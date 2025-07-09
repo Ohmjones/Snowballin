@@ -50,7 +50,7 @@ Use my referral and we’ll both get \$50 when you trade $200:
 - **Go:** 1.20+
 - **Git**
 - **[Kraken API Key/Secret](https://support.kraken.com/hc/en-us/articles/360000919966-How-to-create-an-API-key)** [with trade & withdraw perms
-- **No Coingecko key required** (free-tier safe)
+- **Build Tools**: A C compiler toolchain (like GCC/build-essential) is required for the SQLite database driver.
 
 ---
 
@@ -58,14 +58,15 @@ Use my referral and we’ll both get \$50 when you trade $200:
 
 ```bash
 # Install Go and Git
-sudo apt update && sudo apt install -y golang-go git
+# Install Go, Git, and the necessary C compiler tools
+sudo apt update && sudo apt install -y golang-go git build-essential
 
-# Clone your repo
-git clone https://github.com/Ohmjones/Snowballbot.git /home/ubuntu/snowballin
-cd snowballin
+# Clone the repository
+git clone https://github.com/Ohmjones/Snowballin.git /home/ubuntu/snowballin
+cd /home/ubuntu/snowballin
 
-# Build the binary
-go build -o snowballbot
+# Build the binary with CGO enabled (critical for the database)
+CGO_ENABLED=1 go build -o snowballin main.go
 ```
 
 ---
@@ -149,44 +150,34 @@ Create `config.json`:
 ### 🔁 Daemonizing Snowballbot with `systemd` (Ubuntu/Debian)
 
 ```bash
-# Create the systemd service file:
-# Replace /path/to/snowballbot with your actual binary and working directory path.
-sudo tee /etc/systemd/system/snowballbot.service > /dev/null <<EOF
+# Create the systemd service file.
+# IMPORTANT: Replace /home/ubuntu/snowballin with the actual absolute path to your project.
+sudo tee /etc/systemd/system/snowballin.service > /dev/null <<EOF
 [Unit]
-Description=Snowballbot Trading Daemon
-After=network.target
+Description=Snowballin Trading Bot
+After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/path/to/snowballbot
-ExecStart=/path/to/snowballbot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/snowballin
+ExecStart=/home/ubuntu/snowballin/snowballin
 Restart=on-failure
-StandardOutput=append:/path/to/snowballbot.out
-StandardError=append:/path/to/snowballbot.err
+RestartSec=5s
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Reload systemd, enable the service, and start it:
-sudo systemctl daemon-reexec
+# Reload systemd, enable the service to start on boot, and start it now
 sudo systemctl daemon-reload
-sudo systemctl enable snowballbot
-sudo systemctl start snowballbot
+sudo systemctl enable snowballin.service
+sudo systemctl start snowballin.service
 
-# Check logging:
-journalctl -u snowballbot -f
-
-# Commands to status/stop/start/restart manually
-sudo systemctl status snowballbot.service
-sudo systemctl stop snowballbot.service
-sudo systemctl start snowballbot.service
-sudo systemctl restart snowballbot.service
-
-# Start tailing logs to watch bot
-screen -S snowbotting
-tail -f /path/to/snowballbot.err
-# Detach: Ctrl+A then D, Reattach: `screen -x snowbot`
+# To check the status and see the latest logs:
+sudo systemctl status snowballin.service
+journalctl -u snowballin.service -f --no-pager`
 ```
 ## 🔁 Restart & Recovery
 
