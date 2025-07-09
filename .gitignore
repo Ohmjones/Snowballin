@@ -1,7 +1,6 @@
 # Go build files
 /bin/
 /vendor/
-/pkg/
 /*.exe
 *.test
 *.out

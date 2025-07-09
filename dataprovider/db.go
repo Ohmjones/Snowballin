@@ -7,6 +7,8 @@ import (
 	"fmt"
 	_ "github.com/mattn/go-sqlite3"
 	"log"
+	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -15,6 +17,10 @@ type SQLiteCache struct {
 }
 
 func NewSQLiteCache(dbPath utilities.DatabaseConfig) (*SQLiteCache, error) {
+	dir := filepath.Dir(dbPath.DBPath)
+	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
+		return nil, fmt.Errorf("failed to create database directory '%s': %w", dir, err)
+	}
 	db, err := sql.Open("sqlite3", dbPath.DBPath)
 	if err != nil {
 		return nil, err
