@@ -1,0 +1,15 @@
+# Go build files
+/bin/
+/vendor/
+/pkg/
+/*.exe
+*.test
+*.out
+
+# IDE/editor files
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db

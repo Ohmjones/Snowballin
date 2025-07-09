@@ -1,0 +1,153 @@
+{
+  "app_name": "Snowballin'",
+  "version": "2.0.1",
+  "environment": "production",
+  "logging": {
+    "level": "debug",
+    "log_to_file": true,
+    "log_file_path": "logs/snowballin.log",
+    "max_size_mb": 5,
+    "max_backups": 3,
+    "max_age_days": 7,
+    "compress_backups": true
+  },
+  "discord": {
+    "webhook_url": "YOUR_DISCORD_WEBHOOK_URL_HERE"
+  },
+  "dataprovider_weights": {
+    "kraken": 0.51,
+    "coingecko": 0.245,
+    "coinmarketcap": 0.245
+  },
+  "coingecko": {
+    "base_url": "https://api.coingecko.com/api/v3",
+    "api_key": "YOUR_COINGECKO_API_KEY_OR_LEAVE_EMPTY_FOR_PUBLIC",
+    "request_timeout_sec": 10,
+    "max_retries": 3,
+    "retry_delay_sec": 5,
+    "ohlcv_days_default": "90",
+    "id_map_refresh_interval_hours": 24,
+    "rate_limit_per_sec": 1,
+    "rate_limit_burst": 2,
+    "cache_base_path": "cache/cg_ohlcv",
+    "cache_retention_days": 7,
+    "quote_currency": "usd"
+  },
+  "coinmarketcap": {
+    "base_url": "https://pro-api.coinmarketcap.com",
+    "api_key": "YOUR_CMC_PRO_API_KEY_IF_USING",
+    "request_timeout_sec": 10,
+    "max_retries": 3,
+    "retry_delay_sec": 5,
+    "ohlcv_days_default": 90,
+    "id_map_refresh_interval_hours": 24,
+    "rate_limit_per_sec": 0.5,
+    "rate_limit_burst": 2,
+    "cache_base_path": "cache/cmc_ohlcv"
+  },
+  "FearGreed": {
+    "baseURL": "https://api.alternative.me",
+    "refreshIntervalHours": 4
+  },
+  "kraken": {
+    "quote_currency": "usd",
+    "api_key": "YOUR_KRAKEN_API_KEY",
+    "api_secret": "YOUR_KRAKEN_API_SECRET",
+    "request_timeout_sec": 20,
+    "order_placement_delay_ms": 500,
+    "base_url": "https://api.kraken.com",
+    "max_retries": 3,
+    "retry_delay_sec": 5,
+    "refresh_interval_hours": 12,
+    "use_otp": false,
+    "otp_secret": ""
+  },
+  "data_discrepancy": {
+    "threshold_percent": 3.0,
+    "consecutive_cycles_trigger": 3,
+    "action": "log_warning"
+  },
+  "dca": {
+    "num_ladders": 3,
+    "dca_levels": [0.2, 0.3, 0.5],
+    "dca_atr_multiplier": 1.5
+  },
+  "trading": {
+    "asset_pairs": [
+      "BTC/USD",
+      "ETH/USD",
+      "SOL/USD"
+    ],
+    "quote_currency": "USD",
+    "max_portfolio_drawdown": 0.20,
+    "liquidity_sell_percentage": 5.0,
+    "min_position_hold_ratio": 0.9,
+    "atr_stop_loss_multiplier": 1.5,
+    "atr_take_profit_multiplier": 2.5,
+    "trailing_stop_enabled": true,
+    "trailing_take_profit_enabled": true,
+    "default_stop_loss": 0.02,
+    "default_take_profit": 0.04,
+    "dca_atr_spacing_multiplier": 2.0,
+    "recalculate_after_dca_fill": true
+  },
+  "indicators": {
+    "rsi_period": 14,
+    "stoch_rsi_period": 14,
+    "stoch_rsi_buy_threshold": 20.0,
+    "stoch_rsi_sell_threshold": 80.0,
+    "macd_fast_period": 12,
+    "macd_slow_period": 26,
+    "macd_signal_period": 9,
+    "atr_period": 14,
+    "volume_spike_factor": 2.0,
+    "volume_lookback_period": 10
+  },
+  "consensus": {
+    "threshold_buy": 0.6,
+    "threshold_sell": 0.6,
+    "multi_timeframe": {
+      "base_timeframe": "1h",
+      "additional_timeframes": ["4h", "1d"],
+      "tf_lookback_lengths": [100, 100, 100]
+    }
+  },
+
+  "exit_strategy": {
+    "flush_threshold_atr": 3.0,
+    "max_profit_exit_percentage": 75
+  },
+  "orders": {
+    "enable_watcher": true,
+    "watcher_interval_sec": 60,
+    "reaper_interval_sec": 300,
+    "max_order_age_minutes_for_grid_base": 1440.0,
+    "min_order_age_minutes_dynamic_cap": 5.0,
+    "max_order_age_minutes_dynamic_cap": 120.0
+  },
+  "withdrawal": {
+    "enabled": false,
+    "withdraw_usd": 1000.0,
+    "withdraw_keys": {
+      "BTC": "your_btc_withdrawal_address_here",
+      "ETH": "your_eth_withdrawal_address_here",
+      "SOL": "your_sol_withdrawal_address_here"
+    },
+    "check_interval_sec": 3600,
+    "cooldown_minutes": 1440
+  },
+  "database": {
+    "database_path": "data/snowballin.db"
+  },
+  "data_completeness": {
+    "substitution_sources": ["coingecko", "coinmarketcap"],
+    "discrepancy_threshold_percent": 3.0,
+    "log_level_on_substitution": "INFO",
+    "log_level_on_discrepancy": "WARNING"
+  },
+  "circuit_breaker": {
+  "enabled": true,
+  "drawdown_threshold_percent": 10,
+  "atr_volatility_threshold": 5.0
+}
+}
