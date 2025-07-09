@@ -71,6 +71,7 @@ type CoingeckoConfig struct {
 type CoinmarketcapConfig struct {
 	BaseURL                   string `mapstructure:"base_url"`
 	APIKey                    string `mapstructure:"api_key"`
+	QuoteCurrency             string `mapstructure:"quote_currency"`
 	RequestTimeoutSec         int    `mapstructure:"request_timeout_sec"`
 	MaxRetries                int    `mapstructure:"max_retries"`
 	RetryDelaySec             int    `mapstructure:"retry_delay_sec"`

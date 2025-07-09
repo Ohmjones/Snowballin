@@ -899,11 +899,13 @@ func (c *Client) GetExchangeDetails(ctx context.Context, exchangeIdentifier stri
 // GetGlobalMarketData retrieves overall cryptocurrency market metrics.
 func (c *Client) GetGlobalMarketData(ctx context.Context) (dataprovider.GlobalMarketData, error) {
 	params := url.Values{}
-	// TODO: Allow vsCurrency to be passed and mapped to convert_id
-	// quoteCurrencyID := "2781" // USD
-	// if c.cfg.QuoteCurrency != "" { lookup c.cfg.QuoteCurrency to its numerical ID for CMC }
-	// params.Set("convert_id", quoteCurrencyID)
-	params.Set("convert", "USD") // Default to USD for now
+
+	// Use the configured quote currency, defaulting to USD if not set.
+	quoteCurrency := "USD"
+	if c.cfg != nil && c.cfg.QuoteCurrency != "" {
+		quoteCurrency = c.cfg.QuoteCurrency
+	}
+	params.Set("convert", strings.ToUpper(quoteCurrency))
 
 	var response cmcGlobalMetricsResponse
 	err := c.makeAPICall(ctx, "/v1/global-metrics/quotes/latest", params, &response)
@@ -914,9 +916,9 @@ func (c *Client) GetGlobalMarketData(ctx context.Context) (dataprovider.GlobalMa
 		return dataprovider.GlobalMarketData{}, fmt.Errorf("CMC API error for GetGlobalMarketData: %s (Code: %d)", response.Status.ErrorMessage, response.Status.ErrorCode)
 	}
 
-	quote, ok := response.Data.Quote["USD"] // Assuming "USD" was used for convert
+	quote, ok := response.Data.Quote[strings.ToUpper(quoteCurrency)]
 	if !ok {
-		// Fallback to first available quote if "USD" is not present (e.g. if convert param was different)
+		// Fallback to first available quote if the primary one isn't present
 		foundKey := ""
 		for k, qVal := range response.Data.Quote {
 			quote = qVal
@@ -926,11 +928,12 @@ func (c *Client) GetGlobalMarketData(ctx context.Context) (dataprovider.GlobalMa
 		if foundKey == "" {
 			return dataprovider.GlobalMarketData{}, errors.New("no quote data found in CMC global metrics response")
 		}
-		c.logger.LogWarn("GetGlobalMarketData: Target quote 'USD' not found, using first available: '%s'", foundKey)
+		c.logger.LogWarn("GetGlobalMarketData: Target quote '%s' not found, using first available: '%s'", quoteCurrency, foundKey)
 	}
 
 	return dataprovider.GlobalMarketData{
 		TotalMarketCap: quote.TotalMarketCap,
+		BTCDominance:   response.Data.BtcDominance,
 	}, nil
 }
 

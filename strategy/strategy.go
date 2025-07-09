@@ -134,6 +134,18 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 	var providerReasons []string
 	s.logger.LogInfo("GenerateSignals [%s]: Starting consensus calculation across %d providers.", data.AssetPair, len(data.ProvidersData))
 
+	var btcDominanceModifier float64
+	baseAsset := strings.Split(data.AssetPair, "/")[0]
+	if strings.ToUpper(baseAsset) != "BTC" && data.BTCDominance > 0 {
+		if data.BTCDominance > 55.0 { // BTC is strongly dominant, risk-off for alts
+			btcDominanceModifier = -0.5
+			s.logger.LogInfo("GenerateSignals [%s]: Applying BEARISH BTC Dominance modifier (%.2f) as dominance is high (%.2f%%).", data.AssetPair, btcDominanceModifier, data.BTCDominance)
+		} else if data.BTCDominance < 45.0 { // BTC is weak, risk-on for alts
+			btcDominanceModifier = 0.25
+			s.logger.LogInfo("GenerateSignals [%s]: Applying BULLISH BTC Dominance modifier (+%.2f) as dominance is low (%.2f%%).", data.AssetPair, btcDominanceModifier, data.BTCDominance)
+		}
+	}
+
 	for _, providerData := range data.ProvidersData {
 		if len(providerData.OHLCVBars) < cfg.Indicators.ATRPeriod {
 			s.logger.LogWarn("GenerateSignals: Skipping provider '%s' due to insufficient OHLCV data (%d bars).", providerData.Name, len(providerData.OHLCVBars))
@@ -208,7 +220,15 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 	}
 
 	consensusReason := strings.Join(providerReasons, " | ")
-	s.logger.LogInfo("GenerateSignals [%s]: Consensus Score: %.2f. Reason: %s", data.AssetPair, totalWeightedScore, consensusReason)
+	s.logger.LogInfo("GenerateSignals [%s]: Provider Consensus Score: %.2f.", data.AssetPair, totalWeightedScore)
+
+	// Apply the BTC Dominance modifier if it has a non-zero value
+	if btcDominanceModifier != 0 {
+		s.logger.LogInfo("GenerateSignals [%s]: Applying BTC Dominance modifier (%.2f) to score.", data.AssetPair, btcDominanceModifier)
+		totalWeightedScore += btcDominanceModifier
+	}
+
+	s.logger.LogInfo("GenerateSignals [%s]: Final Score after mods: %.2f. Reason: %s", data.AssetPair, totalWeightedScore, consensusReason)
 
 	// --- 3. Final Decision Making Based on Consensus ---
 	var signals []StrategySignal

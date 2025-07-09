@@ -106,7 +106,7 @@ type ExchangeDetails struct {
 // GlobalMarketData represents overall market stats.
 type GlobalMarketData struct {
 	TotalMarketCap float64 // Usually in USD
-	// Add other global fields if needed (e.g., BTC dominance)
+	BTCDominance   float64 `json:"btc_dominance"`
 }
 
 // FearGreedIndex represents the market sentiment index.

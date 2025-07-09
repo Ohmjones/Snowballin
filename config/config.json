@@ -36,6 +36,7 @@
   "coinmarketcap": {
     "base_url": "https://pro-api.coinmarketcap.com",
     "api_key": "YOUR_CMC_PRO_API_KEY_IF_USING",
+    "quote_currency": "USD",
     "request_timeout_sec": 10,
     "max_retries": 3,
     "retry_delay_sec": 5,

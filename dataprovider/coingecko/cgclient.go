@@ -95,8 +95,8 @@ type cgExchange struct {
 	TradeVolume24hBtcNormalized float64 `json:"trade_volume_24h_btc_normalized"`
 }
 type cgGlobalData struct {
-	TotalMarketCap map[string]float64 `json:"total_market_cap"`
-	// Add other fields from "data" object if needed
+	TotalMarketCap      map[string]float64 `json:"total_market_cap"`
+	MarketCapPercentage map[string]float64 `json:"market_cap_percentage"`
 }
 type cgGlobalResponse struct {
 	Data cgGlobalData `json:"data"`
@@ -651,7 +651,11 @@ func (c *Client) GetGlobalMarketData(ctx context.Context) (dataprovider.GlobalMa
 			}
 		}
 	}
-	return dataprovider.GlobalMarketData{TotalMarketCap: totalMarketCap}, nil
+	btcDominance, ok := cgGlobalResp.Data.MarketCapPercentage["btc"]
+	if !ok {
+		c.logger.LogWarn("GetGlobalMarketData: BTC Dominance not found in CoinGecko response.")
+	}
+	return dataprovider.GlobalMarketData{TotalMarketCap: totalMarketCap, BTCDominance: btcDominance}, nil
 }
 
 // GetTrendingSearches implements DataProvider interface.

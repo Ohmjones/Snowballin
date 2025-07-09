@@ -74,6 +74,7 @@ type ConsolidatedMarketPicture struct {
 	// The first element could conventionally be the primary broker (Kraken).
 	ProvidersData []ProviderData
 
+	BTCDominance       float64
 	FearGreedIndex     dataprovider.FearGreedIndex // Global market sentiment
 	PortfolioValue     float64                     // Current total portfolio value
 	PeakPortfolioValue float64                     // **ADDED**: Historical peak portfolio value for drawdown calculations.

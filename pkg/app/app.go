@@ -20,17 +20,20 @@ import (
 )
 
 type TradingState struct {
-	broker             broker.Broker
-	logger             *utilities.Logger
-	config             *utilities.AppConfig
-	discordClient      *discord.Client
-	cache              *dataprovider.SQLiteCache
-	activeDPs          []dataprovider.DataProvider
-	providerNames      map[dataprovider.DataProvider]string
-	peakPortfolioValue float64
-	openPositions      map[string]*utilities.Position
-	pendingOrders      map[string]string
-	stateMutex         sync.RWMutex
+	broker                 broker.Broker
+	logger                 *utilities.Logger
+	config                 *utilities.AppConfig
+	discordClient          *discord.Client
+	cache                  *dataprovider.SQLiteCache
+	activeDPs              []dataprovider.DataProvider
+	providerNames          map[dataprovider.DataProvider]string
+	peakPortfolioValue     float64
+	lastWithdrawalCheck    time.Time
+	lastGlobalMetricsFetch time.Time
+	lastBTCDominance       float64
+	openPositions          map[string]*utilities.Position
+	pendingOrders          map[string]string
+	stateMutex             sync.RWMutex
 }
 
 var (
@@ -212,7 +215,24 @@ func processTradingCycle(ctx context.Context, state *TradingState) {
 		state.peakPortfolioValue = currentPortfolioValue
 	}
 	state.stateMutex.Unlock()
-
+	// Fetch global market data periodically, not on every cycle, to conserve API calls.
+	if time.Since(state.lastGlobalMetricsFetch) > 30*time.Minute {
+		state.logger.LogInfo("GlobalMetrics: Fetching updated global market data...")
+		// Use the first active data provider for this call.
+		if len(state.activeDPs) > 0 {
+			provider := state.activeDPs[0]
+			globalData, err := provider.GetGlobalMarketData(ctx)
+			if err != nil {
+				state.logger.LogError("GlobalMetrics: Failed to fetch global data: %v", err)
+			} else {
+				state.stateMutex.Lock()
+				state.lastBTCDominance = globalData.BTCDominance
+				state.lastGlobalMetricsFetch = time.Now()
+				state.stateMutex.Unlock()
+				state.logger.LogInfo("GlobalMetrics: Updated BTC Dominance to: %.2f%%", globalData.BTCDominance)
+			}
+		}
+	}
 	processPendingOrders(ctx, state)
 	reapStaleOrders(ctx, state) // <-- ADD THIS CALL
 
@@ -488,6 +508,7 @@ func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair 
 	consolidatedData := &strategy.ConsolidatedMarketPicture{
 		AssetPair:          assetPair,
 		ProvidersData:      make([]strategy.ProviderData, 0, 1+len(state.activeDPs)),
+		BTCDominance:       state.lastBTCDominance,
 		FearGreedIndex:     getCurrentFNG(),
 		PortfolioValue:     currentPortfolioValue,
 		PeakPortfolioValue: state.peakPortfolioValue,
