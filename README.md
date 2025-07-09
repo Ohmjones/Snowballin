@@ -15,7 +15,9 @@ I honestly didn’t expect this to work. But it is — at least for me. If it he
 
 ### 🧠 For the curious hacker:
 
-This README holds just enough to get your hands dirty. It’s not about turnkey solutions — it’s about sparking ideas. AI isn’t just some passive chatbot. It’s leverage. It’s a force multiplier. Use it to learn faster, automate deeper, and explore smarter.  If you absolutely need help setting this up, I'm happy to help for a recommended donation amount.
+This README holds just enough to get your hands dirty. It’s not about turnkey solutions — it’s about sparking ideas. AI isn’t just some passive chatbot. It’s leverage. It’s a force multiplier. Use it to learn faster, automate deeper, and explore smarter.  
+
+If you absolutely need help setting this up, I'm happy to help for a recommended donation amount.
 
 ---
 
