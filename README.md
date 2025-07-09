@@ -83,7 +83,7 @@ Snowballin' is not a simple grid bot that buys on fixed price drops. It operates
 sudo apt update && sudo apt install -y golang-go git build-essential
 
 # Clone the repository
-git clone [https://github.com/Ohmjones/Snowballin.git](https://github.com/Ohmjones/Snowballin.git) /home/ubuntu/snowballin
+git clone https://github.com/Ohmjones/Snowballin.git /home/ubuntu/snowballin
 cd /home/ubuntu/snowballin
 
 # Build the binary with CGO enabled (critical for the database)
