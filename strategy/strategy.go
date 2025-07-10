@@ -112,15 +112,16 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 
 	// --- 1. Portfolio-Level Circuit Breaker (Corrected Logic) ---
 	// This critical override prevents trading during a severe portfolio drawdown.
-	if data.PeakPortfolioValue > 0 && cfg.Trading.MaxPortfolioDrawdown > 0 {
-		drawdownThresholdValue := data.PeakPortfolioValue * (1.0 - cfg.Trading.MaxPortfolioDrawdown)
+	if cfg.CircuitBreaker.Enabled && data.PeakPortfolioValue > 0 {
+		drawdownPercent := cfg.CircuitBreaker.DrawdownThresholdPercent / 100.0 // Convert from 10.0 to 0.10
+		drawdownThresholdValue := data.PeakPortfolioValue * (1.0 - drawdownPercent)
 		if data.PortfolioValue <= drawdownThresholdValue {
 			s.logger.LogWarn("CIRCUIT BREAKER: Portfolio value (%.2f) is below drawdown threshold (%.2f). Generating immediate sell signal.", data.PortfolioValue, drawdownThresholdValue)
 			return []StrategySignal{{
 				AssetPair:        data.AssetPair,
 				Direction:        "sell",
 				Confidence:       1.0,
-				Reason:           fmt.Sprintf("Circuit Breaker: Portfolio drawdown exceeded %.2f%%", cfg.Trading.MaxPortfolioDrawdown*100),
+				Reason:           fmt.Sprintf("Circuit Breaker: Portfolio drawdown exceeded %.2f%%", cfg.CircuitBreaker.DrawdownThresholdPercent),
 				GeneratedAt:      time.Now(),
 				RecommendedPrice: currentPrice,
 				CalculatedSize:   data.PortfolioValue, // Implies sell all
