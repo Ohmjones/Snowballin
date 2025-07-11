@@ -705,16 +705,6 @@ func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair st
 }
 
 func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair string, currentPortfolioValue float64) (*strategy.ConsolidatedMarketPicture, error) {
-	krakenAdapter, ok := state.broker.(*krakenBroker.Adapter)
-	if !ok {
-		return nil, errors.New("broker is not a kraken adapter")
-	}
-	krakenClient, _ := krakenAdapter.GetInternalClient()
-	krakenSpecificPairName, err := krakenClient.GetKrakenPairName(ctx, assetPair)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get kraken pair name for %s: %w", assetPair, err)
-	}
-
 	state.stateMutex.RLock()
 	consolidatedData := &strategy.ConsolidatedMarketPicture{
 		AssetPair:          assetPair,
@@ -727,12 +717,14 @@ func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair 
 	}
 	state.stateMutex.RUnlock()
 
-	krakenTicker, tickerErr := state.broker.GetTicker(ctx, krakenSpecificPairName)
+	// --- All broker calls now correctly use the original `assetPair` ---
+
+	krakenTicker, tickerErr := state.broker.GetTicker(ctx, assetPair)
 	if tickerErr != nil {
 		state.logger.LogWarn("gatherConsolidatedData [%s]: could not get ticker: %v", assetPair, tickerErr)
 	}
 
-	krakenOrderBook, obErr := state.broker.GetOrderBook(ctx, krakenSpecificPairName, 20)
+	krakenOrderBook, obErr := state.broker.GetOrderBook(ctx, assetPair, 20)
 	if obErr != nil {
 		state.logger.LogWarn("gatherConsolidatedData [%s]: could not get order book: %v", assetPair, obErr)
 	}
@@ -742,6 +734,7 @@ func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair 
 	allTFs := append([]string{tfCfg.BaseTimeframe}, tfCfg.AdditionalTimeframes...)
 	var krakenBaseBars []utilities.OHLCVBar
 	baseBarsFound := false
+
 	for idx, tfString := range allTFs {
 		if idx >= len(tfCfg.TFLookbackLengths) {
 			break
@@ -752,7 +745,9 @@ func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair 
 			state.logger.LogError("gatherConsolidatedData [%s]: bad interval %s: %v", assetPair, tfString, intervalErr)
 			continue
 		}
-		bars, barsErr := state.broker.GetLastNOHLCVBars(ctx, krakenSpecificPairName, krakenInterval, lookback)
+
+		// Correctly use `assetPair` here
+		bars, barsErr := state.broker.GetLastNOHLCVBars(ctx, assetPair, krakenInterval, lookback)
 		if barsErr != nil {
 			state.logger.LogError("gatherConsolidatedData [%s]: could not get OHLCV for %s: %v", assetPair, tfString, barsErr)
 			continue
@@ -786,7 +781,6 @@ func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair 
 
 		extMarketData, mdErr := dp.GetMarketData(ctx, []string{providerCoinID}, state.config.Trading.QuoteCurrency)
 
-		// --- MODIFIED: Only fetch historical data from the provider that supports it ---
 		var extOHLCVBars []utilities.OHLCVBar
 		if providerName == "coingecko" {
 			var ohlcvErr error
