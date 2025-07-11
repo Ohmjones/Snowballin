@@ -25,14 +25,9 @@ func NewSQLiteCache(dbPath utilities.DatabaseConfig) (*SQLiteCache, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	// --- MODIFIED: Schema creation is REMOVED from the constructor ---
-
 	return &SQLiteCache{db: db}, nil
 }
 
-// --- ADDED: New dedicated function to initialize the database schema ---
-// This function will be called synchronously to prevent race conditions.
 func (s *SQLiteCache) InitSchema() error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS ohlcv_bars (
@@ -76,7 +71,6 @@ func (s *SQLiteCache) InitSchema() error {
 	return nil
 }
 
-// --- OHLCV Bar Caching ---
 func (s *SQLiteCache) SaveBar(provider, coinID string, bar utilities.OHLCVBar) error {
 	_, err := s.db.Exec(`INSERT OR REPLACE INTO ohlcv_bars (provider, coin_id, timestamp, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		provider, coinID, bar.Timestamp, bar.Open, bar.High, bar.Low, bar.Close, bar.Volume)
@@ -100,8 +94,6 @@ func (s *SQLiteCache) GetBars(provider, coinID string, start, end int64) ([]util
 	}
 	return bars, nil
 }
-
-// --- State Persistence Functions ---
 
 func (s *SQLiteCache) LoadPositions() (map[string]*utilities.Position, error) {
 	query := `SELECT asset_pair, entry_timestamp, average_price, total_volume, base_order_price, filled_safety_orders, is_dca_active, base_order_size, current_take_profit, broker_order_id, is_trailing_active, peak_price_since_tp FROM open_positions`
@@ -143,6 +135,7 @@ func (s *SQLiteCache) LoadPositions() (map[string]*utilities.Position, error) {
 	return positions, nil
 }
 
+// --- MODIFIED: The entire SavePosition function is corrected ---
 func (s *SQLiteCache) SavePosition(pos *utilities.Position) error {
 	query := `INSERT OR REPLACE INTO open_positions (asset_pair, entry_timestamp, average_price, total_volume, base_order_price, filled_safety_orders, is_dca_active, base_order_size, current_take_profit, broker_order_id, is_trailing_active, peak_price_since_tp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
@@ -167,7 +160,8 @@ func (s *SQLiteCache) SavePosition(pos *utilities.Position) error {
 		pos.CurrentTakeProfit,
 		pos.BrokerOrderID,
 		isTrailingActiveInt,
-		pos.PeakPriceSinceTP)
+		pos.PeakPriceSinceTP,
+	) // Corrected: removed misplaced '}' and added ')'
 	return err
 }
 
@@ -204,7 +198,6 @@ func (s *SQLiteCache) DeletePendingOrder(orderID string) error {
 	return err
 }
 
-// --- Cleanup ---
 func (s *SQLiteCache) CleanupOldBars(provider string, olderThan time.Time) error {
 	cutoff := olderThan.UnixMilli()
 	_, err := s.db.Exec(`DELETE FROM ohlcv_bars WHERE provider=? AND timestamp < ?`, provider, cutoff)
@@ -217,8 +210,6 @@ func (s *SQLiteCache) Close() error {
 
 func (s *SQLiteCache) StartScheduledCleanup(interval time.Duration, provider string) {
 	go func() {
-		// --- ADDED: Add an initial delay to the cleanup task ---
-		// This prevents it from running before the main loop starts.
 		time.Sleep(2 * time.Minute)
 
 		ticker := time.NewTicker(interval)
