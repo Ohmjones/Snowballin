@@ -40,61 +40,89 @@ func (o *Optimizer) RunOptimizationCycle(ctx context.Context, assetPair string) 
 	interval := "1h"
 	sixMonthsAgo := time.Now().AddDate(0, -6, 0)
 
-	// --- MODIFIED: Since only CoinGecko has the required historical data, we now query it directly. ---
-	providerName := "coingecko"
+	potentialProviders := []string{"coingecko", "coinmarketcap"}
+	var lastErr error
 
-	id, err := o.dp.GetCoinID(ctx, baseAsset)
-	if err != nil {
-		o.logger.LogError("[Optimizer] Could not get asset ID for %s: %v", baseAsset, err)
+	for _, providerName := range potentialProviders {
+		id, err := o.dp.GetCoinID(ctx, baseAsset)
+		if err != nil {
+			o.logger.LogWarn("[Optimizer] Could not get asset ID for %s, skipping provider %s", baseAsset, providerName)
+			lastErr = err
+			continue
+		}
+
+		cacheKey := fmt.Sprintf("%s-%s-%s", id, strings.ToLower(quoteAsset), interval)
+		bars, err = o.cache.GetBars(providerName, cacheKey, sixMonthsAgo.UnixMilli(), time.Now().UnixMilli())
+		if err != nil {
+			lastErr = err
+		}
+
+		if err == nil && len(bars) >= 40 {
+			o.logger.LogInfo("[Optimizer] Found sufficient historical data for %s under provider '%s' with key '%s'", assetPair, providerName, cacheKey)
+			lastErr = nil
+			break
+		}
+	}
+
+	if len(bars) < 40 {
+		o.logger.LogError("[Optimizer] Could not fetch sufficient historical data for %s from any provider. Last error: %v", assetPair, lastErr)
 		return
 	}
 
-	cacheKey := fmt.Sprintf("%s-%s-%s", id, strings.ToLower(quoteAsset), interval)
-	bars, err = o.cache.GetBars(providerName, cacheKey, sixMonthsAgo.UnixMilli(), time.Now().UnixMilli())
-
-	if err != nil || len(bars) < 40 {
-		o.logger.LogError("[Optimizer] Could not fetch sufficient historical data for %s from provider '%s'. Error: %v", assetPair, providerName, err)
-		return
-	}
-
-	o.logger.LogInfo("[Optimizer] Found %d historical bars for %s to run backtest.", len(bars), assetPair)
+	o.logger.LogInfo("[Optimizer] Found %d historical bars for %s. Beginning optimization...", len(bars), assetPair)
 
 	var bestResult strategy.BacktestResult
-	bestScore := -1.0
+	bestScore := -1e9
 
-	for rsiPeriod := 10; rsiPeriod <= 20; rsiPeriod += 2 {
-		for fast := 10; fast <= 15; fast++ {
-			for slow := 20; slow <= 30; slow += 2 {
-				btCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-				defer cancel()
+	for stochBuy := 20.0; stochBuy <= 30.0; stochBuy += 5.0 {
+		for rsiPeriod := 12; rsiPeriod <= 16; rsiPeriod += 2 {
+			for fast := 10; fast <= 15; fast++ {
+				for slow := 20; slow <= 30; slow += 2 {
+					btCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+					defer cancel()
 
-				if btCtx.Err() != nil {
-					o.logger.LogWarn("[Optimizer] Optimization cycle for %s cancelled.", assetPair)
-					return
-				}
+					if btCtx.Err() != nil {
+						o.logger.LogWarn("[Optimizer] Optimization cycle for %s cancelled.", assetPair)
+						return
+					}
 
-				params := utilities.IndicatorsConfig{
-					RSIPeriod:        rsiPeriod,
-					MACDFastPeriod:   fast,
-					MACDSlowPeriod:   slow,
-					MACDSignalPeriod: 9,
-				}
+					params := utilities.IndicatorsConfig{
+						RSIPeriod:             rsiPeriod,
+						StochRSIBuyThreshold:  stochBuy,
+						StochRSISellThreshold: 80.0,
+						StochRSIPeriod:        14,
+						MACDFastPeriod:        fast,
+						MACDSlowPeriod:        slow,
+						MACDSignalPeriod:      9,
+					}
 
-				result := strategy.RunBacktest(bars, params, o.config.Trading.TakeProfitPercentage)
+					// --- MODIFIED: The call to RunBacktest now passes the trading config struct ---
+					result := strategy.RunBacktest(bars, params, o.config.Trading)
 
-				if result.NetProfit > bestScore {
-					bestScore = result.NetProfit
-					bestResult = result
+					if result.NetProfit > bestScore {
+						bestScore = result.NetProfit
+						bestResult = result
+					}
 				}
 			}
 		}
 	}
 
-	if bestScore > 0 {
-		o.logger.LogInfo("[Optimizer] Found new best parameters for %s: RSI(%d), MACD(%d, %d, %d). Net Profit: %.2f",
-			assetPair, bestResult.Parameters.RSIPeriod, bestResult.Parameters.MACDFastPeriod, bestResult.Parameters.MACDSlowPeriod, bestResult.Parameters.MACDSignalPeriod, bestResult.NetProfit)
+	if bestScore > -1e9 {
+		o.logger.LogInfo("[Optimizer] Found new best parameters for %s -> Profit: %.2f | RSI(%d) StochBuy(%.1f) MACD(%d,%d,%d)",
+			assetPair, bestResult.NetProfit,
+			bestResult.Parameters.RSIPeriod, bestResult.Parameters.StochRSIBuyThreshold,
+			bestResult.Parameters.MACDFastPeriod, bestResult.Parameters.MACDSlowPeriod, bestResult.Parameters.MACDSignalPeriod)
 
-		o.saveOptimizedParams(bestResult.Parameters)
+		finalParams := o.config.Indicators
+		finalParams.RSIPeriod = bestResult.Parameters.RSIPeriod
+		finalParams.StochRSIBuyThreshold = bestResult.Parameters.StochRSIBuyThreshold
+		finalParams.MACDFastPeriod = bestResult.Parameters.MACDFastPeriod
+		finalParams.MACDSlowPeriod = bestResult.Parameters.MACDSlowPeriod
+		finalParams.MACDSignalPeriod = bestResult.Parameters.MACDSignalPeriod
+
+		o.saveOptimizedParams(finalParams)
+
 	} else {
 		o.logger.LogWarn("[Optimizer] Optimization cycle for %s did not yield a profitable result.", assetPair)
 	}

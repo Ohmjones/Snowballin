@@ -1,6 +1,9 @@
 package strategy
 
-import "Snowballin/utilities"
+import (
+	"Snowballin/utilities"
+	"math"
+)
 
 // BacktestResult holds the performance metrics of a single backtest run.
 type BacktestResult struct {
@@ -13,53 +16,99 @@ type BacktestResult struct {
 	WinRate       float64
 }
 
-// RunBacktest simulates the DCA strategy over a historical dataset.
-// NOTE: This is a simplified backtester for demonstration. A production version would be more complex.
-func RunBacktest(bars []utilities.OHLCVBar, params utilities.IndicatorsConfig, tp float64) BacktestResult {
+// --- MODIFIED: The function now accepts TradingConfig to access the correct DCA parameters ---
+func RunBacktest(bars []utilities.OHLCVBar, indicatorParams utilities.IndicatorsConfig, tradingParams utilities.TradingConfig) BacktestResult {
 	var netProfit float64
-	var wins, losses int
-	inTrade := false
-	entryPrice := 0.0
+	var totalTrades, winningTrades int
 
-	for i := params.MACDSlowPeriod; i < len(bars); i++ {
-		// Use a simple MACD crossover for entry/exit signals in this backtest
+	type simulatedPosition struct {
+		IsActive           bool
+		EntryPrice         float64
+		AveragePrice       float64
+		BaseOrderSize      float64
+		TotalVolume        float64
+		FilledSafetyOrders int
+	}
+	currentTrade := simulatedPosition{}
+
+	requiredBars := indicatorParams.MACDSlowPeriod
+	if indicatorParams.RSIPeriod > requiredBars {
+		requiredBars = indicatorParams.RSIPeriod
+	}
+
+	for i := requiredBars; i < len(bars); i++ {
 		currentBars := bars[:i+1]
-		macdHist := CalculateMACD(currentBars, params.MACDFastPeriod, params.MACDSlowPeriod, params.MACDSignalPeriod)
+		currentBar := currentBars[len(currentBars)-1]
 
-		prevBars := bars[:i]
-		prevMacdHist := CalculateMACD(prevBars, params.MACDFastPeriod, params.MACDSlowPeriod, params.MACDSignalPeriod)
+		if !currentTrade.IsActive {
+			rsi := CalculateRSI(currentBars, indicatorParams.RSIPeriod)
+			macdHist := CalculateMACD(currentBars, indicatorParams.MACDFastPeriod, indicatorParams.MACDSlowPeriod, indicatorParams.MACDSignalPeriod)
 
-		// Entry condition: MACD crosses above zero
-		if !inTrade && macdHist > 0 && prevMacdHist <= 0 {
-			inTrade = true
-			entryPrice = currentBars[len(currentBars)-1].Close
+			if macdHist > 0 && rsi < 60 {
+				currentTrade = simulatedPosition{
+					IsActive:           true,
+					EntryPrice:         currentBar.Close,
+					AveragePrice:       currentBar.Close,
+					BaseOrderSize:      1.0,
+					TotalVolume:        1.0,
+					FilledSafetyOrders: 0,
+				}
+			}
+			continue
 		}
 
-		// Exit condition: Take Profit is hit
-		if inTrade && currentBars[len(currentBars)-1].High >= entryPrice*(1.0+tp) {
-			profit := (entryPrice * (1.0 + tp)) - entryPrice
-			netProfit += profit
-			wins++
-			inTrade = false
-		} else if inTrade && macdHist < 0 && prevMacdHist >= 0 { // Exit condition: MACD crosses below zero (loss)
-			profit := currentBars[len(currentBars)-1].Close - entryPrice
-			netProfit += profit
-			losses++
-			inTrade = false
+		if currentTrade.IsActive {
+			// --- MODIFIED: Access take_profit_percentage from tradingParams ---
+			takeProfitPrice := currentTrade.AveragePrice * (1.0 + tradingParams.TakeProfitPercentage)
+			if currentBar.High >= takeProfitPrice {
+				profit := (takeProfitPrice - currentTrade.AveragePrice) * currentTrade.TotalVolume
+				netProfit += profit
+				totalTrades++
+				winningTrades++
+				currentTrade = simulatedPosition{}
+				continue
+			}
+
+			// --- MODIFIED: Access DCA grid parameters from tradingParams ---
+			if currentTrade.FilledSafetyOrders >= tradingParams.MaxSafetyOrders {
+				continue
+			}
+
+			nextSONumber := currentTrade.FilledSafetyOrders + 1
+
+			var totalDeviationPercentage float64
+			currentStep := tradingParams.PriceDeviationToOpenSafetyOrders
+			for j := 0; j < nextSONumber; j++ {
+				totalDeviationPercentage += currentStep
+				currentStep *= tradingParams.SafetyOrderStepScale
+			}
+
+			safetyOrderPrice := currentTrade.EntryPrice * (1.0 - (totalDeviationPercentage / 100.0))
+
+			if currentBar.Low <= safetyOrderPrice {
+				soVolume := currentTrade.BaseOrderSize * math.Pow(tradingParams.SafetyOrderVolumeScale, float64(nextSONumber))
+
+				oldCost := currentTrade.AveragePrice * currentTrade.TotalVolume
+				newCost := safetyOrderPrice * soVolume
+				newTotalVolume := currentTrade.TotalVolume + soVolume
+
+				currentTrade.AveragePrice = (oldCost + newCost) / newTotalVolume
+				currentTrade.TotalVolume = newTotalVolume
+				currentTrade.FilledSafetyOrders++
+			}
 		}
 	}
 
-	totalTrades := wins + losses
 	winRate := 0.0
 	if totalTrades > 0 {
-		winRate = float64(wins) / float64(totalTrades)
+		winRate = float64(winningTrades) / float64(totalTrades)
 	}
 
 	return BacktestResult{
-		Parameters:    params,
+		Parameters:    indicatorParams,
 		TotalTrades:   totalTrades,
-		WinningTrades: wins,
-		LosingTrades:  losses,
+		WinningTrades: winningTrades,
+		LosingTrades:  totalTrades - winningTrades,
 		NetProfit:     netProfit,
 		WinRate:       winRate,
 	}
