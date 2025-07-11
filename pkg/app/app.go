@@ -633,12 +633,21 @@ func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair st
 
 	dynamicBaseOrderSize := capitalForThisTrade / cumulativeMultiplier
 
+	// If the calculated size is less than the configured minimum,
+	// override it and attempt to use the minimum instead.
 	if dynamicBaseOrderSize < cfg.BaseOrderSize {
-		state.logger.LogInfo("SeekEntry [%s]: Dynamic size (%.2f) is below minimum (%.2f). Skipping trade.", assetPair, dynamicBaseOrderSize, cfg.BaseOrderSize)
+		state.logger.LogInfo("SeekEntry [%s]: Dynamic size (%.2f) is below minimum (%.2f). Attempting to use minimum size instead.", assetPair, dynamicBaseOrderSize, cfg.BaseOrderSize)
+		dynamicBaseOrderSize = cfg.BaseOrderSize // Override with the minimum
+	}
+
+	// CRITICAL: After potentially overriding, check if we have enough capital budgeted for even this base order.
+	// This prevents placing a $10 base order when the risk settings only budgeted $5 for the ENTIRE trade cycle.
+	if dynamicBaseOrderSize > capitalForThisTrade {
+		state.logger.LogWarn("SeekEntry [%s]: Insufficient capital for the desired trade size. Budget for full trade cycle is only %.2f, but a base order of %.2f is required. Skipping trade. Please adjust risk or safety order settings.", assetPair, capitalForThisTrade, dynamicBaseOrderSize)
 		return
 	}
 
-	state.logger.LogInfo("SeekEntry [%s]: Dynamic capital check PASSED. Calculated base order size: %.2f %s.", assetPair, dynamicBaseOrderSize, cfg.QuoteCurrency)
+	state.logger.LogInfo("SeekEntry [%s]: Capital check passed. Base order size set to: %.2f %s.", assetPair, dynamicBaseOrderSize, cfg.QuoteCurrency)
 
 	// --- 2. Signal Generation ---
 	consolidatedData, err := gatherConsolidatedData(ctx, state, assetPair, currentPortfolioValue)
