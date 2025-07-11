@@ -34,37 +34,39 @@ func (o *Optimizer) RunOptimizationCycle(ctx context.Context, assetPair string) 
 	o.logger.LogInfo("[Optimizer] Starting optimization cycle for %s...", assetPair)
 
 	var bars []utilities.OHLCVBar
-	var err error
-
-	// --- MODIFIED: Logic to build the correct cache key ---
-	// The optimizer now uses its data provider to get the correct ID, ensuring the key matches what was primed.
+	
 	baseAsset := strings.Split(assetPair, "/")[0]
 	quoteAsset := strings.Split(assetPair, "/")[1]
-
-	coinID, err := o.dp.GetCoinID(ctx, baseAsset)
-	if err != nil {
-		o.logger.LogError("[Optimizer] Could not get CoinGecko ID for %s: %v", baseAsset, err)
-		return
-	}
-
-	// For optimization, we'll use the 1-hour timeframe ("1h" is the user-friendly format)
 	interval := "1h"
-	cacheKey := fmt.Sprintf("%s-%s-%s", coinID, strings.ToLower(quoteAsset), interval)
-	providerName := "coingecko" // We know the data was primed from CoinGecko
-
 	sixMonthsAgo := time.Now().AddDate(0, -6, 0)
-	bars, err = o.cache.GetBars(providerName, cacheKey, sixMonthsAgo.UnixMilli(), time.Now().UnixMilli())
 
-	if err != nil || len(bars) < 200 {
-		o.logger.LogError("[Optimizer] Could not fetch sufficient historical data for key '%s' under provider '%s': %v", cacheKey, providerName, err)
+	potentialProviders := []string{"coingecko", "coinmarketcap"}
+
+	for _, providerName := range potentialProviders {
+		// --- MODIFIED: Removed unused 'provider' variable ---
+
+		id, err := o.dp.GetCoinID(ctx, baseAsset)
+		if err != nil {
+			o.logger.LogWarn("[Optimizer] Could not get asset ID for %s, skipping provider %s", baseAsset, providerName)
+			continue
+		}
+
+		cacheKey := fmt.Sprintf("%s-%s-%s", id, strings.ToLower(quoteAsset), interval)
+		bars, err = o.cache.GetBars(providerName, cacheKey, sixMonthsAgo.UnixMilli(), time.Now().UnixMilli())
+		if err == nil && len(bars) >= 200 {
+			o.logger.LogInfo("[Optimizer] Found sufficient historical data for %s under provider '%s' with key '%s'", assetPair, providerName, cacheKey)
+			break
+		}
+	}
+
+	if len(bars) < 200 {
+		o.logger.LogError("[Optimizer] Could not fetch sufficient historical data for %s from any provider.", assetPair)
 		return
 	}
-	o.logger.LogInfo("[Optimizer] Found %d historical bars for key '%s' to run backtest.", len(bars), cacheKey)
 
 	var bestResult strategy.BacktestResult
 	bestScore := -1.0
 
-	// 2. Loop through a range of parameters
 	for rsiPeriod := 10; rsiPeriod <= 20; rsiPeriod += 2 {
 		for fast := 10; fast <= 15; fast++ {
 			for slow := 20; slow <= 30; slow += 2 {
@@ -83,10 +85,8 @@ func (o *Optimizer) RunOptimizationCycle(ctx context.Context, assetPair string) 
 					MACDSignalPeriod: 9,
 				}
 
-				// 3. Run the backtest for each combination
 				result := strategy.RunBacktest(bars, params, o.config.Trading.TakeProfitPercentage)
 
-				// 4. Score the result (e.g., by net profit)
 				if result.NetProfit > bestScore {
 					bestScore = result.NetProfit
 					bestResult = result
@@ -99,7 +99,6 @@ func (o *Optimizer) RunOptimizationCycle(ctx context.Context, assetPair string) 
 		o.logger.LogInfo("[Optimizer] Found new best parameters for %s: RSI(%d), MACD(%d, %d, %d). Net Profit: %.2f",
 			assetPair, bestResult.Parameters.RSIPeriod, bestResult.Parameters.MACDFastPeriod, bestResult.Parameters.MACDSlowPeriod, bestResult.Parameters.MACDSignalPeriod, bestResult.NetProfit)
 
-		// 5. Save the winning parameters to a file
 		o.saveOptimizedParams(bestResult.Parameters)
 	} else {
 		o.logger.LogWarn("[Optimizer] Optimization cycle for %s did not yield a profitable result.", assetPair)

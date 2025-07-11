@@ -712,13 +712,15 @@ func (c *Client) PrimeHistoricalData(ctx context.Context, id, vsCurrency, interv
 	ohlcParams.Add("days", strconv.Itoa(days))
 
 	ohlcEndpoint := fmt.Sprintf("/coins/%s/ohlc", id)
+
+	// --- MODIFIED: Corrected the target variable from &err to &ohlcData ---
 	err := c.request(ctx, ohlcEndpoint, ohlcParams, &ohlcData)
 	if err != nil {
 		return fmt.Errorf("failed to fetch priming data from CoinGecko /ohlc for %s: %w", id, err)
 	}
 
 	cacheProvider := "coingecko"
-	cacheCoinID := fmt.Sprintf("%s-%s-%s", id, vsCurrency, interval)
+	cacheCoinID := fmt.Sprintf("%s-%s-%s", id, strings.ToLower(vsCurrency), interval)
 
 	for _, ohlcPoint := range ohlcData {
 		if len(ohlcPoint) != 5 {
@@ -731,7 +733,6 @@ func (c *Client) PrimeHistoricalData(ctx context.Context, id, vsCurrency, interv
 			Low:       ohlcPoint[3],
 			Close:     ohlcPoint[4],
 		}
-		// Save each fetched bar to the cache
 		if err := c.cache.SaveBar(cacheProvider, cacheCoinID, bar); err != nil {
 			c.logger.LogWarn("PrimeHistoricalData [%s]: Failed to save bar to cache: %v", id, err)
 		}

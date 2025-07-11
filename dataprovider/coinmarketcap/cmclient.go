@@ -926,11 +926,11 @@ func (c *Client) PrimeHistoricalData(ctx context.Context, id, vsCurrency, interv
 	} else if cmcInterval == Interval4h {
 		countForAPI = strconv.Itoa(days * 6)
 	} else {
-		countForAPI = "5000"
-	} // Max count for CMC
+		countForAPI = "5000" // Max count for CMC
+	}
 
 	params := url.Values{
-		"symbol":   {strings.ToUpper(assetSymbol)},
+		"id":       {numericalCoinID}, // Use numerical ID for the call
 		"convert":  {strings.ToUpper(vsCurrency)},
 		"interval": {cmcInterval},
 		"count":    {countForAPI},
@@ -950,6 +950,11 @@ func (c *Client) PrimeHistoricalData(ctx context.Context, id, vsCurrency, interv
 		return fmt.Errorf("no OHLCV data for ID %s in response", numericalCoinID)
 	}
 
+	// --- MODIFIED: Standardize the cache saving logic ---
+	cacheProvider := "coinmarketcap"
+	// Use the same key format as CoinGecko for consistency
+	cacheCoinID := fmt.Sprintf("%s-%s-%s", id, strings.ToLower(vsCurrency), interval)
+
 	for _, qData := range apiData.Quotes {
 		quoteSet, ok := qData.QuoteMap[strings.ToUpper(vsCurrency)]
 		if !ok {
@@ -962,7 +967,7 @@ func (c *Client) PrimeHistoricalData(ctx context.Context, id, vsCurrency, interv
 
 		bar := utils.OHLCVBar{Timestamp: ts.UnixMilli(), Open: quoteSet.Open, High: quoteSet.High, Low: quoteSet.Low, Close: quoteSet.Close, Volume: quoteSet.Volume}
 		if c.cache != nil {
-			c.cache.SaveBar(providerName, assetSymbol, bar)
+			c.cache.SaveBar(cacheProvider, cacheCoinID, bar)
 		}
 	}
 	c.logger.LogInfo("PRIMING CoinMarketCap Data: Successfully processed and cached %d data points for %s.", len(apiData.Quotes), assetSymbol)
