@@ -162,26 +162,30 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 		primeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Minute) // Generous timeout for bulk download
 		defer cancel()
 
-		providerToUse := activeDPs[0] // Use the first active provider for priming
-		providerName := providerNames[providerToUse]
-		logger.LogInfo("Pre-Flight Prime: Using provider '%s' for data priming.", providerName)
+		// --- MODIFIED: Loop through ALL active data providers ---
+		for _, providerToUse := range activeDPs {
+			providerName := providerNames[providerToUse]
+			logger.LogInfo("Pre-Flight Prime: Using provider '%s' for data priming.", providerName)
 
-		for _, pair := range cfg.Trading.AssetPairs {
-			logger.LogInfo("Pre-Flight Prime: Priming data for %s...", pair)
-			baseAsset := strings.Split(pair, "/")[0]
-			coinID, err := providerToUse.GetCoinID(primeCtx, baseAsset)
-			if err != nil {
-				logger.LogError("Pre-Flight Prime: Could not get coin ID for %s. Skipping. Error: %v", baseAsset, err)
-				continue
-			}
+			for _, pair := range cfg.Trading.AssetPairs {
+				logger.LogInfo("Pre-Flight Prime: Priming data for %s...", pair)
+				baseAsset := strings.Split(pair, "/")[0]
 
-			for _, tf := range append(cfg.Consensus.MultiTimeframe.AdditionalTimeframes, cfg.Consensus.MultiTimeframe.BaseTimeframe) {
-				logger.LogDebug("Pre-Flight Prime: Fetching %s data for %s...", tf, pair)
-				err := providerToUse.PrimeHistoricalData(primeCtx, coinID, cfg.Trading.QuoteCurrency, tf, cfg.Preflight.PrimingDays)
+				coinID, err := providerToUse.GetCoinID(primeCtx, baseAsset)
 				if err != nil {
-					logger.LogWarn("Pre-Flight Prime: Failed to prime %s data for %s. Continuing. Error: %v", tf, pair, err)
+					logger.LogError("Pre-Flight Prime: Could not get coin ID for %s using provider %s. Skipping. Error: %v", baseAsset, providerName, err)
+					continue
 				}
-				time.Sleep(2 * time.Second)
+
+				for _, tf := range append(cfg.Consensus.MultiTimeframe.AdditionalTimeframes, cfg.Consensus.MultiTimeframe.BaseTimeframe) {
+					logger.LogDebug("Pre-Flight Prime: Fetching %s data for %s...", tf, pair)
+					err := providerToUse.PrimeHistoricalData(primeCtx, coinID, cfg.Trading.QuoteCurrency, tf, cfg.Preflight.PrimingDays)
+					if err != nil {
+						logger.LogWarn("Pre-Flight Prime: Failed to prime %s data for %s using %s. Continuing. Error: %v", tf, pair, providerName, err)
+					}
+					// Keep a small delay to be friendly to APIs
+					time.Sleep(2 * time.Second)
+				}
 			}
 		}
 		logger.LogInfo("Pre-Flight Prime: Historical data priming complete.")

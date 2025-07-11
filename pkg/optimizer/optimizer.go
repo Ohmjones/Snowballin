@@ -34,7 +34,7 @@ func (o *Optimizer) RunOptimizationCycle(ctx context.Context, assetPair string) 
 	o.logger.LogInfo("[Optimizer] Starting optimization cycle for %s...", assetPair)
 
 	var bars []utilities.OHLCVBar
-	
+
 	baseAsset := strings.Split(assetPair, "/")[0]
 	quoteAsset := strings.Split(assetPair, "/")[1]
 	interval := "1h"
@@ -53,7 +53,7 @@ func (o *Optimizer) RunOptimizationCycle(ctx context.Context, assetPair string) 
 
 		cacheKey := fmt.Sprintf("%s-%s-%s", id, strings.ToLower(quoteAsset), interval)
 		bars, err = o.cache.GetBars(providerName, cacheKey, sixMonthsAgo.UnixMilli(), time.Now().UnixMilli())
-		if err == nil && len(bars) >= 200 {
+		if err == nil && len(bars) >= 40 {
 			o.logger.LogInfo("[Optimizer] Found sufficient historical data for %s under provider '%s' with key '%s'", assetPair, providerName, cacheKey)
 			break
 		}
