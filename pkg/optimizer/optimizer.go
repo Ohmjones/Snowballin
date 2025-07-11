@@ -74,34 +74,37 @@ func (o *Optimizer) RunOptimizationCycle(ctx context.Context, assetPair string) 
 	var bestResult strategy.BacktestResult
 	bestScore := -1e9
 
-	for stochBuy := 20.0; stochBuy <= 30.0; stochBuy += 5.0 {
-		for rsiPeriod := 12; rsiPeriod <= 16; rsiPeriod += 2 {
-			for fast := 10; fast <= 15; fast++ {
-				for slow := 20; slow <= 30; slow += 2 {
-					btCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-					defer cancel()
+	// --- ADDED: Loop to test the OBV Moving Average Period ---
+	for obvPeriod := 20; obvPeriod <= 30; obvPeriod += 5 { // Test OBV MA periods of 20, 25, 30
+		for stochBuy := 20.0; stochBuy <= 30.0; stochBuy += 5.0 {
+			for rsiPeriod := 12; rsiPeriod <= 16; rsiPeriod += 2 {
+				for fast := 10; fast <= 15; fast++ {
+					for slow := 20; slow <= 30; slow += 2 {
+						btCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+						defer cancel()
 
-					if btCtx.Err() != nil {
-						o.logger.LogWarn("[Optimizer] Optimization cycle for %s cancelled.", assetPair)
-						return
-					}
+						if btCtx.Err() != nil {
+							o.logger.LogWarn("[Optimizer] Optimization cycle for %s cancelled.", assetPair)
+							return
+						}
 
-					params := utilities.IndicatorsConfig{
-						RSIPeriod:             rsiPeriod,
-						StochRSIBuyThreshold:  stochBuy,
-						StochRSISellThreshold: 80.0,
-						StochRSIPeriod:        14,
-						MACDFastPeriod:        fast,
-						MACDSlowPeriod:        slow,
-						MACDSignalPeriod:      9,
-					}
+						params := utilities.IndicatorsConfig{
+							RSIPeriod:             rsiPeriod,
+							StochRSIBuyThreshold:  stochBuy,
+							StochRSISellThreshold: 80.0,
+							StochRSIPeriod:        14,
+							MACDFastPeriod:        fast,
+							MACDSlowPeriod:        slow,
+							MACDSignalPeriod:      9,
+							OBVMAPeriod:           obvPeriod, // Pass the OBV period to the backtest
+						}
 
-					// --- MODIFIED: The call to RunBacktest now passes the trading config struct ---
-					result := strategy.RunBacktest(bars, params, o.config.Trading)
+						result := strategy.RunBacktest(bars, params, o.config.Trading)
 
-					if result.NetProfit > bestScore {
-						bestScore = result.NetProfit
-						bestResult = result
+						if result.NetProfit > bestScore {
+							bestScore = result.NetProfit
+							bestResult = result
+						}
 					}
 				}
 			}
@@ -109,10 +112,12 @@ func (o *Optimizer) RunOptimizationCycle(ctx context.Context, assetPair string) 
 	}
 
 	if bestScore > -1e9 {
-		o.logger.LogInfo("[Optimizer] Found new best parameters for %s -> Profit: %.2f | RSI(%d) StochBuy(%.1f) MACD(%d,%d,%d)",
+		// --- MODIFIED: Updated log message to include the new OBV parameter ---
+		o.logger.LogInfo("[Optimizer] Found new best parameters for %s -> Profit: %.2f | RSI(%d) StochBuy(%.1f) MACD(%d,%d,%d) OBV_MA(%d)",
 			assetPair, bestResult.NetProfit,
 			bestResult.Parameters.RSIPeriod, bestResult.Parameters.StochRSIBuyThreshold,
-			bestResult.Parameters.MACDFastPeriod, bestResult.Parameters.MACDSlowPeriod, bestResult.Parameters.MACDSignalPeriod)
+			bestResult.Parameters.MACDFastPeriod, bestResult.Parameters.MACDSlowPeriod, bestResult.Parameters.MACDSignalPeriod,
+			bestResult.Parameters.OBVMAPeriod)
 
 		finalParams := o.config.Indicators
 		finalParams.RSIPeriod = bestResult.Parameters.RSIPeriod
@@ -120,6 +125,7 @@ func (o *Optimizer) RunOptimizationCycle(ctx context.Context, assetPair string) 
 		finalParams.MACDFastPeriod = bestResult.Parameters.MACDFastPeriod
 		finalParams.MACDSlowPeriod = bestResult.Parameters.MACDSlowPeriod
 		finalParams.MACDSignalPeriod = bestResult.Parameters.MACDSignalPeriod
+		finalParams.OBVMAPeriod = bestResult.Parameters.OBVMAPeriod // Save the best OBV period
 
 		o.saveOptimizedParams(finalParams)
 

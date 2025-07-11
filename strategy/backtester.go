@@ -35,6 +35,22 @@ func RunBacktest(bars []utilities.OHLCVBar, indicatorParams utilities.Indicators
 	if indicatorParams.RSIPeriod > requiredBars {
 		requiredBars = indicatorParams.RSIPeriod
 	}
+	// --- MODIFIED: Ensure enough bars for OBV MA calculation ---
+	if indicatorParams.OBVMAPeriod > requiredBars {
+		requiredBars = indicatorParams.OBVMAPeriod
+	}
+
+	// Pre-calculate the full OBV series once for efficiency
+	fullObvSeries := make([]float64, len(bars))
+	for i := 1; i < len(bars); i++ {
+		if bars[i].Close > bars[i-1].Close {
+			fullObvSeries[i] = fullObvSeries[i-1] + bars[i].Volume
+		} else if bars[i].Close < bars[i-1].Close {
+			fullObvSeries[i] = fullObvSeries[i-1] - bars[i].Volume
+		} else {
+			fullObvSeries[i] = fullObvSeries[i-1]
+		}
+	}
 
 	for i := requiredBars; i < len(bars); i++ {
 		currentBars := bars[:i+1]
@@ -44,7 +60,12 @@ func RunBacktest(bars []utilities.OHLCVBar, indicatorParams utilities.Indicators
 			rsi := CalculateRSI(currentBars, indicatorParams.RSIPeriod)
 			macdHist := CalculateMACD(currentBars, indicatorParams.MACDFastPeriod, indicatorParams.MACDSlowPeriod, indicatorParams.MACDSignalPeriod)
 
-			if macdHist > 0 && rsi < 60 {
+			// --- MODIFIED: Incorporate OBV trend confirmation ---
+			currentOBV := fullObvSeries[i]
+			obvSMA := CalculateSMA(fullObvSeries[:i+1], indicatorParams.OBVMAPeriod)
+
+			// Entry Condition: MACD bullish, RSI is not overbought, AND OBV confirms rising volume trend
+			if macdHist > 0 && rsi < 60 && currentOBV > obvSMA {
 				currentTrade = simulatedPosition{
 					IsActive:           true,
 					EntryPrice:         currentBar.Close,
@@ -58,7 +79,6 @@ func RunBacktest(bars []utilities.OHLCVBar, indicatorParams utilities.Indicators
 		}
 
 		if currentTrade.IsActive {
-			// --- MODIFIED: Access take_profit_percentage from tradingParams ---
 			takeProfitPrice := currentTrade.AveragePrice * (1.0 + tradingParams.TakeProfitPercentage)
 			if currentBar.High >= takeProfitPrice {
 				profit := (takeProfitPrice - currentTrade.AveragePrice) * currentTrade.TotalVolume
@@ -69,7 +89,6 @@ func RunBacktest(bars []utilities.OHLCVBar, indicatorParams utilities.Indicators
 				continue
 			}
 
-			// --- MODIFIED: Access DCA grid parameters from tradingParams ---
 			if currentTrade.FilledSafetyOrders >= tradingParams.MaxSafetyOrders {
 				continue
 			}

@@ -24,6 +24,20 @@ func ComputeEMASeries(data []float64, period int) ([]float64, []float64) {
 	return ema, nil
 }
 
+// --- ADDED: Helper function to calculate SMA for a series of floats ---
+func CalculateSMA(data []float64, period int) float64 {
+	if len(data) < period {
+		return 0.0
+	}
+
+	segment := data[len(data)-period:]
+	sum := 0.0
+	for _, v := range segment {
+		sum += v
+	}
+	return sum / float64(period)
+}
+
 // CalculateATR explicitly calculates the Average True Range (ATR) over the last 'period' bars.
 func CalculateATR(bars []utilities.OHLCVBar, period int) (float64, error) { // Changed signature
 	n := len(bars)

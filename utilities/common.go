@@ -156,6 +156,7 @@ type IndicatorsConfig struct {
 	VolumeLookbackPeriod  int     `mapstructure:"volume_lookback_period"`
 	OBVPositiveThreshold  float64 `mapstructure:"obv_positive_threshold"`
 	OBVNegativeThreshold  float64 `mapstructure:"obv_negative_threshold"`
+	OBVMAPeriod           int     `mapstructure:"obv_ma_period"`
 }
 
 // InMemoryNonceCounter provides a simple in-memory nonce generator.
