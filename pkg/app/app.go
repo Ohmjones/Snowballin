@@ -197,7 +197,7 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 	startFNGUpdater(ctx, fearGreedProvider, logger, 4*time.Hour)
 
 	// --- NEW: Initialize and Start the Optimizer ---
-	optimizer := optimizer.NewOptimizer(logger, sqliteCache, cfg)
+	optimizer := optimizer.NewOptimizer(logger, sqliteCache, cfg, activeDPs[0])
 	go optimizer.StartScheduledOptimization(ctx)
 
 	loadedPositions, err := sqliteCache.LoadPositions()

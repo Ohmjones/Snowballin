@@ -7,7 +7,9 @@ import (
 	"Snowballin/utilities"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -15,10 +17,16 @@ type Optimizer struct {
 	logger *utilities.Logger
 	cache  *dataprovider.SQLiteCache
 	config *utilities.AppConfig
+	dp     dataprovider.DataProvider
 }
 
-func NewOptimizer(logger *utilities.Logger, cache *dataprovider.SQLiteCache, config *utilities.AppConfig) *Optimizer {
-	return &Optimizer{logger: logger, cache: cache, config: config}
+func NewOptimizer(logger *utilities.Logger, cache *dataprovider.SQLiteCache, config *utilities.AppConfig, dp dataprovider.DataProvider) *Optimizer {
+	return &Optimizer{
+		logger: logger,
+		cache:  cache,
+		config: config,
+		dp:     dp,
+	}
 }
 
 // RunOptimizationCycle finds the best indicator parameters for a given asset.
@@ -28,26 +36,30 @@ func (o *Optimizer) RunOptimizationCycle(ctx context.Context, assetPair string) 
 	var bars []utilities.OHLCVBar
 	var err error
 
-	// --- MODIFIED: Try multiple providers to find cached data ---
-	potentialProviders := []string{"kraken", "coingecko", "coinmarketcap"}
-	sixMonthsAgo := time.Now().AddDate(0, -6, 0)
+	// --- MODIFIED: Logic to build the correct cache key ---
+	// The optimizer now uses its data provider to get the correct ID, ensuring the key matches what was primed.
+	baseAsset := strings.Split(assetPair, "/")[0]
+	quoteAsset := strings.Split(assetPair, "/")[1]
 
-	for _, provider := range potentialProviders {
-		// Note: The key format for kraken is "BTC/USD-60" but for coingecko it is "bitcoin-usd-1h"
-		// The priming logic saves data differently. For now, we assume the optimizer uses Kraken's key format.
-		// A more robust solution might unify cache keys, but this will check the primary source.
-		cacheKey := assetPair + "-60" // Assuming 1h timeframe (60m) for optimization
-		bars, err = o.cache.GetBars(provider, cacheKey, sixMonthsAgo.UnixMilli(), time.Now().UnixMilli())
-		if err == nil && len(bars) >= 200 {
-			o.logger.LogInfo("[Optimizer] Found sufficient historical data for %s under provider '%s'", assetPair, provider)
-			break // We found enough data, exit the provider loop
-		}
-	}
-
-	if len(bars) < 200 { // Check after trying all providers
-		o.logger.LogError("[Optimizer] Could not fetch sufficient historical data for %s from any provider: %v", assetPair, err)
+	coinID, err := o.dp.GetCoinID(ctx, baseAsset)
+	if err != nil {
+		o.logger.LogError("[Optimizer] Could not get CoinGecko ID for %s: %v", baseAsset, err)
 		return
 	}
+
+	// For optimization, we'll use the 1-hour timeframe ("1h" is the user-friendly format)
+	interval := "1h"
+	cacheKey := fmt.Sprintf("%s-%s-%s", coinID, strings.ToLower(quoteAsset), interval)
+	providerName := "coingecko" // We know the data was primed from CoinGecko
+
+	sixMonthsAgo := time.Now().AddDate(0, -6, 0)
+	bars, err = o.cache.GetBars(providerName, cacheKey, sixMonthsAgo.UnixMilli(), time.Now().UnixMilli())
+
+	if err != nil || len(bars) < 200 {
+		o.logger.LogError("[Optimizer] Could not fetch sufficient historical data for key '%s' under provider '%s': %v", cacheKey, providerName, err)
+		return
+	}
+	o.logger.LogInfo("[Optimizer] Found %d historical bars for key '%s' to run backtest.", len(bars), cacheKey)
 
 	var bestResult strategy.BacktestResult
 	bestScore := -1.0
@@ -56,12 +68,9 @@ func (o *Optimizer) RunOptimizationCycle(ctx context.Context, assetPair string) 
 	for rsiPeriod := 10; rsiPeriod <= 20; rsiPeriod += 2 {
 		for fast := 10; fast <= 15; fast++ {
 			for slow := 20; slow <= 30; slow += 2 {
-				// Create a context for the backtest to allow for cancellation
-				// This is good practice if backtests become very long
 				btCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 				defer cancel()
 
-				// Check for parent context cancellation before starting a heavy operation
 				if btCtx.Err() != nil {
 					o.logger.LogWarn("[Optimizer] Optimization cycle for %s cancelled.", assetPair)
 					return
@@ -71,7 +80,7 @@ func (o *Optimizer) RunOptimizationCycle(ctx context.Context, assetPair string) 
 					RSIPeriod:        rsiPeriod,
 					MACDFastPeriod:   fast,
 					MACDSlowPeriod:   slow,
-					MACDSignalPeriod: 9, // Can also be optimized
+					MACDSignalPeriod: 9,
 				}
 
 				// 3. Run the backtest for each combination
