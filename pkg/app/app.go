@@ -165,32 +165,34 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 	// --- Optional Pre-Flight: Prime Historical Data Cache ---
 	if cfg.Preflight.PrimeHistoricalData && len(activeDPs) > 0 {
 		logger.LogInfo("Pre-Flight Prime: Historical data priming is ENABLED. Fetching %d days of data...", cfg.Preflight.PrimingDays)
-		primeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Minute) // Generous timeout for bulk download
+		primeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 		defer cancel()
 
-		// --- MODIFIED: Loop through ALL active data providers ---
 		for _, providerToUse := range activeDPs {
 			providerName := providerNames[providerToUse]
-			logger.LogInfo("Pre-Flight Prime: Using provider '%s' for data priming.", providerName)
 
-			for _, pair := range cfg.Trading.AssetPairs {
-				logger.LogInfo("Pre-Flight Prime: Priming data for %s...", pair)
-				baseAsset := strings.Split(pair, "/")[0]
+			// --- MODIFIED: Only run historical priming for the provider that supports it ---
+			if providerName == "coingecko" {
+				logger.LogInfo("Pre-Flight Prime: Using provider '%s' for historical data priming.", providerName)
 
-				coinID, err := providerToUse.GetCoinID(primeCtx, baseAsset)
-				if err != nil {
-					logger.LogError("Pre-Flight Prime: Could not get coin ID for %s using provider %s. Skipping. Error: %v", baseAsset, providerName, err)
-					continue
-				}
+				for _, pair := range cfg.Trading.AssetPairs {
+					logger.LogInfo("Pre-Flight Prime: Priming data for %s...", pair)
+					baseAsset := strings.Split(pair, "/")[0]
 
-				for _, tf := range append(cfg.Consensus.MultiTimeframe.AdditionalTimeframes, cfg.Consensus.MultiTimeframe.BaseTimeframe) {
-					logger.LogDebug("Pre-Flight Prime: Fetching %s data for %s...", tf, pair)
-					err := providerToUse.PrimeHistoricalData(primeCtx, coinID, cfg.Trading.QuoteCurrency, tf, cfg.Preflight.PrimingDays)
+					coinID, err := providerToUse.GetCoinID(primeCtx, baseAsset)
 					if err != nil {
-						logger.LogWarn("Pre-Flight Prime: Failed to prime %s data for %s using %s. Continuing. Error: %v", tf, pair, providerName, err)
+						logger.LogError("Pre-Flight Prime: Could not get coin ID for %s using provider %s. Skipping. Error: %v", baseAsset, providerName, err)
+						continue
 					}
-					// Keep a small delay to be friendly to APIs
-					time.Sleep(2 * time.Second)
+
+					for _, tf := range append(cfg.Consensus.MultiTimeframe.AdditionalTimeframes, cfg.Consensus.MultiTimeframe.BaseTimeframe) {
+						logger.LogDebug("Pre-Flight Prime: Fetching %s data for %s...", tf, pair)
+						err := providerToUse.PrimeHistoricalData(primeCtx, coinID, cfg.Trading.QuoteCurrency, tf, cfg.Preflight.PrimingDays)
+						if err != nil {
+							logger.LogWarn("Pre-Flight Prime: Failed to prime %s data for %s using %s. Continuing. Error: %v", tf, pair, providerName, err)
+						}
+						time.Sleep(2 * time.Second)
+					}
 				}
 			}
 		}
@@ -767,17 +769,22 @@ func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair 
 		}
 
 		extMarketData, mdErr := dp.GetMarketData(ctx, []string{providerCoinID}, state.config.Trading.QuoteCurrency)
-		extOHLCVBars, ohlcvErr := dp.GetOHLCVHistorical(ctx, providerCoinID, state.config.Trading.QuoteCurrency, tfCfg.BaseTimeframe)
+
+		// --- MODIFIED: Only fetch historical data from the provider that supports it ---
+		var extOHLCVBars []utilities.OHLCVBar
+		if providerName == "coingecko" {
+			var ohlcvErr error
+			extOHLCVBars, ohlcvErr = dp.GetOHLCVHistorical(ctx, providerCoinID, state.config.Trading.QuoteCurrency, tfCfg.BaseTimeframe)
+			if ohlcvErr != nil {
+				state.logger.LogWarn("gatherConsolidatedData [%s]: %s GetOHLCVHistorical failed: %v", assetPair, providerName, ohlcvErr)
+			}
+		}
 
 		var currentPrice float64
 		if mdErr == nil && len(extMarketData) > 0 {
 			currentPrice = extMarketData[0].CurrentPrice
 		} else if mdErr != nil {
 			state.logger.LogWarn("gatherConsolidatedData [%s]: %s GetMarketData failed: %v", assetPair, providerName, mdErr)
-		}
-
-		if ohlcvErr != nil {
-			state.logger.LogWarn("gatherConsolidatedData [%s]: %s GetOHLCVHistorical failed: %v", assetPair, providerName, ohlcvErr)
 		}
 
 		consolidatedData.ProvidersData = append(consolidatedData.ProvidersData, strategy.ProviderData{

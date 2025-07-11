@@ -40,29 +40,24 @@ func (o *Optimizer) RunOptimizationCycle(ctx context.Context, assetPair string) 
 	interval := "1h"
 	sixMonthsAgo := time.Now().AddDate(0, -6, 0)
 
-	potentialProviders := []string{"coingecko", "coinmarketcap"}
+	// --- MODIFIED: Since only CoinGecko has the required historical data, we now query it directly. ---
+	providerName := "coingecko"
 
-	for _, providerName := range potentialProviders {
-		// --- MODIFIED: Removed unused 'provider' variable ---
-
-		id, err := o.dp.GetCoinID(ctx, baseAsset)
-		if err != nil {
-			o.logger.LogWarn("[Optimizer] Could not get asset ID for %s, skipping provider %s", baseAsset, providerName)
-			continue
-		}
-
-		cacheKey := fmt.Sprintf("%s-%s-%s", id, strings.ToLower(quoteAsset), interval)
-		bars, err = o.cache.GetBars(providerName, cacheKey, sixMonthsAgo.UnixMilli(), time.Now().UnixMilli())
-		if err == nil && len(bars) >= 40 {
-			o.logger.LogInfo("[Optimizer] Found sufficient historical data for %s under provider '%s' with key '%s'", assetPair, providerName, cacheKey)
-			break
-		}
-	}
-
-	if len(bars) < 200 {
-		o.logger.LogError("[Optimizer] Could not fetch sufficient historical data for %s from any provider.", assetPair)
+	id, err := o.dp.GetCoinID(ctx, baseAsset)
+	if err != nil {
+		o.logger.LogError("[Optimizer] Could not get asset ID for %s: %v", baseAsset, err)
 		return
 	}
+
+	cacheKey := fmt.Sprintf("%s-%s-%s", id, strings.ToLower(quoteAsset), interval)
+	bars, err = o.cache.GetBars(providerName, cacheKey, sixMonthsAgo.UnixMilli(), time.Now().UnixMilli())
+
+	if err != nil || len(bars) < 40 {
+		o.logger.LogError("[Optimizer] Could not fetch sufficient historical data for %s from provider '%s'. Error: %v", assetPair, providerName, err)
+		return
+	}
+
+	o.logger.LogInfo("[Optimizer] Found %d historical bars for %s to run backtest.", len(bars), assetPair)
 
 	var bestResult strategy.BacktestResult
 	bestScore := -1.0
