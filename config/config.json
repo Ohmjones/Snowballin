@@ -75,7 +75,7 @@
       "SOL/USD"
     ],
     "quote_currency": "USD",
-    "portfolio_risk_per_trade": 0.3,
+    "portfolio_risk_per_trade": 0.5,
     "base_order_size": 10.0,
     "safety_order_size": 10.0,
     "max_safety_orders": 8,
