@@ -465,72 +465,66 @@ func (c *Client) RefreshAssetPairs(ctx context.Context) error {
 	}
 	err := c.callPublic(ctx, "/0/public/AssetPairs", nil, &resp)
 	if err != nil {
+		// This block handles cases where the API call itself fails.
+		errMsg := "kraken: RefreshAssetPairs API call failed"
 		if len(resp.Error) > 0 {
-			return fmt.Errorf("kraken: AssetPairs API error: %s (underlying: %w)", strings.Join(resp.Error, ", "), err)
+			errMsg = fmt.Sprintf("kraken: AssetPairs API error: %s", strings.Join(resp.Error, ", "))
 		}
-		return fmt.Errorf("kraken: RefreshAssetPairs API call failed: %w", err)
+		return fmt.Errorf("%s (underlying: %w)", errMsg, err)
 	}
 	if len(resp.Error) > 0 {
-		return fmt.Errorf("kraken: AssetPairs API error: %s", strings.Join(resp.Error, ", "))
+		return fmt.Errorf("kraken: AssetPairs API error on successful call: %s", strings.Join(resp.Error, ", "))
 	}
 
 	c.dataMu.Lock()
 	defer c.dataMu.Unlock()
 
+	// This is a critical check. We cannot build the pair map without the asset map.
 	if len(c.assetInfoMap) == 0 {
-		c.logger.LogWarn("Kraken Client: assetInfoMap is empty during RefreshAssetPairs. Common pair mapping might be incomplete. Consider calling RefreshAssets first.")
+		c.logger.LogFatal("Kraken Client: Asset map is empty. RefreshAssets() must be called before RefreshAssetPairs().")
+		return errors.New("asset map not initialized")
 	}
 
-	c.pairInfoMap = make(map[string]AssetPairAPIInfo)
+	// Reset maps to ensure we have the latest data.
+	c.pairInfoMap = resp.Result
 	c.pairDetailsCache = make(map[string]PairDetail)
 	c.commonToKrakenPair = make(map[string]string)
 
-	quoteCurrencyCommon := "USD"
-	if c.cfg != nil && c.cfg.QuoteCurrency != "" {
-		quoteCurrencyCommon = strings.ToUpper(c.cfg.QuoteCurrency)
-	}
-
-	var krakenQuoteInternalName string
-	for kName, assetInf := range c.assetInfoMap {
-		if assetInf.Altname == quoteCurrencyCommon {
-			krakenQuoteInternalName = kName
-			break
-		}
-	}
-	if krakenQuoteInternalName == "" {
-		c.logger.LogWarn("Kraken Client: Could not find internal name for quote currency '%s'. Pair mapping may be limited.", quoteCurrencyCommon)
-	}
-
 	for krakenPairName, pairInfo := range resp.Result {
-		c.pairInfoMap[krakenPairName] = pairInfo
+		// Store the detailed pair info for later use (e.g., for order precision).
 		c.pairDetailsCache[krakenPairName] = PairDetail{
 			PairDecimals: pairInfo.PairDecimals,
 			LotDecimals:  pairInfo.LotDecimals,
 			OrderMin:     pairInfo.OrderMin,
 		}
 
-		baseAssetInternalName := pairInfo.Base
-		quoteAssetInternalName := pairInfo.Quote
+		// Look up the common names (altnames) for the base and quote assets.
+		baseAssetInfo, baseOk := c.assetInfoMap[pairInfo.Base]
+		quoteAssetInfo, quoteOk := c.assetInfoMap[pairInfo.Quote]
 
-		if assetInfoForBase, ok := c.assetInfoMap[baseAssetInternalName]; ok {
-			commonBaseAltName := assetInfoForBase.Altname
-			if commonBaseAltName != "" {
-				if krakenQuoteInternalName != "" && quoteAssetInternalName == krakenQuoteInternalName {
-					c.commonToKrakenPair[commonBaseAltName] = krakenPairName
-					if commonBaseAltName == "XBT" && c.commonToKrakenPair["BTC"] == "" {
-						c.commonToKrakenPair["BTC"] = krakenPairName
-					} else if commonBaseAltName == "BTC" && c.commonToKrakenPair["XBT"] == "" {
-						c.commonToKrakenPair["XBT"] = krakenPairName
-					}
-				} else if krakenQuoteInternalName == "" {
-					if _, exists := c.commonToKrakenPair[commonBaseAltName]; !exists {
-						c.commonToKrakenPair[commonBaseAltName] = krakenPairName
-					}
-				}
+		// If we can't identify both sides of the pair, we can't create a valid mapping.
+		if !baseOk || !quoteOk {
+			continue
+		}
+
+		commonBase := baseAssetInfo.Altname   // e.g., "XBT"
+		commonQuote := quoteAssetInfo.Altname // e.g., "USD"
+
+		if commonBase != "" && commonQuote != "" {
+			// Build the human-readable key, e.g., "XBT/USD"
+			commonPairKey := fmt.Sprintf("%s/%s", commonBase, commonQuote)
+			c.commonToKrakenPair[commonPairKey] = krakenPairName
+
+			// **CRITICAL**: Handle the special case for Bitcoin. If the base is XBT,
+			// also create a mapping for "BTC" so the config is easy to use.
+			if commonBase == "XBT" {
+				btcPairKey := fmt.Sprintf("BTC/%s", commonQuote)
+				c.commonToKrakenPair[btcPairKey] = krakenPairName
 			}
 		}
 	}
-	c.logger.LogInfo("Kraken Client: Refreshed %d asset pairs. Mapped %d assets to pairs.", len(c.pairInfoMap), len(c.commonToKrakenPair))
+
+	c.logger.LogInfo("Kraken Client: Refreshed %d asset pairs. Mapped %d human-readable pairs to Kraken API pairs.", len(c.pairInfoMap), len(c.commonToKrakenPair))
 	return nil
 }
 

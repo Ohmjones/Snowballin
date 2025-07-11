@@ -61,12 +61,19 @@ func (a *Adapter) GetInternalClient() (*Client, bool) {
 // RefreshAssetInfo ensures that the adapter's underlying client has the latest asset and pair information.
 func (a *Adapter) RefreshAssetInfo(ctx context.Context) error {
 	a.logger.LogInfo("Adapter: Refreshing Kraken asset information...")
+
+	// First, refresh the assets to get the name mapping (e.g., XXBT -> XBT).
+	// This is critical and must happen before refreshing pairs.
 	if err := a.client.RefreshAssets(ctx); err != nil {
 		return fmt.Errorf("adapter failed to refresh Kraken assets: %w", err)
 	}
-	if err := a.client.RefreshAssetPairs(ctx); err != nil { // Relies on RefreshAssets having been called
+
+	// THEN, refresh the pairs. This function uses the asset map we just fetched
+	// to build the translation layer correctly.
+	if err := a.client.RefreshAssetPairs(ctx); err != nil {
 		return fmt.Errorf("adapter failed to refresh Kraken asset pairs: %w", err)
 	}
+
 	a.logger.LogInfo("Adapter: Kraken asset information refreshed.")
 	return nil
 }

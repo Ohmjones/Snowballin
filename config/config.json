@@ -70,9 +70,9 @@
   },
   "trading": {
     "asset_pairs": [
-      "XBTUSD",
-      "ETHUSD",
-      "SOLUSD"
+      "BTC/USD",
+      "ETH/USD",
+      "SOL/USD"
     ],
     "quote_currency": "USD",
     "portfolio_risk_per_trade": 0.5,
