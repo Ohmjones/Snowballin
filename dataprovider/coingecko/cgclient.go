@@ -328,6 +328,20 @@ func (c *Client) refreshCoinIDMapIfNeeded(ctx context.Context, force bool) error
 // GetCoinID implements DataProvider interface.
 // commonAssetSymbol: e.g., "BTC", "Ethereum", "bitcoin"
 func (c *Client) GetCoinID(ctx context.Context, sym string) (string, error) {
+	up := strings.ToUpper(sym)
+	lo := strings.ToLower(sym)
+
+	// --- ADDED: Priority map for critical assets ---
+	priorityMap := map[string]string{
+		"BTC": "bitcoin",
+		"ETH": "ethereum",
+		"SOL": "solana",
+	}
+	if id, ok := priorityMap[up]; ok {
+		c.logger.LogDebug("CoinGecko GetCoinID: Found '%s' in priority map. Using ID: '%s'", up, id)
+		return id, nil
+	}
+
 	// 1) Refresh with short timeout
 	rc, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -340,31 +354,24 @@ func (c *Client) GetCoinID(ctx context.Context, sym string) (string, error) {
 
 	// 2) Grab read-lock and bail if empty
 	c.idMapMu.RLock()
-	// defer c.idMapMu.RUnlock() // This defer should be after all uses of idMap and symbolToIDMap
 	mapLen := len(c.idMap) + len(c.symbolToIDMap)
 	if mapLen == 0 {
-		c.idMapMu.RUnlock() // Unlock before returning
+		c.idMapMu.RUnlock()
 		return "", fmt.Errorf(
 			"CoinGecko ID map is empty for asset '%s'; initial population may be pending or failed",
 			sym,
 		)
 	}
 
-	// 3) Prepare lookup keys
-	up := strings.ToUpper(sym)
-	lo := strings.ToLower(sym)
-
 	// 4) Data-driven lookup strategies
-	// Check idMap first (common uppercase symbol to CG ID, CG ID to CG ID)
 	if id, ok := c.idMap[up]; ok {
 		c.idMapMu.RUnlock()
 		return id, nil
 	}
-	if id, ok := c.idMap[lo]; ok { // This covers direct ID lookup if 'sym' was already the CG ID
+	if id, ok := c.idMap[lo]; ok {
 		c.idMapMu.RUnlock()
 		return id, nil
 	}
-	// Then check symbolToIDMap (lowercase symbol or name to CG ID)
 	if id, ok := c.symbolToIDMap[lo]; ok {
 		c.idMapMu.RUnlock()
 		return id, nil
@@ -376,13 +383,13 @@ func (c *Client) GetCoinID(ctx context.Context, sym string) (string, error) {
 			c.idMapMu.RUnlock()
 			return id, nil
 		}
-		if id, ok := c.idMap["bitcoin"]; ok { // "bitcoin" should be in idMap (lo map) or symbolToIDMap
+		if id, ok := c.idMap["bitcoin"]; ok {
 			c.idMapMu.RUnlock()
 			return id, nil
 		}
 	}
 
-	c.idMapMu.RUnlock() // Unlock after all checks
+	c.idMapMu.RUnlock()
 
 	// 6) Nothing matched
 	c.logger.LogWarn(

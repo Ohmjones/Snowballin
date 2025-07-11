@@ -81,25 +81,26 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 	totalValue := 0.0
 	quoteCurrencyUpper := strings.ToUpper(quoteCurrency)
 
-	// Get Kraken's internal name for the quote currency (e.g., "ZUSD" for "USD")
 	krakenQuoteAsset, err := a.client.GetKrakenAssetName(ctx, quoteCurrencyUpper)
 	if err != nil {
-		// If direct lookup fails, try common known ones or default
 		a.logger.LogWarn("Could not directly map quote currency '%s' to Kraken asset name: %v. Trying common defaults.", quoteCurrencyUpper, err)
 		switch quoteCurrencyUpper {
 		case "USD":
-			krakenQuoteAsset = "ZUSD" // Common Kraken representation for USD
+			krakenQuoteAsset = "ZUSD"
 		case "EUR":
 			krakenQuoteAsset = "ZEUR"
-		// Add other common mappings if needed
 		default:
-			// If still not found, we might not be able to value assets correctly if they aren't already in the quote currency.
-			// However, balances are keyed by Kraken's asset names.
-			krakenQuoteAsset = quoteCurrencyUpper // Assume direct match if no specific mapping known, might fail for some.
+			krakenQuoteAsset = quoteCurrencyUpper
 		}
 	}
 
 	for assetName, balanceStr := range balances {
+		// --- ADDED: Logic to skip futures (.F) assets ---
+		if strings.HasSuffix(assetName, ".F") {
+			a.logger.LogDebug("GetAccountValue: Skipping futures asset %s", assetName)
+			continue
+		}
+
 		balance, err := strconv.ParseFloat(balanceStr, 64)
 		if err != nil {
 			a.logger.LogWarn("GetAccountValue: could not parse balance for %s ('%s'): %v", assetName, balanceStr, err)
@@ -110,20 +111,15 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 			continue
 		}
 
-		// Asset name from Kraken (e.g., "XXBT", "ZUSD")
-		if strings.EqualFold(assetName, krakenQuoteAsset) || (assetName == "USD" && krakenQuoteAsset == "ZUSD") || (assetName == "EUR" && krakenQuoteAsset == "ZEUR") { // Handling ZUSD/USD case
+		if strings.EqualFold(assetName, krakenQuoteAsset) || (assetName == "USD" && krakenQuoteAsset == "ZUSD") || (assetName == "EUR" && krakenQuoteAsset == "ZEUR") {
 			totalValue += balance
 		} else {
-			// Need to convert this asset to the quote currency value
-			// Form the pair name, e.g., XXBTZUSD from XXBT and ZUSD
-			// We need the altname for the current asset to form a common pair like "BTC/USD"
 			commonBaseAsset, err := a.client.GetCommonAssetName(ctx, assetName)
 			if err != nil {
 				a.logger.LogWarn("GetAccountValue: could not get common name for Kraken asset %s: %v. Cannot value.", assetName, err)
 				continue
 			}
 
-			// Form a common pair, e.g., "BTC/USD"
 			commonPairToFetch := commonBaseAsset + "/" + quoteCurrencyUpper
 			krakenPairForTicker, err := a.client.GetKrakenPairName(ctx, commonPairToFetch)
 			if err != nil {
