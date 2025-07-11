@@ -40,6 +40,21 @@ func LoadConfig(path string) (utilities.AppConfig, *utilities.Logger, error) {
 		return utilities.AppConfig{}, nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
+	// --- NEW: Load and merge optimized parameters ---
+	optParamsFile := "config/optimized_params.json"
+	if _, err := os.Stat(optParamsFile); err == nil {
+		viper.SetConfigFile(optParamsFile)
+		if err := viper.MergeInConfig(); err != nil {
+			fmt.Printf("Warning: could not merge optimized params: %v\n", err)
+		} else {
+			// Unmarshal again to overwrite indicator settings
+			if err := viper.Unmarshal(&config); err != nil {
+				return utilities.AppConfig{}, nil, fmt.Errorf("failed to unmarshal merged config: %w", err)
+			}
+			fmt.Println(">> Successfully loaded optimized indicator parameters.")
+		}
+	}
+
 	// Explicit Logger instantiation based on loaded config logging level
 	logLevel, err := utilities.ParseLogLevel(config.Logging.Level)
 	if err != nil {

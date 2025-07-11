@@ -1,9 +1,11 @@
 package app
 
 import (
+	"Snowballin/pkg/optimizer"
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -32,7 +34,7 @@ type TradingState struct {
 	lastGlobalMetricsFetch time.Time
 	lastBTCDominance       float64
 	openPositions          map[string]*utilities.Position
-	pendingOrders          map[string]string
+	pendingOrders          map[string]string // Maps orderID to assetPair
 	stateMutex             sync.RWMutex
 }
 
@@ -145,7 +147,6 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 	logger.LogInfo("Pre-Flight: Initializing and priming external data providers...")
 	for _, dp := range configuredDPs {
 		providerName := providerNames[dp]
-		// PrimeCache now serves as our connectivity and data-readiness check.
 		if err := dp.PrimeCache(ctx); err != nil {
 			logger.LogError("Pre-Flight: Failed to prime cache for %s: %v. This provider will be disabled.", providerName, err)
 			discordClient.SendMessage(fmt.Sprintf("⚠️ **Warning:** Data provider '%s' failed pre-flight check and will be disabled for this session.", providerName))
@@ -154,7 +155,39 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 			activeDPs = append(activeDPs, dp)
 		}
 	}
+	// --- NEW (Step 2.2): ADD THIS ENTIRE BLOCK ---
+	// --- Optional Pre-Flight: Prime Historical Data Cache ---
+	if cfg.Preflight.PrimeHistoricalData && len(activeDPs) > 0 {
+		logger.LogInfo("Pre-Flight Prime: Historical data priming is ENABLED. Fetching %d days of data...", cfg.Preflight.PrimingDays)
+		primeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Minute) // Generous timeout for bulk download
+		defer cancel()
 
+		providerToUse := activeDPs[0] // Use the first active provider for priming
+		providerName := providerNames[providerToUse]
+		logger.LogInfo("Pre-Flight Prime: Using provider '%s' for data priming.", providerName)
+
+		for _, pair := range cfg.Trading.AssetPairs {
+			logger.LogInfo("Pre-Flight Prime: Priming data for %s...", pair)
+			baseAsset := strings.Split(pair, "/")[0]
+			coinID, err := providerToUse.GetCoinID(primeCtx, baseAsset)
+			if err != nil {
+				logger.LogError("Pre-Flight Prime: Could not get coin ID for %s. Skipping. Error: %v", baseAsset, err)
+				continue
+			}
+
+			for _, tf := range append(cfg.Consensus.MultiTimeframe.AdditionalTimeframes, cfg.Consensus.MultiTimeframe.BaseTimeframe) {
+				logger.LogDebug("Pre-Flight Prime: Fetching %s data for %s...", tf, pair)
+				err := providerToUse.PrimeHistoricalData(primeCtx, coinID, cfg.Trading.QuoteCurrency, tf, cfg.Preflight.PrimingDays)
+				if err != nil {
+					logger.LogWarn("Pre-Flight Prime: Failed to prime %s data for %s. Continuing. Error: %v", tf, pair, err)
+				}
+				time.Sleep(2 * time.Second)
+			}
+		}
+		logger.LogInfo("Pre-Flight Prime: Historical data priming complete.")
+	} else {
+		logger.LogInfo("Pre-Flight Prime: Historical data priming is DISABLED.")
+	}
 	// --- 5. Initialize Remaining Services and Final State ---
 	var fearGreedProvider dataprovider.FearGreedProvider
 	if cfg.FearGreed != nil && cfg.FearGreed.BaseURL != "" {
@@ -162,6 +195,10 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 		fearGreedProvider = fgClient
 	}
 	startFNGUpdater(ctx, fearGreedProvider, logger, 4*time.Hour)
+
+	// --- NEW: Initialize and Start the Optimizer ---
+	optimizer := optimizer.NewOptimizer(logger, sqliteCache, cfg)
+	go optimizer.StartScheduledOptimization(ctx)
 
 	loadedPositions, err := sqliteCache.LoadPositions()
 	if err != nil {
@@ -202,23 +239,38 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 	}
 }
 
-// In processTradingCycle, add the call to reapStaleOrders
 func processTradingCycle(ctx context.Context, state *TradingState) {
 	state.logger.LogInfo("-------------------- New Trading Cycle --------------------")
 	currentPortfolioValue, valErr := state.broker.GetAccountValue(ctx, state.config.Trading.QuoteCurrency)
 	if valErr != nil {
 		state.logger.LogError("Cycle: Could not update portfolio value: %v", valErr)
-		currentPortfolioValue = state.peakPortfolioValue
+		return // Do not proceed if we can't get the portfolio value
 	}
+
 	state.stateMutex.Lock()
 	if currentPortfolioValue > state.peakPortfolioValue {
 		state.peakPortfolioValue = currentPortfolioValue
 	}
 	state.stateMutex.Unlock()
-	// Fetch global market data periodically, not on every cycle, to conserve API calls.
+
+	// --- ADDED: Portfolio-level Circuit Breaker ---
+	if state.config.CircuitBreaker.Enabled && state.peakPortfolioValue > 0 {
+		drawdownPercent := state.config.CircuitBreaker.DrawdownThresholdPercent / 100.0
+		drawdownThresholdValue := state.peakPortfolioValue * (1.0 - drawdownPercent)
+
+		if currentPortfolioValue <= drawdownThresholdValue {
+			reason := fmt.Sprintf("Portfolio value (%.2f) dropped below drawdown threshold (%.2f). Max drawdown of %.2f%% from peak (%.2f) was exceeded.",
+				currentPortfolioValue, drawdownThresholdValue, state.config.CircuitBreaker.DrawdownThresholdPercent, state.peakPortfolioValue)
+
+			state.logger.LogWarn("CIRCUIT BREAKER: %s", reason)
+			liquidateAllPositions(ctx, state, reason)
+			// After triggering, we should not proceed with normal trading operations for this cycle.
+			return
+		}
+	}
+
 	if time.Since(state.lastGlobalMetricsFetch) > 30*time.Minute {
 		state.logger.LogInfo("GlobalMetrics: Fetching updated global market data...")
-		// Use the first active data provider for this call.
 		if len(state.activeDPs) > 0 {
 			provider := state.activeDPs[0]
 			globalData, err := provider.GetGlobalMarketData(ctx)
@@ -233,8 +285,9 @@ func processTradingCycle(ctx context.Context, state *TradingState) {
 			}
 		}
 	}
+
 	processPendingOrders(ctx, state)
-	reapStaleOrders(ctx, state) // <-- ADD THIS CALL
+	reapStaleOrders(ctx, state)
 
 	for _, assetPair := range state.config.Trading.AssetPairs {
 		state.stateMutex.RLock()
@@ -242,14 +295,13 @@ func processTradingCycle(ctx context.Context, state *TradingState) {
 		state.stateMutex.RUnlock()
 
 		if hasPosition {
-			manageOpenPosition(ctx, state, position, currentPortfolioValue)
+			manageOpenPosition(ctx, state, position)
 		} else {
 			seekEntryOpportunity(ctx, state, assetPair, currentPortfolioValue)
 		}
 	}
 }
 
-// Add this new function to the end of the file
 func reapStaleOrders(ctx context.Context, state *TradingState) {
 	state.stateMutex.RLock()
 	if len(state.pendingOrders) == 0 {
@@ -264,16 +316,15 @@ func reapStaleOrders(ctx context.Context, state *TradingState) {
 
 	maxAge := time.Duration(state.config.Orders.MaxOrderAgeMinutesForGridBase) * time.Minute
 	if maxAge <= 0 {
-		return // Feature disabled
+		return
 	}
 
 	for _, orderID := range orderIDsToCheck {
 		order, err := state.broker.GetOrderStatus(ctx, orderID)
 		if err != nil {
-			continue // Error handled in processPendingOrders, skip here
+			continue
 		}
 
-		// Check if the order is still open and has exceeded its max age
 		if order.Status == "open" && time.Since(order.TimePlaced) > maxAge {
 			state.logger.LogWarn("Reaper: Order %s for %s is stale (age: %s). Cancelling.", orderID, order.Pair, time.Since(order.TimePlaced))
 			err := state.broker.CancelOrder(ctx, orderID)
@@ -281,7 +332,6 @@ func reapStaleOrders(ctx context.Context, state *TradingState) {
 				state.logger.LogError("Reaper: Failed to cancel stale order %s: %v", orderID, err)
 			} else {
 				state.logger.LogInfo("Reaper: Successfully cancelled stale order %s.", orderID)
-				// The order will be removed from pendingOrders by processPendingOrders in the next cycle when its status shows "canceled".
 				state.discordClient.SendMessage(fmt.Sprintf("ℹ️ Canceled stale order for %s. ID: `%s`", order.Pair, orderID))
 			}
 		}
@@ -304,8 +354,6 @@ func processPendingOrders(ctx context.Context, state *TradingState) {
 		state.logger.LogInfo("PendingOrders: Checking status of %d pending order(s).", len(orderIDsToCheck))
 	}
 
-	stratInstance := strategy.NewStrategy(state.logger)
-
 	for _, orderID := range orderIDsToCheck {
 		order, err := state.broker.GetOrderStatus(ctx, orderID)
 		if err != nil {
@@ -313,48 +361,67 @@ func processPendingOrders(ctx context.Context, state *TradingState) {
 			continue
 		}
 
-		if strings.EqualFold(order.Status, "closed") { // "closed" is Kraken's status for filled/completed
+		if strings.EqualFold(order.Status, "closed") {
 			state.logger.LogInfo("PendingOrders: Order %s for %s filled!", orderID, order.Pair)
 			state.stateMutex.Lock()
-			assetPair := state.pendingOrders[orderID]
+			assetPair, isPending := state.pendingOrders[orderID]
 
-			if strings.EqualFold(order.Side, "buy") {
-				// A buy order was filled, so we are opening a new position.
-				krakenAdapter, _ := state.broker.(*krakenBroker.Adapter)
-				krakenClient, _ := krakenAdapter.GetInternalClient()
-				krakenSpecificPairName, _ := krakenClient.GetKrakenPairName(ctx, assetPair)
-				baseTF, _ := utilities.ConvertTFToKrakenInterval(state.config.Consensus.MultiTimeframe.BaseTimeframe)
-				lookback := state.config.Consensus.MultiTimeframe.TFLookbackLengths[0]
-				bars, _ := state.broker.GetLastNOHLCVBars(ctx, krakenSpecificPairName, baseTF, lookback)
+			if isPending {
+				if strings.EqualFold(order.Side, "buy") {
+					position, hasPosition := state.openPositions[assetPair]
+					if !hasPosition { // This is a BASE order fill
+						baseOrderSizeInQuote := order.Price * order.ExecutedVol
+						newPosition := &utilities.Position{
+							AssetPair:          assetPair,
+							EntryTimestamp:     order.TimeCompleted,
+							AveragePrice:       order.Price,
+							TotalVolume:        order.ExecutedVol,
+							BaseOrderPrice:     order.Price,
+							FilledSafetyOrders: 0,
+							IsDcaActive:        true,
+							BrokerOrderID:      orderID,
+							BaseOrderSize:      baseOrderSizeInQuote, // Store the actual size in quote currency
+						}
+						newPosition.CurrentTakeProfit = newPosition.AveragePrice * (1 + state.config.Trading.TakeProfitPercentage)
+						state.openPositions[assetPair] = newPosition
+						state.discordClient.NotifyOrderFilled(order, fmt.Sprintf("✅ New Position Opened (Base Order)\nTP: %.2f", newPosition.CurrentTakeProfit))
+						if err := state.cache.SavePosition(newPosition); err != nil {
+							state.logger.LogError("PendingOrders: Failed to save new position to DB for %s: %v", assetPair, err)
+						}
 
-				avgFillPrice := order.Price
-				sl, tp, _ := stratInstance.CalculateATRBasedSLTP(bars, avgFillPrice, *state.config)
+					} else { // This is a SAFETY order fill
+						oldVolume := position.TotalVolume
+						oldAvgPrice := position.AveragePrice
+						newVolume := order.ExecutedVol
+						newPrice := order.Price
 
-				newPosition := &utilities.Position{
-					AssetPair:         assetPair,
-					EntryPrice:        avgFillPrice,
-					Volume:            order.ExecutedVol,
-					EntryTimestamp:    order.TimeCompleted,
-					CurrentStopLoss:   sl,
-					CurrentTakeProfit: tp,
-					BrokerOrderID:     orderID,
+						position.TotalVolume += newVolume
+						position.AveragePrice = ((oldAvgPrice * oldVolume) + (newPrice * newVolume)) / position.TotalVolume
+						position.FilledSafetyOrders++
+						position.CurrentTakeProfit = position.AveragePrice * (1 + state.config.Trading.TakeProfitPercentage)
+						position.IsDcaActive = true // Re-enable DCA for the next check
+
+						state.openPositions[assetPair] = position
+						state.discordClient.NotifyOrderFilled(order, fmt.Sprintf("⤵️ Safety Order #%d Filled\nNew Avg Price: %.2f\nNew TP: %.2f", position.FilledSafetyOrders, position.AveragePrice, position.CurrentTakeProfit))
+						if err := state.cache.SavePosition(position); err != nil {
+							state.logger.LogError("PendingOrders: Failed to update position in DB for %s: %v", assetPair, err)
+						}
+					}
+
+				} else { // A "sell" order was filled, closing a position.
+					if pos, ok := state.openPositions[assetPair]; ok {
+						profit := (order.Price - pos.AveragePrice) * pos.TotalVolume
+						profitPercent := ((order.Price - pos.AveragePrice) / pos.AveragePrice) * 100
+						state.discordClient.NotifyOrderFilled(order, fmt.Sprintf("💰 Position Closed\nProfit: %.2f %s (%.2f%%)", profit, state.config.Trading.QuoteCurrency, profitPercent))
+						delete(state.openPositions, assetPair)
+						_ = state.cache.DeletePosition(assetPair)
+					}
 				}
-				state.openPositions[assetPair] = newPosition
-				state.discordClient.NotifyOrderFilled(order, "Position Opened")
 
-				// Persist the new position to the database
-				if err := state.cache.SavePosition(newPosition); err != nil {
-					state.logger.LogError("PendingOrders: Failed to save new position to DB for %s: %v", assetPair, err)
+				delete(state.pendingOrders, orderID)
+				if err := state.cache.DeletePendingOrder(orderID); err != nil {
+					state.logger.LogError("PendingOrders: Failed to delete pending order %s from DB: %v", orderID, err)
 				}
-
-			} else { // A "sell" order was filled, closing a position.
-				state.discordClient.NotifyOrderFilled(order, "Position Closed")
-			}
-
-			// The order is complete, remove it from pending state in memory and DB.
-			delete(state.pendingOrders, orderID)
-			if err := state.cache.DeletePendingOrder(orderID); err != nil {
-				state.logger.LogError("PendingOrders: Failed to delete pending order %s from DB: %v", orderID, err)
 			}
 			state.stateMutex.Unlock()
 
@@ -363,6 +430,12 @@ func processPendingOrders(ctx context.Context, state *TradingState) {
 			state.discordClient.SendMessage(fmt.Sprintf("⚠️ Order for %s failed! Status: %s, ID: `%s`", state.pendingOrders[orderID], order.Status, orderID))
 
 			state.stateMutex.Lock()
+			// If a safety order fails, we should re-enable DCA for the position
+			if pos, ok := state.openPositions[state.pendingOrders[orderID]]; ok {
+				pos.IsDcaActive = true
+				state.openPositions[state.pendingOrders[orderID]] = pos
+				_ = state.cache.SavePosition(pos)
+			}
 			delete(state.pendingOrders, orderID)
 			if err := state.cache.DeletePendingOrder(orderID); err != nil {
 				state.logger.LogError("PendingOrders: Failed to delete failed order %s from DB: %v", orderID, err)
@@ -372,9 +445,9 @@ func processPendingOrders(ctx context.Context, state *TradingState) {
 	}
 }
 
-func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities.Position, currentPortfolioValue float64) {
-	state.logger.LogInfo("ManagePosition [%s]: Managing position. Vol: %.8f, Entry: %.2f, SL: %.2f, TP: %.2f",
-		pos.AssetPair, pos.Volume, pos.EntryPrice, pos.CurrentStopLoss, pos.CurrentTakeProfit)
+func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities.Position) {
+	state.logger.LogInfo("ManagePosition [%s]: Managing position. AvgPrice: %.2f, Vol: %.8f, SOs: %d, TP: %.2f",
+		pos.AssetPair, pos.AveragePrice, pos.TotalVolume, pos.FilledSafetyOrders, pos.CurrentTakeProfit)
 
 	ticker, err := state.broker.GetTicker(ctx, pos.AssetPair)
 	if err != nil {
@@ -383,79 +456,70 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 	}
 	currentPrice := ticker.LastPrice
 
-	// Check for SL/TP hit
-	if currentPrice <= pos.CurrentStopLoss {
-		state.logger.LogWarn("ManagePosition [%s]: STOP-LOSS HIT at %.2f. Placing market sell order.", pos.AssetPair, currentPrice)
-		orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.Volume, 0, 0, "")
-		if err != nil {
-			state.logger.LogError("ManagePosition [%s]: Failed to place market sell order for stop-loss: %v", pos.AssetPair, err)
-		} else {
-			state.stateMutex.Lock()
-			delete(state.openPositions, pos.AssetPair)
-			_ = state.cache.DeletePosition(pos.AssetPair) // Persist deletion
-			state.pendingOrders[orderID] = pos.AssetPair
-			_ = state.cache.SavePendingOrder(orderID, pos.AssetPair) // Persist new pending order
-			state.stateMutex.Unlock()
-		}
-		return
-	}
-	if currentPrice >= pos.CurrentTakeProfit {
-		state.logger.LogInfo("ManagePosition [%s]: TAKE-PROFIT HIT at %.2f. Placing market sell order.", pos.AssetPair, currentPrice)
-		orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.Volume, 0, 0, "")
-		if err != nil {
-			state.logger.LogError("ManagePosition [%s]: Failed to place market sell order for take-profit: %v", pos.AssetPair, err)
-		} else {
-			state.stateMutex.Lock()
-			delete(state.openPositions, pos.AssetPair)
-			_ = state.cache.DeletePosition(pos.AssetPair)
-			state.pendingOrders[orderID] = pos.AssetPair
-			_ = state.cache.SavePendingOrder(orderID, pos.AssetPair)
-			state.stateMutex.Unlock()
-		}
-		return
-	}
-
-	// Apply Trailing Stop-Loss
-	if state.config.Trading.TrailingStopEnabled && currentPrice > pos.EntryPrice {
-		krakenAdapter, _ := state.broker.(*krakenBroker.Adapter)
-		krakenClient, _ := krakenAdapter.GetInternalClient()
-		krakenSpecificPairName, _ := krakenClient.GetKrakenPairName(ctx, pos.AssetPair)
-		baseTF, _ := utilities.ConvertTFToKrakenInterval(state.config.Consensus.MultiTimeframe.BaseTimeframe)
-		lookback := state.config.Consensus.MultiTimeframe.TFLookbackLengths[0]
-		bars, err := state.broker.GetLastNOHLCVBars(ctx, krakenSpecificPairName, baseTF, lookback)
-		if err == nil && len(bars) > 0 {
-			atr, _ := strategy.CalculateATR(bars, state.config.Indicators.ATRPeriod)
-			newTrailingStop := currentPrice - (atr * state.config.Trading.ATRStopLossMultiplier)
-			if newTrailingStop > pos.CurrentStopLoss {
-				state.logger.LogInfo("ManagePosition [%s]: Trailing stop loss. Updating from %.2f to %.2f.", pos.AssetPair, pos.CurrentStopLoss, newTrailingStop)
+	// --- ADDED: Check for a strategy-based exit signal FIRST ---
+	// Gather the necessary data to check for trend reversals
+	portfolioValue, _ := state.broker.GetAccountValue(ctx, state.config.Trading.QuoteCurrency)
+	consolidatedData, err := gatherConsolidatedData(ctx, state, pos.AssetPair, portfolioValue)
+	if err != nil {
+		state.logger.LogError("ManagePosition [%s]: Could not gather data for exit signal check: %v", pos.AssetPair, err)
+	} else {
+		stratInstance := strategy.NewStrategy(state.logger)
+		exitSignal, shouldExit := stratInstance.GenerateExitSignal(ctx, *consolidatedData, *state.config)
+		if shouldExit && exitSignal.Direction == "sell" {
+			state.logger.LogWarn("ManagePosition [%s]: STRATEGY EXIT SIGNAL received. Reason: %s. Placing market sell order.", pos.AssetPair, exitSignal.Reason)
+			orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
+			if err != nil {
+				state.logger.LogError("ManagePosition [%s]: Failed to place market sell order for strategy exit: %v", pos.AssetPair, err)
+			} else {
 				state.stateMutex.Lock()
-				pos.CurrentStopLoss = newTrailingStop
-				state.openPositions[pos.AssetPair] = pos
-				_ = state.cache.SavePosition(pos) // Persist the updated stop-loss
+				state.pendingOrders[orderID] = pos.AssetPair
+				_ = state.cache.SavePendingOrder(orderID, pos.AssetPair)
 				state.stateMutex.Unlock()
 			}
+			return // Exit since we placed a sell order
 		}
 	}
+	// --- End of strategy-based exit check ---
 
-	// Check for strategy-based exit signal
-	consolidatedData, err := gatherConsolidatedData(ctx, state, pos.AssetPair, currentPortfolioValue)
-	if err != nil {
-		state.logger.LogError("ManagePosition [%s]: Failed to gather data for exit signal check: %v", pos.AssetPair, err)
-		return
-	}
-	stratInstance := strategy.NewStrategy(state.logger)
-	signals, _ := stratInstance.GenerateSignals(ctx, *consolidatedData, *state.config)
-	for _, sig := range signals {
-		if sig.Direction == "sell" {
-			state.logger.LogInfo("ManagePosition [%s]: SELL signal received from strategy. Placing limit sell order.", pos.AssetPair)
-			orderID, placeErr := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "limit", pos.Volume, sig.RecommendedPrice, 0, "")
-			if placeErr != nil {
-				state.logger.LogError("ManagePosition [%s]: Failed to place limit sell order for exit signal: %v", pos.AssetPair, placeErr)
+	// --- Trailing Stop and Take-Profit logic (no changes from previous step) ---
+	if state.config.Trading.TrailingStopEnabled && pos.IsTrailingActive {
+		if currentPrice > pos.PeakPriceSinceTP {
+			pos.PeakPriceSinceTP = currentPrice
+			state.logger.LogInfo("ManagePosition [%s]: Trailing stop active. New peak price: %.2f", pos.AssetPair, pos.PeakPriceSinceTP)
+			if err := state.cache.SavePosition(pos); err != nil {
+				state.logger.LogError("ManagePosition [%s]: Failed to save updated peak price to DB: %v", pos.AssetPair, err)
+			}
+		}
+		trailingStopPrice := pos.PeakPriceSinceTP * (1.0 - (state.config.Trading.TrailingStopDeviation / 100.0))
+		if currentPrice <= trailingStopPrice {
+			state.logger.LogInfo("ManagePosition [%s]: TRAILING STOP-LOSS HIT at %.2f (Peak was %.2f). Placing market sell order.", pos.AssetPair, currentPrice, pos.PeakPriceSinceTP)
+			orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
+			if err != nil {
+				state.logger.LogError("ManagePosition [%s]: Failed to place market sell order for trailing stop: %v", pos.AssetPair, err)
 			} else {
-				state.logger.LogInfo("ManagePosition [%s]: Placed limit sell order %s to exit position.", pos.AssetPair, orderID)
 				state.stateMutex.Lock()
-				delete(state.openPositions, pos.AssetPair)
-				_ = state.cache.DeletePosition(pos.AssetPair)
+				state.pendingOrders[orderID] = pos.AssetPair
+				_ = state.cache.SavePendingOrder(orderID, pos.AssetPair)
+				state.stateMutex.Unlock()
+			}
+			return
+		}
+	} else if currentPrice >= pos.CurrentTakeProfit {
+		if state.config.Trading.TrailingStopEnabled {
+			pos.IsTrailingActive = true
+			pos.PeakPriceSinceTP = currentPrice
+			state.logger.LogInfo("ManagePosition [%s]: TAKE-PROFIT HIT at %.2f. Activating trailing stop-loss.", pos.AssetPair, currentPrice)
+			if err := state.cache.SavePosition(pos); err != nil {
+				state.logger.LogError("ManagePosition [%s]: Failed to save activated trailing stop to DB: %v", pos.AssetPair, err)
+			}
+			return
+		} else {
+			state.logger.LogInfo("ManagePosition [%s]: TAKE-PROFIT HIT at %.2f. Placing market sell order (trailing stop disabled).", pos.AssetPair, currentPrice)
+			orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
+			if err != nil {
+				state.logger.LogError("ManagePosition [%s]: Failed to place market sell order for take-profit: %v", pos.AssetPair, err)
+			} else {
+				state.stateMutex.Lock()
 				state.pendingOrders[orderID] = pos.AssetPair
 				_ = state.cache.SavePendingOrder(orderID, pos.AssetPair)
 				state.stateMutex.Unlock()
@@ -463,25 +527,145 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 			return
 		}
 	}
+
+	// --- Martingale DCA Safety Order logic (no changes from previous step) ---
+	if pos.IsDcaActive && pos.FilledSafetyOrders < state.config.Trading.MaxSafetyOrders {
+		var shouldPlaceSafetyOrder bool
+		var nextSafetyOrderPrice float64
+
+		if state.config.Trading.DcaSpacingMode == "atr" {
+			state.logger.LogDebug("ManagePosition [%s]: Using ATR spacing mode.", pos.AssetPair)
+			tf := state.config.Consensus.MultiTimeframe.BaseTimeframe
+			krakenInterval, _ := utilities.ConvertTFToKrakenInterval(tf)
+			bars, err := state.broker.GetLastNOHLCVBars(ctx, pos.AssetPair, krakenInterval, state.config.Trading.DcaAtrPeriod+1)
+			if err != nil || len(bars) < state.config.Trading.DcaAtrPeriod+1 {
+				state.logger.LogError("ManagePosition [%s]: Could not fetch enough bars for ATR calculation: %v", pos.AssetPair, err)
+			} else {
+				atrValue, err := strategy.CalculateATR(bars, state.config.Trading.DcaAtrPeriod)
+				if err != nil {
+					state.logger.LogError("ManagePosition [%s]: Error calculating ATR: %v", pos.AssetPair, err)
+				} else {
+					priceDeviation := atrValue * state.config.Trading.DcaAtrSpacingMultiplier * math.Pow(state.config.Trading.SafetyOrderStepScale, float64(pos.FilledSafetyOrders))
+					lastFilledPrice := pos.AveragePrice
+					if pos.FilledSafetyOrders == 0 {
+						lastFilledPrice = pos.BaseOrderPrice
+					}
+					nextSafetyOrderPrice = lastFilledPrice - priceDeviation
+					state.logger.LogDebug("ManagePosition [%s]: Checking for SO #%d (ATR). ATR=%.2f, Deviation=%.2f, Target Price <= %.2f (Current: %.2f)",
+						pos.AssetPair, pos.FilledSafetyOrders+1, atrValue, priceDeviation, nextSafetyOrderPrice, currentPrice)
+					if currentPrice <= nextSafetyOrderPrice {
+						shouldPlaceSafetyOrder = true
+					}
+				}
+			}
+		} else {
+			state.logger.LogDebug("ManagePosition [%s]: Using percentage spacing mode.", pos.AssetPair)
+			nextSONumber := pos.FilledSafetyOrders + 1
+			var totalDeviationPercentage float64
+			currentStep := state.config.Trading.PriceDeviationToOpenSafetyOrders
+			for i := 0; i < nextSONumber; i++ {
+				totalDeviationPercentage += currentStep
+				currentStep *= state.config.Trading.SafetyOrderStepScale
+			}
+			nextSafetyOrderPrice = pos.BaseOrderPrice * (1 - (totalDeviationPercentage / 100.0))
+			state.logger.LogDebug("ManagePosition [%s]: Checking for SO #%d (Percentage). Target price drop: %.2f%% -> %.2f (Current: %.2f)",
+				pos.AssetPair, nextSONumber, totalDeviationPercentage, nextSafetyOrderPrice, currentPrice)
+			if currentPrice <= nextSafetyOrderPrice {
+				shouldPlaceSafetyOrder = true
+			}
+		}
+
+		if shouldPlaceSafetyOrder {
+			nextSONumber := pos.FilledSafetyOrders + 1
+			orderSizeInQuote := pos.BaseOrderSize * math.Pow(state.config.Trading.SafetyOrderVolumeScale, float64(nextSONumber))
+			orderSizeInBase := orderSizeInQuote / currentPrice
+
+			state.logger.LogInfo("ManagePosition [%s]: Price condition met for Safety Order #%d. Placing limit buy order of %.2f %s.", pos.AssetPair, nextSONumber, orderSizeInQuote, state.config.Trading.QuoteCurrency)
+			orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "buy", "limit", orderSizeInBase, currentPrice, 0, "")
+			if err != nil {
+				state.logger.LogError("ManagePosition [%s]: Failed to place safety order: %v", pos.AssetPair, err)
+			} else {
+				state.logger.LogInfo("ManagePosition [%s]: Placed Safety Order #%d. ID: %s", pos.AssetPair, nextSONumber, orderID)
+				state.stateMutex.Lock()
+				state.pendingOrders[orderID] = pos.AssetPair
+				_ = state.cache.SavePendingOrder(orderID, pos.AssetPair)
+				pos.IsDcaActive = false
+				state.openPositions[pos.AssetPair] = pos
+				_ = state.cache.SavePosition(pos)
+				state.stateMutex.Unlock()
+			}
+		}
+	}
 }
 
 func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair string, currentPortfolioValue float64) {
+	// --- 1. Dynamic Capital Calculation ---
+	cfg := state.config.Trading
+	if len(cfg.AssetPairs) == 0 || cfg.PortfolioRiskPerTrade <= 0 {
+		return
+	}
+
+	cumulativeMultiplier := 1.0
+	for i := 1; i <= cfg.MaxSafetyOrders; i++ {
+		cumulativeMultiplier += math.Pow(cfg.SafetyOrderVolumeScale, float64(i))
+	}
+
+	capitalPerAsset := currentPortfolioValue / float64(len(cfg.AssetPairs))
+	capitalForThisTrade := capitalPerAsset * cfg.PortfolioRiskPerTrade
+
+	dynamicBaseOrderSize := capitalForThisTrade / cumulativeMultiplier
+
+	if dynamicBaseOrderSize < cfg.BaseOrderSize {
+		state.logger.LogInfo("SeekEntry [%s]: Dynamic size (%.2f) is below minimum (%.2f). Skipping trade.", assetPair, dynamicBaseOrderSize, cfg.BaseOrderSize)
+		return
+	}
+
+	state.logger.LogInfo("SeekEntry [%s]: Dynamic capital check PASSED. Calculated base order size: %.2f %s.", assetPair, dynamicBaseOrderSize, cfg.QuoteCurrency)
+
+	// --- 2. Signal Generation ---
 	consolidatedData, err := gatherConsolidatedData(ctx, state, assetPair, currentPortfolioValue)
 	if err != nil {
-		state.logger.LogError("SeekEntry [%s]: Failed to gather data: %v", assetPair, err)
+		state.logger.LogError("SeekEntry [%s]: Failed to gather data for signal generation: %v", assetPair, err)
 		return
 	}
 
 	stratInstance := strategy.NewStrategy(state.logger)
 	signals, _ := stratInstance.GenerateSignals(ctx, *consolidatedData, *state.config)
+
+	// --- 3. Order Placement ---
 	for _, sig := range signals {
 		if sig.Direction == "buy" {
-			state.logger.LogInfo("SeekEntry [%s]: BUY signal received. Confidence: %.2f. Placing order.", assetPair, sig.Confidence)
-			orderID, placeErr := state.broker.PlaceOrder(ctx, assetPair, sig.Direction, "limit", sig.CalculatedSize, sig.RecommendedPrice, 0, "")
+			// --- ADDED: Adjust final order size based on Fear & Greed Index ---
+			finalBaseOrderSize := dynamicBaseOrderSize
+			fngValue := consolidatedData.FearGreedIndex.Value
+			if fngValue > 0 { // Only apply if we have valid F&G data
+				var fngModifier float64 = 1.0
+				if fngValue <= 25 { // Extreme Fear -> Be more cautious
+					fngModifier = 0.75
+				} else if fngValue >= 75 { // Extreme Greed -> Be more aggressive
+					fngModifier = 1.25
+				}
+
+				if fngModifier != 1.0 {
+					finalBaseOrderSize = dynamicBaseOrderSize * fngModifier
+					state.logger.LogInfo("SeekEntry [%s]: Modifying order size based on F&G Index (%d). Original: %.2f, Modifier: %.2f, Final: %.2f %s",
+						assetPair, fngValue, dynamicBaseOrderSize, fngModifier, finalBaseOrderSize, cfg.QuoteCurrency)
+				}
+			}
+
+			ticker, tickerErr := state.broker.GetTicker(ctx, assetPair)
+			if tickerErr != nil || ticker.LastPrice == 0 {
+				state.logger.LogError("SeekEntry [%s]: Cannot place order, failed to get current price: %v", assetPair, tickerErr)
+				continue
+			}
+			orderSizeInBase := finalBaseOrderSize / ticker.LastPrice
+
+			state.logger.LogInfo("SeekEntry [%s]: BUY signal received. Reason: %s. Placing DYNAMIC BASE order.", assetPair, sig.Reason)
+			orderID, placeErr := state.broker.PlaceOrder(ctx, assetPair, "buy", "limit", orderSizeInBase, ticker.LastPrice, 0, "")
 			if placeErr != nil {
-				state.logger.LogError("SeekEntry [%s]: Place BUY order failed: %v", assetPair, placeErr)
+				state.logger.LogError("SeekEntry [%s]: Place DYNAMIC BASE order failed: %v", assetPair, placeErr)
 			} else {
-				state.logger.LogInfo("SeekEntry [%s]: Placed BUY order ID %s. Now tracking.", assetPair, orderID)
+				state.logger.LogInfo("SeekEntry [%s]: Placed DYNAMIC BASE order ID %s. Now tracking.", assetPair, orderID)
 				state.stateMutex.Lock()
 				state.pendingOrders[orderID] = assetPair
 				if err := state.cache.SavePendingOrder(orderID, assetPair); err != nil {
@@ -512,13 +696,13 @@ func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair 
 		FearGreedIndex:     getCurrentFNG(),
 		PortfolioValue:     currentPortfolioValue,
 		PeakPortfolioValue: state.peakPortfolioValue,
+		PrimaryOHLCVByTF:   make(map[string][]utilities.OHLCVBar),
 	}
 	state.stateMutex.RUnlock()
 
 	krakenTicker, tickerErr := state.broker.GetTicker(ctx, krakenSpecificPairName)
 	if tickerErr != nil {
 		state.logger.LogWarn("gatherConsolidatedData [%s]: could not get ticker: %v", assetPair, tickerErr)
-		// Continue with a zero-value ticker, price will be 0. Logic must handle this.
 	}
 
 	krakenOrderBook, obErr := state.broker.GetOrderBook(ctx, krakenSpecificPairName, 20)
@@ -529,7 +713,7 @@ func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair 
 
 	tfCfg := state.config.Consensus.MultiTimeframe
 	allTFs := append([]string{tfCfg.BaseTimeframe}, tfCfg.AdditionalTimeframes...)
-	krakenBaseBars, krakenOHLCVByTF := []utilities.OHLCVBar{}, make(map[string][]utilities.OHLCVBar)
+	var krakenBaseBars []utilities.OHLCVBar
 	baseBarsFound := false
 	for idx, tfString := range allTFs {
 		if idx >= len(tfCfg.TFLookbackLengths) {
@@ -544,9 +728,9 @@ func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair 
 		bars, barsErr := state.broker.GetLastNOHLCVBars(ctx, krakenSpecificPairName, krakenInterval, lookback)
 		if barsErr != nil {
 			state.logger.LogError("gatherConsolidatedData [%s]: could not get OHLCV for %s: %v", assetPair, tfString, barsErr)
-			continue // Skip this timeframe if it fails
+			continue
 		}
-		krakenOHLCVByTF[tfString] = bars
+		consolidatedData.PrimaryOHLCVByTF[tfString] = bars
 		if tfString == tfCfg.BaseTimeframe {
 			krakenBaseBars = bars
 			if len(bars) > 0 {
@@ -554,7 +738,7 @@ func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair 
 			}
 		}
 	}
-	consolidatedData.PrimaryOHLCVByTF = krakenOHLCVByTF
+
 	if !baseBarsFound {
 		return nil, errors.New("could not fetch base timeframe OHLCV data from broker")
 	}
@@ -594,4 +778,28 @@ func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair 
 	}
 
 	return consolidatedData, nil
+}
+
+// --- ADDED: Helper function to liquidate all open positions ---
+func liquidateAllPositions(ctx context.Context, state *TradingState, reason string) {
+	state.stateMutex.Lock() // Use a full lock as we are modifying positions
+	defer state.stateMutex.Unlock()
+
+	state.discordClient.SendMessage(fmt.Sprintf("🚨 **CIRCUIT BREAKER TRIGGERED** 🚨\n**Reason:** %s\nAttempting to liquidate all open positions.", reason))
+
+	for assetPair, position := range state.openPositions {
+		if position.TotalVolume > 0 {
+			state.logger.LogWarn("CircuitBreaker: Liquidating position for %s (Volume: %f)", assetPair, position.TotalVolume)
+			orderID, err := state.broker.PlaceOrder(ctx, assetPair, "sell", "market", position.TotalVolume, 0, 0, "")
+			if err != nil {
+				state.logger.LogError("CircuitBreaker: Failed to place liquidation order for %s: %v", assetPair, err)
+				state.discordClient.SendMessage(fmt.Sprintf("🔥 **LIQUIDATION FAILED for %s! Manual intervention required!**", assetPair))
+			} else {
+				state.logger.LogInfo("CircuitBreaker: Liquidation order placed for %s. ID: %s", assetPair, orderID)
+				state.pendingOrders[orderID] = assetPair // Track the sell order
+				_ = state.cache.SavePendingOrder(orderID, assetPair)
+				// The position will be removed from state.openPositions once the sell order is confirmed filled.
+			}
+		}
+	}
 }

@@ -1,9 +1,9 @@
 {
   "app_name": "Snowballin'",
-  "version": "2.0.1",
+  "version": "3.0.0",
   "environment": "production",
   "logging": {
-    "level": "debug",
+    "level": "info",
     "log_to_file": true,
     "log_file_path": "logs/snowballin.log",
     "max_size_mb": 5,
@@ -68,11 +68,6 @@
     "consecutive_cycles_trigger": 3,
     "action": "log_warning"
   },
-  "dca": {
-    "num_ladders": 3,
-    "dca_levels": [0.2, 0.3, 0.5],
-    "dca_atr_multiplier": 1.5
-  },
   "trading": {
     "asset_pairs": [
       "BTC/USD",
@@ -80,16 +75,16 @@
       "SOL/USD"
     ],
     "quote_currency": "USD",
-    "max_portfolio_drawdown": 0.20,
-    "liquidity_sell_percentage": 5.0,
-    "min_position_hold_ratio": 0.9,
-    "atr_stop_loss_multiplier": 1.5,
-    "atr_take_profit_multiplier": 2.5,
-    "trailing_stop_enabled": true,
-    "trailing_take_profit_enabled": true,
-    "default_stop_loss": 0.02,
-    "default_take_profit": 0.04,
-    "dca_atr_spacing_multiplier": 2.0,
+    "portfolio_risk_per_trade": 0.3,
+    "base_order_size": 10.0,
+    "safety_order_size": 10.0,
+    "max_safety_orders": 8,
+    "price_deviation_to_open_safety_orders": 1.5,
+    "safety_order_step_scale": 1.5,
+    "safety_order_volume_scale": 1.5,
+    "take_profit_percentage": 0.025,
+    "trailing_stop_enabled": false,
+    "stop_loss_enabled": false,
     "recalculate_after_dca_fill": true
   },
   "indicators": {
@@ -105,15 +100,26 @@
     "volume_lookback_period": 10
   },
   "consensus": {
-    "threshold_buy": 0.6,
-    "threshold_sell": 0.6,
+    "use_multi_timeframe_consensus": true,
     "multi_timeframe": {
       "base_timeframe": "1h",
-      "additional_timeframes": ["4h", "1d"],
-      "tf_lookback_lengths": [100, 100, 100]
+      "additional_timeframes": [
+        "5m",
+        "15m",
+        "4h",
+        "1d",
+        "1w"
+      ],
+      "tf_lookback_lengths": [
+        100,
+        100,
+        100,
+        100,
+        100,
+        100
+      ]
     }
   },
-
   "exit_strategy": {
     "flush_threshold_atr": 3.0,
     "max_profit_exit_percentage": 75
@@ -141,14 +147,21 @@
     "database_path": "data/snowballin.db"
   },
   "data_completeness": {
-    "substitution_sources": ["coingecko", "coinmarketcap"],
+    "substitution_sources": [
+      "coingecko",
+      "coinmarketcap"
+    ],
     "discrepancy_threshold_percent": 3.0,
     "log_level_on_substitution": "INFO",
     "log_level_on_discrepancy": "WARNING"
   },
+  "preflight": {
+    "prime_historical_data": true,
+    "priming_days": 180
+  },
   "circuit_breaker": {
-  "enabled": true,
-  "drawdown_threshold_percent": 10,
-  "atr_volatility_threshold": 5.0
-}
+    "enabled": true,
+    "drawdown_threshold_percent": 10,
+    "atr_volatility_threshold": 5.0
+  }
 }

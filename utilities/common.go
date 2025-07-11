@@ -1,4 +1,3 @@
-// Package utilities provides utility functions, shared types, and configurations for the Snowballin trading bot.
 package utilities
 
 import (
@@ -22,15 +21,14 @@ import (
 )
 
 // LogLevel defines the severity of a log message.
-// Higher values indicate higher severity (though iota makes Debug=0 the lowest).
 type LogLevel int
 
 const (
-	Debug LogLevel = iota // Debug messages for detailed tracing.
-	Info                  // Info messages for general operational information.
-	Warn                  // Warn messages for potential issues.
-	Error                 // Error messages for recoverable errors.
-	Fatal                 // Fatal messages for non-recoverable errors that cause termination.
+	Debug LogLevel = iota
+	Info
+	Warn
+	Error
+	Fatal
 )
 
 // --- Global Logger ---
@@ -51,17 +49,16 @@ type AppConfig struct {
 	DataProviderWeights map[string]float64     `mapstructure:"dataprovider_weights"`
 	DataDiscrepancy     DataDiscrepancyConfig  `mapstructure:"data_discrepancy"`
 	DB                  DatabaseConfig         `mapstructure:"db"`
-	DCA                 DCAConfig              `mapstructure:"dca"`
-	Debug               LogLevel
-	Discord             DiscordConfig      `mapstructure:"discord"`
-	ExitStrategy        ExitStrategyConfig `mapstructure:"exit_strategy"`
-	FearGreed           *FearGreedConfig   `mapstructure:"FearGreed"`
-	Indicators          IndicatorsConfig   `mapstructure:"indicators"`
-	Kraken              KrakenConfig       `mapstructure:"kraken"`
-	Logging             LoggingConfig      `mapstructure:"logging"`
-	Orders              OrdersConfig       `mapstructure:"orders"`
-	Trading             TradingConfig      `mapstructure:"trading"`
-	Withdrawal          WithdrawalConfig   `mapstructure:"withdrawal"`
+	Discord             DiscordConfig          `mapstructure:"discord"`
+	ExitStrategy        ExitStrategyConfig     `mapstructure:"exit_strategy"`
+	FearGreed           *FearGreedConfig       `mapstructure:"FearGreed"`
+	Indicators          IndicatorsConfig       `mapstructure:"indicators"`
+	Kraken              KrakenConfig           `mapstructure:"kraken"`
+	Logging             LoggingConfig          `mapstructure:"logging"`
+	Orders              OrdersConfig           `mapstructure:"orders"`
+	Trading             TradingConfig          `mapstructure:"trading"`
+	Withdrawal          WithdrawalConfig       `mapstructure:"withdrawal"`
+	Preflight           PreflightConfig        `mapstructure:"preflight"`
 }
 
 // CircuitBreakerConfig defines parameters to halt trading during extreme market conditions.
@@ -104,10 +101,8 @@ type CoinmarketcapConfig struct {
 
 // ConsensusConfig defines how different signals are weighted to reach a trading decision.
 type ConsensusConfig struct {
-	ThresholdBuy                 float64       `mapstructure:"threshold_buy"`
-	ThresholdSell                float64       `mapstructure:"threshold_sell"`
-	CoinGeckoProviderWeightShare float64       `mapstructure:"coin_gecko_provider_weight_share"`
-	MultiTimeframe               MultiTFConfig `mapstructure:"multi_timeframe"`
+	UseMultiTimeframeConsensus bool          `mapstructure:"use_multi_timeframe_consensus"` // New field to enable MTF
+	MultiTimeframe             MultiTFConfig `mapstructure:"multi_timeframe"`
 }
 
 // DatabaseConfig holds settings for database connections.
@@ -128,13 +123,6 @@ type DataDiscrepancyConfig struct {
 	ThresholdPercent         float64 `mapstructure:"threshold_percent"`
 	ConsecutiveCyclesTrigger int     `mapstructure:"consecutive_cycles_trigger"`
 	Action                   string  `mapstructure:"action"`
-}
-
-// DCAConfig holds settings for Dollar-Cost Averaging strategies.
-type DCAConfig struct {
-	NumLadders       int       `mapstructure:"num_ladders"`
-	DCALevels        []float64 `mapstructure:"dca_levels"`
-	DCAATRMultiplier float64   `mapstructure:"dca_atr_multiplier"`
 }
 
 // DiscordConfig holds settings for sending notifications via Discord.
@@ -322,35 +310,59 @@ type OrdersConfig struct {
 	MaxOrderAgeMinutesDynamicCap  float64 `mapstructure:"max_order_age_minutes_dynamic_cap"`
 }
 
-// Position holds the state of an active trade for a specific asset pair.
+// Position holds the state of an active trade, updated to support the Martingale DCA strategy.
 type Position struct {
-	AssetPair         string
-	EntryPrice        float64
-	Volume            float64
-	EntryTimestamp    time.Time
-	CurrentStopLoss   float64
-	CurrentTakeProfit float64
-	BrokerOrderID     string
+	AssetPair      string    `json:"asset_pair"`
+	EntryTimestamp time.Time `json:"entry_timestamp"`
+
+	// Core DCA State
+	AveragePrice       float64 `json:"average_price"`
+	TotalVolume        float64 `json:"total_volume"`
+	BaseOrderPrice     float64 `json:"base_order_price"`
+	FilledSafetyOrders int     `json:"filled_safety_orders"`
+	IsDcaActive        bool    `json:"is_dca_active"`
+	BaseOrderSize      float64 `json:"base_order_size"`
+
+	// Target and Management
+	CurrentTakeProfit float64 `json:"current_take_profit"`
+	BrokerOrderID     string  `json:"broker_order_id"` // Tracks the initial base order ID
+
+	// Trailing Stop Loss
+	IsTrailingActive bool    `json:"is_trailing_active"`
+	PeakPriceSinceTP float64 `json:"peak_price_since_tp"`
 }
 
-// TradingConfig holds general trading parameters.
+type PreflightConfig struct {
+	PrimeHistoricalData bool `mapstructure:"prime_historical_data"`
+	PrimingDays         int  `mapstructure:"priming_days"`
+}
+
+// TradingConfig holds general trading parameters, updated for the new DCA strategy.
 type TradingConfig struct {
-	AssetPairs                []string `mapstructure:"asset_pairs"`
-	QuoteCurrency             string   `mapstructure:"quote_currency"`
-	MaxPortfolioDrawdown      float64  `mapstructure:"max_portfolio_drawdown"`
-	LiquiditySellPercentage   float64  `mapstructure:"liquidity_sell_percentage"`
-	MinPositionHoldRatio      float64  `mapstructure:"min_position_hold_ratio"`
-	ATRStopLossMultiplier     float64  `mapstructure:"atr_stop_loss_multiplier"`
-	ATRTakeProfitMultiplier   float64  `mapstructure:"atr_take_profit_multiplier"`
-	TrailingStopEnabled       bool     `mapstructure:"trailing_stop_enabled"`
-	TrailingTakeProfitEnabled bool     `mapstructure:"trailing_take_profit_enabled"`
-	DefaultStopLoss           float64  `mapstructure:"default_stop_loss"`
-	DefaultTakeProfit         float64  `mapstructure:"default_take_profit"`
-	DcaAtrSpacingMultiplier   float64  `mapstructure:"dca_atr_spacing_multiplier"`
-	RecalculateAfterDcaFill   bool     `mapstructure:"recalculate_after_dca_fill"`
-	PreferredDataProvider     string   `mapstructure:"preferred_dataprovider"`
-	RiskProfile               string   `mapstructure:"risk_profile"`
-	PortfolioValue            float64
+	AssetPairs            []string `mapstructure:"asset_pairs"`
+	QuoteCurrency         string   `mapstructure:"quote_currency"`
+	MaxPortfolioDrawdown  float64  `mapstructure:"max_portfolio_drawdown"`
+	PortfolioRiskPerTrade float64  `mapstructure:"portfolio_risk_per_trade"`
+
+	// --- ADDED: Fields for ATR Spacing Mode ---
+	DcaSpacingMode          string  `mapstructure:"dca_spacing_mode"` // "percentage" or "atr"
+	DcaAtrPeriod            int     `mapstructure:"dca_atr_period"`
+	DcaAtrSpacingMultiplier float64 `mapstructure:"dca_atr_spacing_multiplier"`
+
+	// Martingale DCA Parameters (now for percentage mode)
+	BaseOrderSize                    float64 `mapstructure:"base_order_size"`
+	SafetyOrderSize                  float64 `mapstructure:"safety_order_size"`
+	MaxSafetyOrders                  int     `mapstructure:"max_safety_orders"`
+	SafetyOrderVolumeScale           float64 `mapstructure:"safety_order_volume_scale"`
+	SafetyOrderStepScale             float64 `mapstructure:"safety_order_step_scale"`
+	PriceDeviationToOpenSafetyOrders float64 `mapstructure:"price_deviation_to_open_safety_orders"`
+
+	// Profit Taking and Risk Management
+	TakeProfitPercentage    float64 `mapstructure:"take_profit_percentage"`
+	TrailingStopEnabled     bool    `mapstructure:"trailing_stop_enabled"`
+	TrailingStopDeviation   float64 `mapstructure:"trailing_stop_deviation"` // Make sure this was added in step 1
+	StopLossEnabled         bool    `mapstructure:"stop_loss_enabled"`
+	RecalculateAfterDcaFill bool    `mapstructure:"recalculate_after_dca_fill"`
 }
 
 // WithdrawalConfig holds settings for automated withdrawal of funds.

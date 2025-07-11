@@ -8,44 +8,16 @@ import (
 
 // DataProvider defines the interface for accessing market data from various sources.
 type DataProvider interface {
-	// GetSupportedCoins retrieves a list of all coins supported by the provider.
-	// Implementations should handle caching and mapping to the common dataprovider.Coin type.
 	GetSupportedCoins(ctx context.Context) ([]Coin, error)
-
-	// GetMarketData retrieves current market data for a list of coin IDs.
-	// ids: A slice of provider-specific coin identifiers (e.g., "bitcoin" for CoinGecko, "1" for CoinMarketCap).
-	// vsCurrency: The target currency for price and market cap data (e.g., "USD").
 	GetMarketData(ctx context.Context, ids []string, vsCurrency string) ([]MarketData, error)
-
-	// GetOHLCVHistorical retrieves historical Open, High, Low, Close, and Volume data.
-	// id: Provider-specific coin identifier.
-	// vsCurrency: The target currency.
-	// interval: A string representing the desired candle interval (e.g., "1d", "4h", "1h").
-	//           Implementations should map this to provider-specific interval codes.
 	GetOHLCVHistorical(ctx context.Context, id, vsCurrency, interval string) ([]utilities.OHLCVBar, error)
-
-	// GetHistoricalPrice retrieves the price of a coin on a specific past date.
-	// id: Provider-specific coin identifier.
-	// date: The date string in "DD-MM-YYYY" format.
 	GetHistoricalPrice(ctx context.Context, id, date string) (HistoricalPrice, error)
-
-	// GetExchangeDetails retrieves information about a specific exchange.
-	// exchangeID: Provider-specific exchange identifier (often a slug like "binance").
 	GetExchangeDetails(ctx context.Context, exchangeID string) (ExchangeDetails, error)
-
-	// GetGlobalMarketData retrieves overall cryptocurrency market metrics.
 	GetGlobalMarketData(ctx context.Context) (GlobalMarketData, error)
-
-	// GetCoinID dynamically resolves a common asset symbol (e.g., "BTC", "Ethereum")
-	// to its provider-specific API ID (e.g., "bitcoin", "1").
-	// This is crucial for allowing the application to work with common symbols
-	// while the provider client handles the mapping.
 	GetCoinID(ctx context.Context, commonAssetSymbol string) (string, error)
-	// PrimeCache ensures that any necessary preliminary data (like ID maps) is fetched
-	// and cached before the main application loop starts.
 	PrimeCache(ctx context.Context) error
+	PrimeHistoricalData(ctx context.Context, id, vsCurrency, interval string, days int) error // New method for bulk downloads
 }
-
 type FearGreedProvider interface {
 	GetFearGreedIndex(ctx context.Context) (FearGreedIndex, error)
 }

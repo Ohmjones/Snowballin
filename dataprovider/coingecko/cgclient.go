@@ -466,57 +466,51 @@ func (c *Client) GetMarketData(ctx context.Context, ids []string, vsCurrency str
 	return dpData, nil
 }
 
-// GetOHLCVHistorical fetches OHLCV data by combining /ohlc (for OHL C) and /market_chart (for Volume).
+// GetOHLCVHistorical fetches OHLCV data for a standard lookback period.
 func (c *Client) GetOHLCVHistorical(ctx context.Context, id, vsCurrency, interval string) ([]utils.OHLCVBar, error) {
-	c.logger.LogDebug("CoinGecko GetOHLCVHistorical: Fetching for ID=%s, VS=%s, Interval=%s", id, vsCurrency, interval)
+	// Use a default number of days for general purpose fetching.
+	// Your PrimeHistoricalData function will handle variable-day lookbacks.
+	days := 90
+	c.logger.LogDebug("CoinGecko GetOHLCVHistorical: Fetching for ID=%s, VS=%s, Interval=%s, Days=%d", id, vsCurrency, interval, days)
 
 	cacheProvider := "coingecko"
 	cacheCoinID := fmt.Sprintf("%s-%s-%s", id, vsCurrency, interval)
 
-	var daysForAPI string
+	// --- The original, robust cache-checking logic is preserved ---
 	var expectedIntervalDuration time.Duration
-
 	switch strings.ToLower(interval) {
-	case "1d", "daily":
-		daysForAPI = "max"
-		expectedIntervalDuration = 24 * time.Hour
 	case "4h":
-		daysForAPI = "90"
 		expectedIntervalDuration = 4 * time.Hour
 	case "1h":
-		daysForAPI = "7"
 		expectedIntervalDuration = 1 * time.Hour
 	default:
-		daysForAPI = "max"
 		expectedIntervalDuration = 24 * time.Hour
 	}
 
-	// 1. Try to fetch from cache
 	now := time.Now()
-	startTime := now.Add(-time.Duration(90) * 24 * time.Hour) // Use a reasonable lookback for cache
-	if daysForAPI != "max" {
-		d, _ := strconv.Atoi(daysForAPI)
-		startTime = now.Add(-time.Duration(d) * 24 * time.Hour)
-	}
+	startTime := now.AddDate(0, 0, -days)
 
 	cachedBars, err := c.cache.GetBars(cacheProvider, cacheCoinID, startTime.UnixMilli(), now.UnixMilli())
 	if err != nil {
 		c.logger.LogWarn("cgclient GetOHLCVHistorical [%s]: Failed to get bars from cache: %v", id, err)
 	}
+
+	// Check if the cached data is sufficient and recent
 	if len(cachedBars) > 0 {
 		latestCachedBarTime := time.UnixMilli(cachedBars[len(cachedBars)-1].Timestamp)
 		if time.Since(latestCachedBarTime) < expectedIntervalDuration {
-			c.logger.LogInfo("cgclient GetOHLCVHistorical [%s]: Using %d bars from cache.", id, len(cachedBars))
+			c.logger.LogInfo("cgclient GetOHLCVHistorical [%s]: Using %d fresh bars from cache.", id, len(cachedBars))
 			return cachedBars, nil
 		}
 	}
 
-	// 2. Fetch from API if cache is insufficient
-	c.logger.LogInfo("cgclient GetOHLCVHistorical [%s]: Cache miss or insufficient data. Fetching from API.", id)
+	c.logger.LogInfo("cgclient GetOHLCVHistorical [%s]: Cache miss or stale data. Fetching %d days from API.", id, days)
+
+	// --- API Fetching Logic ---
 	var ohlcData []cgOHLCDataPoint
 	ohlcParams := url.Values{}
 	ohlcParams.Add("vs_currency", strings.ToLower(vsCurrency))
-	ohlcParams.Add("days", daysForAPI)
+	ohlcParams.Add("days", strconv.Itoa(days))
 
 	ohlcEndpoint := fmt.Sprintf("/coins/%s/ohlc", id)
 	err = c.request(ctx, ohlcEndpoint, ohlcParams, &ohlcData)
@@ -524,13 +518,13 @@ func (c *Client) GetOHLCVHistorical(ctx context.Context, id, vsCurrency, interva
 		return nil, fmt.Errorf("failed to fetch OHLC data from CoinGecko /ohlc for %s: %w", id, err)
 	}
 	if len(ohlcData) == 0 {
+		c.logger.LogWarn("CoinGecko API returned no OHLCV data for %s over %d days.", id, days)
 		return []utils.OHLCVBar{}, nil
 	}
 
-	// Since CoinGecko OHLC does not provide volume, we'll fetch it separately
-	// and merge, or just save the OHLC data with zero volume. For simplicity, we will save with zero volume.
-	// The previous implementation's volume merge was complex and potentially inaccurate.
+	c.logger.LogInfo("Successfully fetched %d data points from CoinGecko for %s.", len(ohlcData), id)
 
+	// --- Parsing and Caching Logic is preserved ---
 	mergedBars := make([]utils.OHLCVBar, 0, len(ohlcData))
 	for _, ohlcPoint := range ohlcData {
 		if len(ohlcPoint) != 5 {
@@ -542,11 +536,11 @@ func (c *Client) GetOHLCVHistorical(ctx context.Context, id, vsCurrency, interva
 			High:      ohlcPoint[2],
 			Low:       ohlcPoint[3],
 			Close:     ohlcPoint[4],
-			Volume:    0, // Volume not available from this endpoint
+			Volume:    0, // Volume not available from this specific CoinGecko endpoint
 		}
 		mergedBars = append(mergedBars, bar)
 
-		// 3. Save to cache
+		// Save each fetched bar to the cache
 		if err := c.cache.SaveBar(cacheProvider, cacheCoinID, bar); err != nil {
 			c.logger.LogWarn("cgclient GetOHLCVHistorical [%s]: Failed to save bar to cache: %v", id, err)
 		}
@@ -696,4 +690,45 @@ func ConvertCoinGeckoMarketData(data cgMarketData) (utils.OHLCVBar, error) {
 		Close:     data.CurrentPrice,
 		Volume:    data.TotalVolume,
 	}, nil
+}
+
+func (c *Client) PrimeHistoricalData(ctx context.Context, id, vsCurrency, interval string, days int) error {
+	c.logger.LogInfo("PRIMING CoinGecko Data: Fetching %d days for ID=%s, Interval=%s", days, id, interval)
+
+	if days <= 0 {
+		return fmt.Errorf("priming days must be positive, got %d", days)
+	}
+
+	var ohlcData []cgOHLCDataPoint
+	ohlcParams := url.Values{}
+	ohlcParams.Add("vs_currency", strings.ToLower(vsCurrency))
+	ohlcParams.Add("days", strconv.Itoa(days))
+
+	ohlcEndpoint := fmt.Sprintf("/coins/%s/ohlc", id)
+	err := c.request(ctx, ohlcEndpoint, ohlcParams, &ohlcData)
+	if err != nil {
+		return fmt.Errorf("failed to fetch priming data from CoinGecko /ohlc for %s: %w", id, err)
+	}
+
+	cacheProvider := "coingecko"
+	cacheCoinID := fmt.Sprintf("%s-%s-%s", id, vsCurrency, interval)
+
+	for _, ohlcPoint := range ohlcData {
+		if len(ohlcPoint) != 5 {
+			continue
+		}
+		bar := utils.OHLCVBar{
+			Timestamp: int64(ohlcPoint[0]),
+			Open:      ohlcPoint[1],
+			High:      ohlcPoint[2],
+			Low:       ohlcPoint[3],
+			Close:     ohlcPoint[4],
+		}
+		// Save each fetched bar to the cache
+		if err := c.cache.SaveBar(cacheProvider, cacheCoinID, bar); err != nil {
+			c.logger.LogWarn("PrimeHistoricalData [%s]: Failed to save bar to cache: %v", id, err)
+		}
+	}
+	c.logger.LogInfo("PRIMING CoinGecko Data: Successfully processed and cached %d data points for %s.", len(ohlcData), id)
+	return nil
 }

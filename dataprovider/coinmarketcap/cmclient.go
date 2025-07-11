@@ -592,44 +592,29 @@ func (c *Client) GetMarketData(ctx context.Context, numericalIDs []string, vsCur
 	return marketDataSlice, nil
 }
 
-// GetOHLCVHistorical retrieves historical OHLCV data.
-// id: This is the common asset symbol (e.g., "BTC") as per the original logic in app.go when calling this.
-// We will use the internal numericalIDToSymbolMap to get the symbol if needed or GetCoinID to get numerical ID.
-// For consistency with the DataProvider interface, `id` should be the value returned by `GetCoinID` (numericalID).
-// Then, this function needs to look up the SYMBOL associated with that numericalID for the API call.
-func (c *Client) GetOHLCVHistorical(ctx context.Context, numericalCoinID, vsCurrency, userInterval string) ([]utils.OHLCVBar, error) {
-	c.logger.LogDebug("CoinMarketCap GetOHLCVHistorical: Fetching for NumericalID=%s, VS=%s, Interval=%s", numericalCoinID, vsCurrency, userInterval)
+// GetOHLCVHistorical retrieves historical OHLCV data for regular, smaller fetches.
+func (c *Client) GetOHLCVHistorical(ctx context.Context, id, vsCurrency, interval string) ([]utils.OHLCVBar, error) {
+	numericalCoinID := id
+	userInterval := interval
+	c.logger.LogDebug("CoinMarketCap GetOHLCVHistorical: Fetching for NumID=%s, VS=%s, Interval=%s", numericalCoinID, vsCurrency, userInterval)
 
-	// Get the symbol (e.g., "BTC") for the numerical ID (e.g., "1")
 	c.idMapMu.RLock()
 	assetSymbol, symbolFound := c.numericalIDToSymbolMap[numericalCoinID]
 	c.idMapMu.RUnlock()
-
 	if !symbolFound {
-		// Attempt a refresh if not found, as the map might be stale
-		refreshCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		if err := c.refreshCoinIDMapIfNeeded(refreshCtx, false); err != nil {
-			c.logger.LogWarn("CoinMarketCap GetOHLCVHistorical: Non-critical error refreshing ID map for numericalID '%s': %v.", numericalCoinID, err)
-		}
-		c.idMapMu.RLock()
-		assetSymbol, symbolFound = c.numericalIDToSymbolMap[numericalCoinID]
-		c.idMapMu.RUnlock()
-		if !symbolFound {
-			return nil, fmt.Errorf("CoinMarketCap GetOHLCVHistorical: Symbol for numerical ID %s not found in map. Map may be stale or ID invalid", numericalCoinID)
-		}
+		return nil, fmt.Errorf("CoinMarketCap GetOHLCVHistorical: Symbol for numerical ID %s not found", numericalCoinID)
 	}
 
 	cmcInterval, err := mapToCMCInterval(userInterval)
 	if err != nil {
-		c.logger.LogWarn("CoinMarketCap GetOHLCVHistorical: Invalid interval '%s', defaulting to 1d. Error: %v", userInterval, err)
-		cmcInterval = Interval1d // Default to daily if mapping fails
+		cmcInterval = Interval1d // Default
 	}
 
 	var lookbackPeriodDays int
 	var countForAPI string
 	var expectedIntervalDuration time.Duration
 
+	// This logic determines the amount of data to get for regular indicator calculations.
 	switch cmcInterval {
 	case Interval1d:
 		lookbackPeriodDays = c.cfg.OHLCVDaysDefault
@@ -639,142 +624,74 @@ func (c *Client) GetOHLCVHistorical(ctx context.Context, numericalCoinID, vsCurr
 		countForAPI = strconv.Itoa(lookbackPeriodDays)
 		expectedIntervalDuration = 24 * time.Hour
 	case Interval1h:
-		lookbackPeriodDays = 7             // Fetch 7 days for hourly data
-		countForAPI = strconv.Itoa(7 * 24) // 7 days * 24 hours
+		lookbackPeriodDays = 7
+		countForAPI = strconv.Itoa(7 * 24)
 		expectedIntervalDuration = 1 * time.Hour
 	case Interval4h:
-		lookbackPeriodDays = 30            // Fetch 30 days for 4-hourly data
-		countForAPI = strconv.Itoa(30 * 6) // 30 days * 6 (4h periods per day)
+		lookbackPeriodDays = 30
+		countForAPI = strconv.Itoa(30 * 6)
 		expectedIntervalDuration = 4 * time.Hour
-	// Add more intervals as needed, e.g., 5m, 15m
-	// For very short intervals, 'count' needs to be high to cover a decent period,
-	// and 'time_start'/'time_end' might be better if CMC supports it well for OHLCV.
-	// CMC's OHLCV 'count' seems to be number of data points for that interval.
 	default:
-		c.logger.LogWarn("CoinMarketCap GetOHLCVHistorical: Interval '%s' not specifically handled for count/lookback, defaulting to daily with config/90 days.", cmcInterval)
-		lookbackPeriodDays = c.cfg.OHLCVDaysDefault
-		if lookbackPeriodDays <= 0 {
-			lookbackPeriodDays = 90
-		}
-		countForAPI = strconv.Itoa(lookbackPeriodDays)
+		lookbackPeriodDays = 90
+		countForAPI = "90"
 		expectedIntervalDuration = 24 * time.Hour
 	}
 
 	now := time.Now().UTC()
-	// Cache range should align with the actual data we might get or need for this interval.
-	// For daily, it's straightforward. For hourly, if we fetch 7 days, cache should cover that.
-	cacheStartTime := now.AddDate(0, 0, -lookbackPeriodDays) // Approximate start for cache query
-	cacheStartTimestamp := cacheStartTime.UnixMilli()
-	cacheEndTimestamp := now.UnixMilli() // Up to current time
+	cacheStartTime := now.AddDate(0, 0, -lookbackPeriodDays)
 
-	// Try fetching from SQLite cache first
-	// The coin_id in cache is the symbol (e.g., "BTC") for historical consistency if previously saved that way.
+	// --- FULL CACHE CHECKING AND API FETCH LOGIC ---
 	if c.cache != nil {
-		cachedBars, errCache := c.cache.GetBars(providerName, assetSymbol, cacheStartTimestamp, cacheEndTimestamp)
-		if errCache != nil {
-			c.logger.LogWarn("CoinMarketCap GetOHLCVHistorical: Error reading from SQLite cache for %s (NumID %s): %v. Will fetch.", assetSymbol, numericalCoinID, errCache)
-		} else if len(cachedBars) > 0 {
-			// Check freshness and sufficiency of cached data
+		cachedBars, errCache := c.cache.GetBars(providerName, assetSymbol, cacheStartTime.UnixMilli(), now.UnixMilli())
+		if errCache == nil && len(cachedBars) > 0 {
 			latestCachedBarTime := time.UnixMilli(cachedBars[len(cachedBars)-1].Timestamp).UTC()
-			// Calculate approx number of bars expected for the lookback period
-			expectedBarsCount := int(time.Duration(lookbackPeriodDays*24) * time.Hour / expectedIntervalDuration)
-			if expectedBarsCount == 0 && lookbackPeriodDays > 0 {
-				expectedBarsCount = 1
-			}
-
-			// If cache is recent (e.g., last bar is within 2 intervals of now) AND we have a good portion of data
-			if now.Sub(latestCachedBarTime) < 2*expectedIntervalDuration && len(cachedBars) >= expectedBarsCount/2 {
-				c.logger.LogInfo("CoinMarketCap GetOHLCVHistorical: Using %d bars from SQLite cache for %s (NumID %s, Interval: %s).", len(cachedBars), assetSymbol, numericalCoinID, userInterval)
-				utils.SortBarsByTimestamp(cachedBars) // Ensure sorted
+			if now.Sub(latestCachedBarTime) < 2*expectedIntervalDuration {
+				c.logger.LogInfo("CMC GetOHLCVHistorical: Using %d bars from cache for %s.", len(cachedBars), assetSymbol)
+				utils.SortBarsByTimestamp(cachedBars)
 				return cachedBars, nil
 			}
-			c.logger.LogInfo("CoinMarketCap GetOHLCVHistorical: Cache for %s (NumID %s) is stale or insufficient (%d bars, last: %s). Fetching new data.", assetSymbol, numericalCoinID, len(cachedBars), latestCachedBarTime)
-		} else {
-			c.logger.LogInfo("CoinMarketCap GetOHLCVHistorical: No data in SQLite cache for %s (NumID %s). Fetching new data.", assetSymbol, numericalCoinID)
 		}
 	}
 
-	// --- API Fetching ---
 	params := url.Values{
-		// Use numericalCoinID if the endpoint /v2/cryptocurrency/ohlcv/historical expects numerical ID.
-		// Based on example responses, it uses the ID in the data block, but `symbol` in query params.
-		// Let's try `symbol` first as per typical CMC usage.
-		"symbol":   {strings.ToUpper(assetSymbol)}, // CMC typically uses uppercase symbol here
+		"symbol":   {strings.ToUpper(assetSymbol)},
 		"convert":  {strings.ToUpper(vsCurrency)},
 		"interval": {cmcInterval},
 		"count":    {countForAPI},
-		// "time_period": "latest", // or specify time_start, time_end
 	}
 
 	var response cmcOHLCVHistoricalResponse
 	apiErr := c.makeAPICall(ctx, "/v2/cryptocurrency/ohlcv/historical", params, &response)
 	if apiErr != nil {
-		return nil, fmt.Errorf("CMC GetOHLCVHistorical for %s (NumID %s, Interval %s) failed: %w", assetSymbol, numericalCoinID, cmcInterval, apiErr)
+		return nil, apiErr
 	}
-
 	if response.Status.ErrorCode != 0 {
-		return nil, fmt.Errorf("CMC API error for %s (NumID %s): %s (Code: %d)", assetSymbol, numericalCoinID, response.Status.ErrorMessage, response.Status.ErrorCode)
+		return nil, fmt.Errorf("CMC API error: %s", response.Status.ErrorMessage)
 	}
 
-	// Data is keyed by numerical ID in the response for this v2 endpoint
 	apiData, dataExists := response.Data[numericalCoinID]
 	if !dataExists {
-		// Fallback: try symbol if numerical ID key fails (less likely for v2 endpoint)
-		apiData, dataExists = response.Data[strings.ToUpper(assetSymbol)]
-		if !dataExists {
-			return nil, fmt.Errorf("no OHLCV data found in CMC response for symbol %s or numerical ID %s", assetSymbol, numericalCoinID)
-		}
+		return nil, fmt.Errorf("no OHLCV data for ID %s in response", numericalCoinID)
 	}
 
 	fetchedBars := make([]utils.OHLCVBar, 0, len(apiData.Quotes))
 	for _, qData := range apiData.Quotes {
 		quoteSet, ok := qData.QuoteMap[strings.ToUpper(vsCurrency)]
 		if !ok {
-			c.logger.LogWarn("GetOHLCVHistorical (CMC): Quote for currency %s not found for %s, time_open: %s", vsCurrency, apiData.Symbol, qData.TimeOpen)
 			continue
 		}
-
 		ts, parseErr := time.Parse(time.RFC3339Nano, qData.TimeOpen)
 		if parseErr != nil {
-			c.logger.LogWarn("GetOHLCVHistorical (CMC): Failed parsing TimeOpen for %s ('%s'): %v", apiData.Symbol, qData.TimeOpen, parseErr)
 			continue
 		}
 
-		fetchedBars = append(fetchedBars, utils.OHLCVBar{
-			Timestamp: ts.UnixMilli(),
-			Open:      quoteSet.Open,
-			High:      quoteSet.High,
-			Low:       quoteSet.Low,
-			Close:     quoteSet.Close,
-			Volume:    quoteSet.Volume,
-		})
-	}
-
-	if len(fetchedBars) == 0 && len(apiData.Quotes) > 0 {
-		c.logger.LogWarn("CoinMarketCap GetOHLCVHistorical: No bars constructed despite API returning quotes for %s (NumID %s).", assetSymbol, numericalCoinID)
-	}
-
-	// --- Save to SQLite Cache ---
-	if c.cache != nil && len(fetchedBars) > 0 {
-		c.logger.LogInfo("CoinMarketCap GetOHLCVHistorical: Saving %d fetched bars to SQLite cache for %s (NumID %s).", len(fetchedBars), assetSymbol, numericalCoinID)
-		savedCount := 0
-		for _, barToCache := range fetchedBars {
-			// Only cache bars that are within our queried range to keep cache relevant
-			if barToCache.Timestamp >= cacheStartTime.UnixMilli() { // Ensure we cache relevant data
-				cacheErr := c.cache.SaveBar(providerName, assetSymbol, barToCache) // Use assetSymbol as coin_id for cache consistency
-				if cacheErr != nil {
-					c.logger.LogWarn("CoinMarketCap GetOHLCVHistorical: Failed to save bar to SQLite cache for %s (T: %d): %v", assetSymbol, barToCache.Timestamp, cacheErr)
-				} else {
-					savedCount++
-				}
-			}
+		bar := utils.OHLCVBar{Timestamp: ts.UnixMilli(), Open: quoteSet.Open, High: quoteSet.High, Low: quoteSet.Low, Close: quoteSet.Close, Volume: quoteSet.Volume}
+		fetchedBars = append(fetchedBars, bar)
+		if c.cache != nil {
+			c.cache.SaveBar(providerName, assetSymbol, bar)
 		}
-		c.logger.LogInfo("CoinMarketCap GetOHLCVHistorical: Attempted to save %d bars to cache, successful: %d.", len(fetchedBars), savedCount)
 	}
-
-	utils.SortBarsByTimestamp(fetchedBars) // Ensure sorted before returning
-
-	c.logger.LogInfo("CoinMarketCap GetOHLCVHistorical: Final %d bars for %s (NumID %s, Interval: %s)", len(fetchedBars), assetSymbol, numericalCoinID, userInterval)
+	utils.SortBarsByTimestamp(fetchedBars)
 	return fetchedBars, nil
 }
 
@@ -977,4 +894,77 @@ func mapToCMCInterval(userInterval string) (string, error) {
 		}
 		return "", fmt.Errorf("unsupported or ambiguous interval for CoinMarketCap: %s", userInterval)
 	}
+}
+
+// PrimeHistoricalData fetches a large amount of historical data to populate the cache.
+func (c *Client) PrimeHistoricalData(ctx context.Context, id, vsCurrency, interval string, days int) error {
+	numericalCoinID := id
+	userInterval := interval
+	c.logger.LogInfo("PRIMING CoinMarketCap Data: Fetching %d days for ID=%s, Interval=%s", days, numericalCoinID, userInterval)
+
+	if days <= 0 {
+		return fmt.Errorf("priming days must be positive, got %d", days)
+	}
+
+	c.idMapMu.RLock()
+	assetSymbol, symbolFound := c.numericalIDToSymbolMap[numericalCoinID]
+	c.idMapMu.RUnlock()
+	if !symbolFound {
+		return fmt.Errorf("symbol for numerical ID %s not found", numericalCoinID)
+	}
+
+	cmcInterval, err := mapToCMCInterval(userInterval)
+	if err != nil {
+		cmcInterval = Interval1d
+	}
+
+	var countForAPI string
+	if cmcInterval == Interval1d {
+		countForAPI = strconv.Itoa(days)
+	} else if cmcInterval == Interval1h {
+		countForAPI = strconv.Itoa(days * 24)
+	} else if cmcInterval == Interval4h {
+		countForAPI = strconv.Itoa(days * 6)
+	} else {
+		countForAPI = "5000"
+	} // Max count for CMC
+
+	params := url.Values{
+		"symbol":   {strings.ToUpper(assetSymbol)},
+		"convert":  {strings.ToUpper(vsCurrency)},
+		"interval": {cmcInterval},
+		"count":    {countForAPI},
+	}
+
+	var response cmcOHLCVHistoricalResponse
+	apiErr := c.makeAPICall(ctx, "/v2/cryptocurrency/ohlcv/historical", params, &response)
+	if apiErr != nil {
+		return apiErr
+	}
+	if response.Status.ErrorCode != 0 {
+		return fmt.Errorf("CMC API error: %s", response.Status.ErrorMessage)
+	}
+
+	apiData, dataExists := response.Data[numericalCoinID]
+	if !dataExists {
+		return fmt.Errorf("no OHLCV data for ID %s in response", numericalCoinID)
+	}
+
+	for _, qData := range apiData.Quotes {
+		quoteSet, ok := qData.QuoteMap[strings.ToUpper(vsCurrency)]
+		if !ok {
+			continue
+		}
+		ts, parseErr := time.Parse(time.RFC3339Nano, qData.TimeOpen)
+		if parseErr != nil {
+			continue
+		}
+
+		bar := utils.OHLCVBar{Timestamp: ts.UnixMilli(), Open: quoteSet.Open, High: quoteSet.High, Low: quoteSet.Low, Close: quoteSet.Close, Volume: quoteSet.Volume}
+		if c.cache != nil {
+			c.cache.SaveBar(providerName, assetSymbol, bar)
+		}
+	}
+	c.logger.LogInfo("PRIMING CoinMarketCap Data: Successfully processed and cached %d data points for %s.", len(apiData.Quotes), assetSymbol)
+	return nil
 }

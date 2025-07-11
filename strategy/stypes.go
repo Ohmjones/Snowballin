@@ -45,6 +45,7 @@ type strategyImpl struct {
 // Strategy defines the interface for all trading strategies.
 type Strategy interface {
 	GenerateSignals(ctx context.Context, data ConsolidatedMarketPicture, cfg utilities.AppConfig) ([]StrategySignal, error)
+	GenerateExitSignal(ctx context.Context, data ConsolidatedMarketPicture, cfg utilities.AppConfig) (StrategySignal, bool)
 }
 
 // ProviderData holds market data from a single named provider relevant for consensus.
