@@ -104,6 +104,12 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 		return fmt.Errorf("pre-flight check failed: sqlite cache init failed: %w", err)
 	}
 	defer sqliteCache.Close()
+
+	// Synchronously initialize the DB schema to prevent race conditions ---
+	if err := sqliteCache.InitSchema(); err != nil {
+		return fmt.Errorf("pre-flight check failed: could not initialize db schema: %w", err)
+	}
+
 	go sqliteCache.StartScheduledCleanup(24*time.Hour, "CoinGecko")
 	go sqliteCache.StartScheduledCleanup(24*time.Hour, "CoinMarketCap")
 	go sqliteCache.StartScheduledCleanup(24*time.Hour, "kraken")
@@ -200,7 +206,6 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 	}
 	startFNGUpdater(ctx, fearGreedProvider, logger, 4*time.Hour)
 
-	// --- NEW: Initialize and Start the Optimizer ---
 	optimizer := optimizer.NewOptimizer(logger, sqliteCache, cfg, activeDPs[0])
 	go optimizer.StartScheduledOptimization(ctx)
 

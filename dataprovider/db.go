@@ -26,6 +26,14 @@ func NewSQLiteCache(dbPath utilities.DatabaseConfig) (*SQLiteCache, error) {
 		return nil, err
 	}
 
+	// --- MODIFIED: Schema creation is REMOVED from the constructor ---
+
+	return &SQLiteCache{db: db}, nil
+}
+
+// --- ADDED: New dedicated function to initialize the database schema ---
+// This function will be called synchronously to prevent race conditions.
+func (s *SQLiteCache) InitSchema() error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS ohlcv_bars (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,7 +59,9 @@ func NewSQLiteCache(dbPath utilities.DatabaseConfig) (*SQLiteCache, error) {
 		is_dca_active INTEGER NOT NULL,
 		base_order_size REAL NOT NULL,
 		current_take_profit REAL NOT NULL,
-		broker_order_id TEXT NOT NULL
+		broker_order_id TEXT NOT NULL,
+		is_trailing_active INTEGER NOT NULL,
+		peak_price_since_tp REAL NOT NULL
 	);
 
 	CREATE TABLE IF NOT EXISTS pending_orders (
@@ -59,10 +69,11 @@ func NewSQLiteCache(dbPath utilities.DatabaseConfig) (*SQLiteCache, error) {
 		asset_pair TEXT NOT NULL
 	);
 	`
-	if _, err := db.Exec(schema); err != nil {
-		return nil, err
+	if _, err := s.db.Exec(schema); err != nil {
+		return fmt.Errorf("failed to execute database schema: %w", err)
 	}
-	return &SQLiteCache{db: db}, nil
+	log.Println("Database schema initialized successfully.")
+	return nil
 }
 
 // --- OHLCV Bar Caching ---
@@ -93,7 +104,7 @@ func (s *SQLiteCache) GetBars(provider, coinID string, start, end int64) ([]util
 // --- State Persistence Functions ---
 
 func (s *SQLiteCache) LoadPositions() (map[string]*utilities.Position, error) {
-	query := `SELECT asset_pair, entry_timestamp, average_price, total_volume, base_order_price, filled_safety_orders, is_dca_active, base_order_size, current_take_profit, broker_order_id FROM open_positions`
+	query := `SELECT asset_pair, entry_timestamp, average_price, total_volume, base_order_price, filled_safety_orders, is_dca_active, base_order_size, current_take_profit, broker_order_id, is_trailing_active, peak_price_since_tp FROM open_positions`
 	rows, err := s.db.Query(query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query open positions: %w", err)
@@ -105,6 +116,7 @@ func (s *SQLiteCache) LoadPositions() (map[string]*utilities.Position, error) {
 		var pos utilities.Position
 		var ts int64
 		var isDcaActiveInt int
+		var isTrailingActiveInt int
 
 		err := rows.Scan(
 			&pos.AssetPair,
@@ -117,23 +129,30 @@ func (s *SQLiteCache) LoadPositions() (map[string]*utilities.Position, error) {
 			&pos.BaseOrderSize,
 			&pos.CurrentTakeProfit,
 			&pos.BrokerOrderID,
+			&isTrailingActiveInt,
+			&pos.PeakPriceSinceTP,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan position row: %w", err)
 		}
 		pos.EntryTimestamp = time.Unix(ts, 0)
 		pos.IsDcaActive = isDcaActiveInt == 1
+		pos.IsTrailingActive = isTrailingActiveInt == 1
 		positions[pos.AssetPair] = &pos
 	}
 	return positions, nil
 }
 
 func (s *SQLiteCache) SavePosition(pos *utilities.Position) error {
-	query := `INSERT OR REPLACE INTO open_positions (asset_pair, entry_timestamp, average_price, total_volume, base_order_price, filled_safety_orders, is_dca_active, base_order_size, current_take_profit, broker_order_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	query := `INSERT OR REPLACE INTO open_positions (asset_pair, entry_timestamp, average_price, total_volume, base_order_price, filled_safety_orders, is_dca_active, base_order_size, current_take_profit, broker_order_id, is_trailing_active, peak_price_since_tp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	isDcaActiveInt := 0
 	if pos.IsDcaActive {
 		isDcaActiveInt = 1
+	}
+	isTrailingActiveInt := 0
+	if pos.IsTrailingActive {
+		isTrailingActiveInt = 1
 	}
 
 	_, err := s.db.Exec(query,
@@ -147,7 +166,8 @@ func (s *SQLiteCache) SavePosition(pos *utilities.Position) error {
 		pos.BaseOrderSize,
 		pos.CurrentTakeProfit,
 		pos.BrokerOrderID,
-	)
+		isTrailingActiveInt,
+		pos.PeakPriceSinceTP)
 	return err
 }
 
@@ -197,14 +217,23 @@ func (s *SQLiteCache) Close() error {
 
 func (s *SQLiteCache) StartScheduledCleanup(interval time.Duration, provider string) {
 	go func() {
+		// --- ADDED: Add an initial delay to the cleanup task ---
+		// This prevents it from running before the main loop starts.
+		time.Sleep(2 * time.Minute)
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
 		for {
-			cutoff := time.Now().AddDate(0, 0, -180)
-			if err := s.CleanupOldBars(provider, cutoff); err != nil {
-				log.Printf("Scheduled cleanup error for %s: %v", provider, err)
-			} else {
-				log.Printf("Scheduled cleanup successful for %s", provider)
+			select {
+			case <-ticker.C:
+				cutoff := time.Now().AddDate(0, 0, -180)
+				if err := s.CleanupOldBars(provider, cutoff); err != nil {
+					log.Printf("Scheduled cleanup error for %s: %v", provider, err)
+				} else {
+					log.Printf("Scheduled cleanup successful for %s", provider)
+				}
 			}
-			time.Sleep(interval)
 		}
 	}()
 }
