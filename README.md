@@ -24,8 +24,8 @@ If you absolutely need help setting this up, I'm happy to help for a recommended
 ### **Want to join me on Kraken?** 
 Use my referral and we’ll both get $50 when you trade \$200:  
 
-🔗 [Kraken Referral Link](https://kraken.onelink.me/JDNW/zf45lmjz)  
-🧾 Code: `s4frjfbr`
+🔗 [Kraken Referral Link](https://invite.kraken.com/JDNW/4lfv2ftb)  
+🧾 Code: ksdqyb9d
 
 ---
 ## ✨ How It Works
