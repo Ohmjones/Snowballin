@@ -106,15 +106,15 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 		return 0, fmt.Errorf("GetAccountValue: pivot asset %s has non-positive bid price (%.2f)", pivotAsset, pivotBidPrice)
 	}
 
-	for krakenAssetName, balanceStr := range balances {
+	for originalKey, balanceStr := range balances {
 		balance, err := strconv.ParseFloat(balanceStr, 64)
 		if err != nil || balance == 0 {
 			continue
 		}
 
-		originalKey := krakenAssetName
-		if strings.HasSuffix(krakenAssetName, ".F") {
-			krakenAssetName = strings.TrimSuffix(krakenAssetName, ".F")
+		krakenAssetName := originalKey
+		if strings.HasSuffix(originalKey, ".F") {
+			krakenAssetName = strings.TrimSuffix(originalKey, ".F")
 		}
 
 		commonName, err := a.client.GetCommonAssetName(ctx, krakenAssetName)
