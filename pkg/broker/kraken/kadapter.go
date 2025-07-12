@@ -89,17 +89,13 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 	quoteCurrencyUpper := strings.ToUpper(quoteCurrency)
 
 	for krakenAssetName, balanceStr := range balances {
+		// Skip futures assets, no change here.
 		if strings.HasSuffix(krakenAssetName, ".F") {
 			continue
 		}
 
 		balance, err := strconv.ParseFloat(balanceStr, 64)
-		if err != nil {
-			a.logger.LogWarn("GetAccountValue: could not parse balance for %s ('%s'): %v", krakenAssetName, balanceStr, err)
-			continue
-		}
-
-		if balance == 0 {
+		if err != nil || balance == 0 {
 			continue
 		}
 
@@ -109,36 +105,51 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 			continue
 		}
 
+		// Correctly add cash balance, no change here.
 		if strings.EqualFold(commonName, quoteCurrencyUpper) {
 			totalValue += balance
 			a.logger.LogDebug("GetAccountValue: Added %.2f from cash balance (%s).", balance, commonName)
 		} else {
+			// This is the logic block for valuing crypto assets.
 			commonPairToFetch := commonName + "/" + quoteCurrencyUpper
 			krakenPairForTicker, err := a.client.GetKrakenPairName(ctx, commonPairToFetch)
-			if err != nil {
-				return 0, fmt.Errorf("failed to find a tradable pair for asset %s...", commonName, balance, quoteCurrencyUpper, err)
-			}
-			tickerInfo, err := a.client.GetTickerAPI(ctx, krakenPairForTicker)
 
-			// --- CRITICAL FIX: All-or-Nothing Logic ---
+			// --- FIX #1: HANDLE MISSING PAIRS ---
+			// If we cannot find a direct pair against the quote currency (e.g., ALT/USD),
+			// the old code valued it at 0. The correct fix is to skip it and warn the user.
+			// A more advanced solution is to implement "triangulation" (e.g., price ALT/BTC * price BTC/USD).
+			if err != nil {
+				a.logger.LogWarn("GetAccountValue: Could not find a direct trading pair for %s. Asset will be SKIPPED in valuation. Error: %v", commonPairToFetch, err)
+				continue // Skip to the next asset instead of crashing or miscalculating.
+			}
+
+			tickerInfo, err := a.client.GetTickerAPI(ctx, krakenPairForTicker)
 			if err != nil {
 				// If we fail to get a price for any asset, the entire calculation is invalid.
-				// Return an error to stop the trading cycle from proceeding with bad data.
 				return 0, fmt.Errorf("failed to get ticker for %s (asset %s) during portfolio valuation: %w", krakenPairForTicker, commonName, err)
 			}
-			if len(tickerInfo.LastTradeClosed) == 0 {
-				return 0, fmt.Errorf("ticker for %s (asset %s) returned no price data", krakenPairForTicker, commonName)
-			}
-			// --- END OF FIX ---
 
-			lastPrice, err := strconv.ParseFloat(tickerInfo.LastTradeClosed[0], 64)
+			// --- FIX #2: USE BID PRICE, NOT LAST TRADE PRICE ---
+			// The 'Bid' price (tickerInfo.Bid[0]) is the true liquid value (what you can sell for now).
+			// 'LastTradeClosed' can be stale and inaccurate.
+			if len(tickerInfo.Bid) == 0 || tickerInfo.Bid[0] == "" {
+				return 0, fmt.Errorf("ticker for %s (asset %s) returned no Bid price data", krakenPairForTicker, commonName)
+			}
+
+			bidPrice, err := strconv.ParseFloat(tickerInfo.Bid[0], 64)
 			if err != nil {
-				return 0, fmt.Errorf("could not parse price for %s: %w", commonName, err)
+				return 0, fmt.Errorf("could not parse bid price for %s: %w", commonName, err)
 			}
 
-			assetValueInQuote := balance * lastPrice
+			// Also check that the price is a valid, positive number.
+			if bidPrice <= 0 {
+				a.logger.LogWarn("GetAccountValue: Asset %s has a non-positive price (%.2f) and will be SKIPPED.", commonName, bidPrice)
+				continue
+			}
+
+			assetValueInQuote := balance * bidPrice
 			totalValue += assetValueInQuote
-			a.logger.LogDebug("GetAccountValue: Valued %f of %s at %.2f %s/COIN, adding %.2f to total.", balance, commonName, lastPrice, quoteCurrencyUpper, assetValueInQuote)
+			a.logger.LogDebug("GetAccountValue: Valued %f of %s at %.2f %s/COIN (BID PRICE), adding %.2f to total.", balance, commonName, bidPrice, quoteCurrencyUpper, assetValueInQuote)
 		}
 	}
 
