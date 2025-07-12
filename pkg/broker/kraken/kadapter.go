@@ -88,70 +88,66 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 	totalValue := 0.0
 	quoteCurrencyUpper := strings.ToUpper(quoteCurrency)
 
-	krakenQuoteAsset, err := a.client.GetKrakenAssetName(ctx, quoteCurrencyUpper)
-	if err != nil {
-		a.logger.LogWarn("Could not directly map quote currency '%s' to Kraken asset name: %v. Trying common defaults.", quoteCurrencyUpper, err)
-		switch quoteCurrencyUpper {
-		case "USD":
-			krakenQuoteAsset = "ZUSD"
-		case "EUR":
-			krakenQuoteAsset = "ZEUR"
-		default:
-			krakenQuoteAsset = quoteCurrencyUpper
-		}
-	}
+	for krakenAssetName, balanceStr := range balances {
+		// --- LOGIC CORRECTION & HARDENING ---
 
-	for assetName, balanceStr := range balances {
-		// --- ADDED: Logic to skip futures (.F) assets ---
-		if strings.HasSuffix(assetName, ".F") {
-			a.logger.LogDebug("GetAccountValue: Skipping futures asset %s", assetName)
+		// Skip futures assets, which are not part of the spot portfolio value.
+		if strings.HasSuffix(krakenAssetName, ".F") {
+			a.logger.LogDebug("GetAccountValue: Skipping futures asset %s", krakenAssetName)
 			continue
 		}
 
 		balance, err := strconv.ParseFloat(balanceStr, 64)
 		if err != nil {
-			a.logger.LogWarn("GetAccountValue: could not parse balance for %s ('%s'): %v", assetName, balanceStr, err)
+			a.logger.LogWarn("GetAccountValue: could not parse balance for %s ('%s'): %v", krakenAssetName, balanceStr, err)
 			continue
 		}
 
 		if balance == 0 {
+			continue // Skip zero-balance assets.
+		}
+
+		// Get the universal, common name for the asset (e.g., "BTC", "ETH", "USD").
+		// This is the key change to handle all of Kraken's naming variations.
+		commonName, err := a.client.GetCommonAssetName(ctx, krakenAssetName)
+		if err != nil {
+			a.logger.LogWarn("GetAccountValue: could not get common name for Kraken asset %s: %v. This balance will be skipped.", krakenAssetName, err)
 			continue
 		}
 
-		if strings.EqualFold(assetName, krakenQuoteAsset) || (assetName == "USD" && krakenQuoteAsset == "ZUSD") || (assetName == "EUR" && krakenQuoteAsset == "ZEUR") {
+		// Now, compare the common name to the quote currency.
+		if strings.EqualFold(commonName, quoteCurrencyUpper) {
+			// This is the cash balance. Add it directly to the total.
 			totalValue += balance
+			a.logger.LogDebug("GetAccountValue: Added %.2f from cash balance (%s).", balance, commonName)
 		} else {
-			commonBaseAsset, err := a.client.GetCommonAssetName(ctx, assetName)
-			if err != nil {
-				a.logger.LogWarn("GetAccountValue: could not get common name for Kraken asset %s: %v. Cannot value.", assetName, err)
-				continue
-			}
-
-			commonPairToFetch := commonBaseAsset + "/" + quoteCurrencyUpper
+			// This is a crypto asset. We need to find its market value in the quote currency.
+			commonPairToFetch := commonName + "/" + quoteCurrencyUpper
 			krakenPairForTicker, err := a.client.GetKrakenPairName(ctx, commonPairToFetch)
 			if err != nil {
-				a.logger.LogWarn("GetAccountValue: could not get Kraken pair for %s to fetch ticker: %v. Cannot value asset %s.", commonPairToFetch, err, assetName)
+				a.logger.LogWarn("GetAccountValue: could not get Kraken pair for %s to fetch ticker: %v. Cannot value asset %s.", commonPairToFetch, err, commonName)
 				continue
 			}
 
 			tickerInfo, err := a.client.GetTickerAPI(ctx, krakenPairForTicker)
-			if err != nil {
-				a.logger.LogWarn("GetAccountValue: failed to get ticker for %s (Kraken pair %s) to value %s: %v", commonPairToFetch, krakenPairForTicker, assetName, err)
+			if err != nil || len(tickerInfo.LastTradeClosed) == 0 {
+				a.logger.LogWarn("GetAccountValue: failed to get ticker for %s (Kraken pair %s): %v. Cannot value asset %s.", commonPairToFetch, krakenPairForTicker, err, commonName)
 				continue
 			}
-			if len(tickerInfo.LastTradeClosed) == 0 {
-				a.logger.LogWarn("GetAccountValue: ticker for %s (Kraken pair %s) has no last trade price. Cannot value asset %s.", commonPairToFetch, krakenPairForTicker, assetName)
-				continue
-			}
+
 			lastPrice, err := strconv.ParseFloat(tickerInfo.LastTradeClosed[0], 64)
 			if err != nil {
-				a.logger.LogWarn("GetAccountValue: could not parse last price for %s (Kraken pair %s): %v. Cannot value asset %s.", commonPairToFetch, krakenPairForTicker, err, assetName)
+				a.logger.LogWarn("GetAccountValue: could not parse last price for %s (Kraken pair %s): %v. Cannot value asset %s.", commonPairToFetch, krakenPairForTicker, err, commonName)
 				continue
 			}
-			totalValue += balance * lastPrice
-			a.logger.LogDebug("Valued %f of %s at %.2f %s/COIN, adding %.2f to total.", balance, assetName, lastPrice, quoteCurrencyUpper, balance*lastPrice)
+
+			// Add the crypto asset's value to the total.
+			assetValueInQuote := balance * lastPrice
+			totalValue += assetValueInQuote
+			a.logger.LogDebug("GetAccountValue: Valued %f of %s at %.2f %s/COIN, adding %.2f to total.", balance, commonName, lastPrice, quoteCurrencyUpper, assetValueInQuote)
 		}
 	}
+
 	a.logger.LogInfo("Calculated total account value: %.2f %s", totalValue, quoteCurrencyUpper)
 	return totalValue, nil
 }
