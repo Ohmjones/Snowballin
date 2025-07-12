@@ -22,20 +22,21 @@ import (
 )
 
 type TradingState struct {
-	broker                 broker.Broker
-	logger                 *utilities.Logger
-	config                 *utilities.AppConfig
-	discordClient          *discord.Client
-	cache                  *dataprovider.SQLiteCache
-	activeDPs              []dataprovider.DataProvider
-	providerNames          map[dataprovider.DataProvider]string
-	peakPortfolioValue     float64
-	lastWithdrawalCheck    time.Time
-	lastGlobalMetricsFetch time.Time
-	lastBTCDominance       float64
-	openPositions          map[string]*utilities.Position
-	pendingOrders          map[string]string // Maps orderID to assetPair
-	stateMutex             sync.RWMutex
+	broker                  broker.Broker
+	logger                  *utilities.Logger
+	config                  *utilities.AppConfig
+	discordClient           *discord.Client
+	cache                   *dataprovider.SQLiteCache
+	activeDPs               []dataprovider.DataProvider
+	providerNames           map[dataprovider.DataProvider]string
+	peakPortfolioValue      float64
+	lastWithdrawalCheck     time.Time
+	lastGlobalMetricsFetch  time.Time
+	lastBTCDominance        float64
+	openPositions           map[string]*utilities.Position
+	pendingOrders           map[string]string // Maps orderID to assetPair
+	stateMutex              sync.RWMutex
+	isCircuitBreakerTripped bool
 }
 
 var (
@@ -259,6 +260,16 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 
 func processTradingCycle(ctx context.Context, state *TradingState) {
 	state.logger.LogInfo("-------------------- New Trading Cycle --------------------")
+
+	// --- ADDED: Check if breaker is already tripped at the start of the cycle ---
+	state.stateMutex.RLock()
+	if state.isCircuitBreakerTripped {
+		state.stateMutex.RUnlock()
+		state.logger.LogWarn("Circuit breaker is active. Halting all new trading operations. Manual restart required.")
+		return // Stop the cycle immediately
+	}
+	state.stateMutex.RUnlock()
+
 	currentPortfolioValue, valErr := state.broker.GetAccountValue(ctx, state.config.Trading.QuoteCurrency)
 	if valErr != nil {
 		state.logger.LogError("Cycle: Could not update portfolio value: %v", valErr)
@@ -271,7 +282,7 @@ func processTradingCycle(ctx context.Context, state *TradingState) {
 	}
 	state.stateMutex.Unlock()
 
-	// --- ADDED: Portfolio-level Circuit Breaker ---
+	// --- MODIFIED: Portfolio-level Circuit Breaker Logic ---
 	if state.config.CircuitBreaker.Enabled && state.peakPortfolioValue > 0 {
 		drawdownPercent := state.config.CircuitBreaker.DrawdownThresholdPercent / 100.0
 		drawdownThresholdValue := state.peakPortfolioValue * (1.0 - drawdownPercent)
@@ -280,8 +291,14 @@ func processTradingCycle(ctx context.Context, state *TradingState) {
 			reason := fmt.Sprintf("Portfolio value (%.2f) dropped below drawdown threshold (%.2f). Max drawdown of %.2f%% from peak (%.2f) was exceeded.",
 				currentPortfolioValue, drawdownThresholdValue, state.config.CircuitBreaker.DrawdownThresholdPercent, state.peakPortfolioValue)
 
+			// --- MODIFIED: Set the tripped state BEFORE liquidating ---
 			state.logger.LogWarn("CIRCUIT BREAKER: %s", reason)
+			state.stateMutex.Lock()
+			state.isCircuitBreakerTripped = true
+			state.stateMutex.Unlock()
+
 			liquidateAllPositions(ctx, state, reason)
+
 			// After triggering, we should not proceed with normal trading operations for this cycle.
 			return
 		}
