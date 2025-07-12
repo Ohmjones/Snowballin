@@ -8,6 +8,19 @@ import (
 	"sort"
 )
 
+// --- NEW: A struct to hold the results of a detailed order book analysis ---
+type OrderBookAnalysis struct {
+	DepthScore       float64            // The original -1.0 to 1.0 score indicating buy/sell pressure.
+	SupportLevels    []SignificantLevel // A list of price levels with unusually high bid volume (buy walls).
+	ResistanceLevels []SignificantLevel // A list of price levels with unusually high ask volume (sell walls).
+}
+
+// --- NEW: Represents a specific price level with significant volume ---
+type SignificantLevel struct {
+	PriceLevel float64
+	Volume     float64
+}
+
 // ComputeEMASeries explicitly computes the Exponential Moving Average (EMA).
 func ComputeEMASeries(data []float64, period int) ([]float64, []float64) {
 	if period <= 0 || len(data) == 0 {
@@ -61,8 +74,83 @@ func CalculateATR(bars []utilities.OHLCVBar, period int) (float64, error) { // C
 	return sum / float64(period), nil // Return result and nil error
 }
 
+// --- NEW: Top-level function to conduct a full analysis of the order book. ---
+// This function combines the general depth pressure score with the identification of
+// specific support and resistance levels (walls).
+func PerformOrderBookAnalysis(orderBook broker.OrderBookData, depthPercent float64, windowSize int, spikeMultiplier float64) OrderBookAnalysis {
+	// 1. Calculate the simple buy/sell pressure score.
+	depthScore := AnalyzeOrderBookDepth(orderBook, depthPercent)
+
+	// 2. Identify significant support and resistance levels.
+	support, resistance := FindSignificantLevels(orderBook, windowSize, spikeMultiplier)
+
+	// 3. Return the combined analysis.
+	return OrderBookAnalysis{
+		DepthScore:       depthScore,
+		SupportLevels:    support,
+		ResistanceLevels: resistance,
+	}
+}
+
+// --- NEW: Finds significant volume clusters (buy/sell walls) in the order book. ---
+// It identifies levels where the volume is significantly higher than its neighbors.
+// `windowSize`: Number of neighboring levels to average for comparison.
+// `spikeMultiplier`: How many times larger the volume must be than the average to be "significant".
+func FindSignificantLevels(orderBook broker.OrderBookData, windowSize int, spikeMultiplier float64) (support []SignificantLevel, resistance []SignificantLevel) {
+	if spikeMultiplier <= 1.0 { // Multiplier must be greater than 1 to be useful.
+		spikeMultiplier = 1.5
+	}
+	if windowSize <= 0 {
+		windowSize = 10
+	}
+
+	// Find Support Levels (from Bids)
+	if len(orderBook.Bids) > windowSize {
+		for i := 0; i < len(orderBook.Bids)-windowSize; i++ {
+			currentBid := orderBook.Bids[i]
+			var sumOfNeighbors float64
+			// Look at the next N bids deeper in the book.
+			for j := 1; j <= windowSize; j++ {
+				sumOfNeighbors += orderBook.Bids[i+j].Volume
+			}
+			avgVolumeOfNeighbors := sumOfNeighbors / float64(windowSize)
+
+			// If the current level's volume is a multiple of the average, it's a wall.
+			if currentBid.Volume >= avgVolumeOfNeighbors*spikeMultiplier {
+				support = append(support, SignificantLevel{
+					PriceLevel: currentBid.Price,
+					Volume:     currentBid.Volume,
+				})
+			}
+		}
+	}
+
+	// Find Resistance Levels (from Asks)
+	if len(orderBook.Asks) > windowSize {
+		for i := 0; i < len(orderBook.Asks)-windowSize; i++ {
+			currentAsk := orderBook.Asks[i]
+			var sumOfNeighbors float64
+			// Look at the next N asks deeper in the book.
+			for j := 1; j <= windowSize; j++ {
+				sumOfNeighbors += orderBook.Asks[i+j].Volume
+			}
+			avgVolumeOfNeighbors := sumOfNeighbors / float64(windowSize)
+
+			// If the current level's volume is a multiple of the average, it's a wall.
+			if currentAsk.Volume >= avgVolumeOfNeighbors*spikeMultiplier {
+				resistance = append(resistance, SignificantLevel{
+					PriceLevel: currentAsk.Price,
+					Volume:     currentAsk.Volume,
+				})
+			}
+		}
+	}
+	return support, resistance
+}
+
 // AnalyzeOrderBookDepth calculates the ratio of bid volume to ask volume within a
 // certain percentage of the mid-price, returning a score from -1.0 to 1.0.
+// This is a measure of immediate buy/sell pressure.
 func AnalyzeOrderBookDepth(orderBook broker.OrderBookData, depthPercent float64) float64 {
 	if len(orderBook.Bids) == 0 || len(orderBook.Asks) == 0 {
 		return 0 // Not enough data to analyze
