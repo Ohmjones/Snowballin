@@ -88,7 +88,7 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 	totalValue := 0.0
 	quoteCurrencyUpper := strings.ToUpper(quoteCurrency)
 
-	pivotAsset := "BTC"
+	pivotAsset := "XBT"
 	pivotPair := pivotAsset + "/" + quoteCurrencyUpper
 	pivotKrakenPair, pivotErr := a.client.GetKrakenPairName(ctx, pivotPair)
 	if pivotErr != nil {
