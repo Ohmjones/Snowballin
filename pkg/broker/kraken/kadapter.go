@@ -88,8 +88,25 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 	totalValue := 0.0
 	quoteCurrencyUpper := strings.ToUpper(quoteCurrency)
 
+	pivotAsset := "BTC"
+	pivotPair := pivotAsset + "/" + quoteCurrencyUpper
+	pivotKrakenPair, pivotErr := a.client.GetKrakenPairName(ctx, pivotPair)
+	if pivotErr != nil {
+		return 0, fmt.Errorf("GetAccountValue: failed to get pivot pair %s for triangulation: %w", pivotPair, pivotErr)
+	}
+	pivotTicker, pivotTickerErr := a.client.GetTickerAPI(ctx, pivotKrakenPair)
+	if pivotTickerErr != nil {
+		return 0, fmt.Errorf("GetAccountValue: failed to get pivot ticker for %s: %w", pivotKrakenPair, pivotTickerErr)
+	}
+	if len(pivotTicker.Bid) == 0 || pivotTicker.Bid[0] == "" {
+		return 0, fmt.Errorf("GetAccountValue: pivot ticker for %s returned no Bid price data", pivotKrakenPair)
+	}
+	pivotBidPrice, _ := strconv.ParseFloat(pivotTicker.Bid[0], 64)
+	if pivotBidPrice <= 0 {
+		return 0, fmt.Errorf("GetAccountValue: pivot asset %s has non-positive bid price (%.2f)", pivotAsset, pivotBidPrice)
+	}
+
 	for krakenAssetName, balanceStr := range balances {
-		// Skip futures assets, no change here.
 		if strings.HasSuffix(krakenAssetName, ".F") {
 			continue
 		}
@@ -105,52 +122,63 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 			continue
 		}
 
-		// Correctly add cash balance, no change here.
 		if strings.EqualFold(commonName, quoteCurrencyUpper) {
 			totalValue += balance
 			a.logger.LogDebug("GetAccountValue: Added %.2f from cash balance (%s).", balance, commonName)
-		} else {
-			// This is the logic block for valuing crypto assets.
-			commonPairToFetch := commonName + "/" + quoteCurrencyUpper
-			krakenPairForTicker, err := a.client.GetKrakenPairName(ctx, commonPairToFetch)
+			continue
+		}
 
-			// --- FIX #1: HANDLE MISSING PAIRS ---
-			// If we cannot find a direct pair against the quote currency (e.g., ALT/USD),
-			// the old code valued it at 0. The correct fix is to skip it and warn the user.
-			// A more advanced solution is to implement "triangulation" (e.g., price ALT/BTC * price BTC/USD).
-			if err != nil {
-				a.logger.LogWarn("GetAccountValue: Could not find a direct trading pair for %s. Asset will be SKIPPED in valuation. Error: %v", commonPairToFetch, err)
-				continue // Skip to the next asset instead of crashing or miscalculating.
-			}
+		commonPairToFetch := commonName + "/" + quoteCurrencyUpper
+		krakenPairForTicker, err := a.client.GetKrakenPairName(ctx, commonPairToFetch)
 
+		var bidPrice float64
+		if err == nil {
 			tickerInfo, err := a.client.GetTickerAPI(ctx, krakenPairForTicker)
 			if err != nil {
-				// If we fail to get a price for any asset, the entire calculation is invalid.
-				return 0, fmt.Errorf("failed to get ticker for %s (asset %s) during portfolio valuation: %w", krakenPairForTicker, commonName, err)
+				a.logger.LogWarn("GetAccountValue: Failed to get direct ticker for %s during valuation: %v. Attempting triangulation.", krakenPairForTicker, err)
+			} else if len(tickerInfo.Bid) == 0 || tickerInfo.Bid[0] == "" {
+				a.logger.LogWarn("GetAccountValue: Direct ticker for %s returned no Bid price data. Attempting triangulation.", krakenPairForTicker)
+			} else {
+				bidPrice, err = strconv.ParseFloat(tickerInfo.Bid[0], 64)
+				if err == nil && bidPrice > 0 {
+					assetValueInQuote := balance * bidPrice
+					totalValue += assetValueInQuote
+					a.logger.LogDebug("GetAccountValue: Valued %f of %s at %.2f %s/COIN (BID PRICE, direct), adding %.2f to total.", balance, commonName, bidPrice, quoteCurrencyUpper, assetValueInQuote)
+					continue
+				} else {
+					a.logger.LogWarn("GetAccountValue: Direct bid price for %s invalid (%.2f). Attempting triangulation.", commonName, bidPrice)
+				}
 			}
-
-			// --- FIX #2: USE BID PRICE, NOT LAST TRADE PRICE ---
-			// The 'Bid' price (tickerInfo.Bid[0]) is the true liquid value (what you can sell for now).
-			// 'LastTradeClosed' can be stale and inaccurate.
-			if len(tickerInfo.Bid) == 0 || tickerInfo.Bid[0] == "" {
-				return 0, fmt.Errorf("ticker for %s (asset %s) returned no Bid price data", krakenPairForTicker, commonName)
-			}
-
-			bidPrice, err := strconv.ParseFloat(tickerInfo.Bid[0], 64)
-			if err != nil {
-				return 0, fmt.Errorf("could not parse bid price for %s: %w", commonName, err)
-			}
-
-			// Also check that the price is a valid, positive number.
-			if bidPrice <= 0 {
-				a.logger.LogWarn("GetAccountValue: Asset %s has a non-positive price (%.2f) and will be SKIPPED.", commonName, bidPrice)
-				continue
-			}
-
-			assetValueInQuote := balance * bidPrice
-			totalValue += assetValueInQuote
-			a.logger.LogDebug("GetAccountValue: Valued %f of %s at %.2f %s/COIN (BID PRICE), adding %.2f to total.", balance, commonName, bidPrice, quoteCurrencyUpper, assetValueInQuote)
+		} else {
+			a.logger.LogWarn("GetAccountValue: Could not find direct trading pair for %s. Attempting triangulation via %s.", commonPairToFetch, pivotAsset)
 		}
+
+		// Triangulation fallback
+		triangPair := commonName + "/" + pivotAsset
+		triangKrakenPair, triangErr := a.client.GetKrakenPairName(ctx, triangPair)
+		if triangErr != nil {
+			a.logger.LogWarn("GetAccountValue: Triangulation failed for %s: no %s pair found. Asset will be SKIPPED.", commonName, triangPair)
+			continue
+		}
+		triangTicker, triangTickerErr := a.client.GetTickerAPI(ctx, triangKrakenPair)
+		if triangTickerErr != nil {
+			a.logger.LogWarn("GetAccountValue: Triangulation failed for %s: failed to get ticker for %s. Asset will be SKIPPED.", commonName, triangKrakenPair)
+			continue
+		}
+		if len(triangTicker.Bid) == 0 || triangTicker.Bid[0] == "" {
+			a.logger.LogWarn("GetAccountValue: Triangulation ticker for %s returned no Bid price data. Asset will be SKIPPED.", triangKrakenPair)
+			continue
+		}
+		triangBidPrice, parseErr := strconv.ParseFloat(triangTicker.Bid[0], 64)
+		if parseErr != nil || triangBidPrice <= 0 {
+			a.logger.LogWarn("GetAccountValue: Triangulation bid price for %s invalid (%.2f). Asset will be SKIPPED.", commonName, triangBidPrice)
+			continue
+		}
+
+		assetValueInPivot := balance * triangBidPrice
+		assetValueInQuote := assetValueInPivot * pivotBidPrice
+		totalValue += assetValueInQuote
+		a.logger.LogDebug("GetAccountValue: Valued %f of %s via triangulation (%s bid: %.2f, %s bid: %.2f), adding %.2f to total.", balance, commonName, triangPair, triangBidPrice, pivotPair, pivotBidPrice, assetValueInQuote)
 	}
 
 	a.logger.LogInfo("Calculated total account value: %.2f %s", totalValue, quoteCurrencyUpper)
