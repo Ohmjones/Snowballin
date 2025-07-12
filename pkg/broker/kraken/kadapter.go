@@ -107,10 +107,6 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 	}
 
 	for krakenAssetName, balanceStr := range balances {
-		if strings.HasSuffix(krakenAssetName, ".F") {
-			continue
-		}
-
 		balance, err := strconv.ParseFloat(balanceStr, 64)
 		if err != nil || balance == 0 {
 			continue
@@ -120,6 +116,11 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 		if err != nil {
 			a.logger.LogWarn("GetAccountValue: could not get common name for Kraken asset %s: %v. This balance will be skipped.", krakenAssetName, err)
 			continue
+		}
+
+		if strings.HasSuffix(krakenAssetName, ".F") {
+			commonName = strings.TrimSuffix(commonName, ".F")
+			a.logger.LogDebug("GetAccountValue: Including futures asset %s as %s", krakenAssetName, commonName)
 		}
 
 		if strings.EqualFold(commonName, quoteCurrencyUpper) {
