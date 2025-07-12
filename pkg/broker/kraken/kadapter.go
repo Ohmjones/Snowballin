@@ -373,40 +373,48 @@ func (a *Adapter) GetOrderStatus(ctx context.Context, orderID string) (broker.Or
 		return broker.Order{}, err
 	}
 
-	order, ok := ordersInfo[orderID]
+	krakenOrder, ok := ordersInfo[orderID]
 	if !ok {
-		return broker.Order{}, errors.New("GetOrderStatus: order not found")
+		// To prevent spamming logs for open orders that haven't been filled yet,
+		// we check if the order might still be open before returning a hard error.
+		// A more robust check might query OpenOrders endpoint, but this is a good heuristic.
+		a.logger.LogDebug("GetOrderStatus: order %s not found in closed/cancelled query. It may still be open.", orderID)
+		return broker.Order{}, fmt.Errorf("GetOrderStatus: order %s not found in trade history query", orderID)
 	}
 
-	price, err := strconv.ParseFloat(order.Price, 64)
-	if err != nil {
-		return broker.Order{}, err
-	}
-	volume, err := strconv.ParseFloat(order.Volume, 64)
-	if err != nil {
-		return broker.Order{}, err
-	}
-	executedVol, err := strconv.ParseFloat(order.VolExec, 64)
-	if err != nil {
-		return broker.Order{}, err
-	}
-	fee, err := strconv.ParseFloat(order.Fee, 64)
-	if err != nil {
-		return broker.Order{}, err
+	// --- FIX: Parse all relevant fields from the Kraken response ---
+	price, _ := strconv.ParseFloat(krakenOrder.Price, 64)
+	volume, _ := strconv.ParseFloat(krakenOrder.Volume, 64)
+	filledVolume, _ := strconv.ParseFloat(krakenOrder.VolExec, 64)
+	fee, _ := strconv.ParseFloat(krakenOrder.Fee, 64)
+	cost, _ := strconv.ParseFloat(krakenOrder.Cost, 64)
+
+	var avgFillPrice float64
+	if filledVolume > 0 {
+		avgFillPrice = cost / filledVolume
 	}
 
+	openTime := time.Unix(int64(krakenOrder.Opentm), 0)
+	closeTime := time.Unix(int64(krakenOrder.Closetm), 0)
+
+	// Map the Kraken-specific data to the generic broker.Order struct
 	return broker.Order{
 		ID:            orderID,
-		Status:        order.Status,
-		Pair:          order.Descr.Pair,
-		Type:          order.Descr.Type,
-		OrderType:     order.Descr.OrderType,
+		Pair:          krakenOrder.Descr.Pair,
+		Side:          krakenOrder.Descr.Type,
+		Type:          krakenOrder.Descr.OrderType,
+		Status:        krakenOrder.Status,
 		Price:         price,
 		Volume:        volume,
-		ExecutedVol:   executedVol,
+		FilledVolume:  filledVolume,
+		AvgFillPrice:  avgFillPrice,
+		Cost:          cost,
 		Fee:           fee,
-		TimePlaced:    time.Unix(int64(order.Opentm), 0),
-		TimeCompleted: time.Unix(int64(order.Closetm), 0),
+		CreatedAt:     openTime,
+		TimePlaced:    openTime, // Redundant, but ensures compatibility
+		UpdatedAt:     closeTime,
+		TimeCompleted: closeTime,
+		Reason:        krakenOrder.Reason,
 	}, nil
 }
 

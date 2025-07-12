@@ -149,6 +149,7 @@ func (c *Client) NotifyOrderFilled(order broker.Order, additionalDetails string)
 
 	sideUpper := strings.ToUpper(order.Side)
 
+	// Set the title and color based on the order side (buy/sell)
 	if sideUpper == "BUY" {
 		title = fmt.Sprintf("✅ BUY Order Filled: %s", order.Pair)
 		color = 3066993 // Green
@@ -160,53 +161,46 @@ func (c *Client) NotifyOrderFilled(order broker.Order, additionalDetails string)
 		color = 3447003 // Blue
 	}
 
-	if additionalDetails != "" {
-		title = fmt.Sprintf("%s (%s)", title, additionalDetails)
-	}
+	// --- FIX: The rest of the details will now be in the description, not the title ---
 
 	var baseAsset, quoteAsset string
 	pairParts := strings.Split(order.Pair, "/")
-	if len(pairParts) > 0 {
-		baseAsset = pairParts[0]
-	}
 	if len(pairParts) > 1 {
+		baseAsset = pairParts[0]
 		quoteAsset = pairParts[1]
-	} else if len(order.Pair) > 3 {
-		if strings.HasSuffix(order.Pair, "USD") {
-			baseAsset = strings.TrimSuffix(order.Pair, "USD")
-			quoteAsset = "USD"
-		} else if strings.HasSuffix(order.Pair, "EUR") {
-			baseAsset = strings.TrimSuffix(order.Pair, "EUR")
-			quoteAsset = "EUR"
-		}
-		// Add more known quote currencies if needed, or improve pair splitting logic
+	} else {
+		baseAsset = order.Pair // Fallback
 	}
 
-	orderDescription := fmt.Sprintf(
-		"Order for **%.6f %s** has been filled.",
-		order.FilledVolume,
-		baseAsset,
-	)
-
+	// Create the main block of details about the order
 	fieldDetails := fmt.Sprintf(
-		"**Pair**: %s | **Side**: %s | **Type**: %s\n"+
-			"**Avg. Fill Price**: %.4f %s\n"+
-			"**Filled Volume**: %.8f\n"+
-			"**Order ID**: `%s`\n\n"+
-			"*Snowballin Trading Bot*",
-		order.Pair, sideUpper, strings.ToUpper(order.Type),
+		"**Pair**: %s\n"+
+			"**Avg. Fill Price**: `%.4f %s`\n"+
+			"**Filled Volume**: `%.8f %s`\n"+
+			"**Total Cost**: `%.2f %s`\n"+
+			"**Order ID**: `%s`",
+		order.Pair,
 		order.AvgFillPrice, quoteAsset,
-		order.FilledVolume,
+		order.FilledVolume, baseAsset,
+		order.Cost, quoteAsset,
 		order.ID,
 	)
 
-	fullDescription := fmt.Sprintf("%s\n\n%s", orderDescription, fieldDetails)
+	// --- FIX: Construct the full description by combining the dynamic details from app.go
+	// with the static details we just created. This keeps the title clean.
+	fullDescription := fmt.Sprintf("%s\n\n%s", additionalDetails, fieldDetails)
+
+	// Use a valid timestamp for the embed
+	timestamp := order.TimeCompleted
+	if timestamp.IsZero() {
+		timestamp = time.Now() // Fallback if the completion time isn't set
+	}
 
 	embed := DiscordEmbed{
 		Title:       title,
 		Description: fullDescription,
 		Color:       color,
-		Timestamp:   order.UpdatedAt.Format(time.RFC3339),
+		Timestamp:   timestamp.Format(time.RFC3339),
 	}
 
 	return c.SendEmbedMessage(embed)
