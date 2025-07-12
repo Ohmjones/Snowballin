@@ -108,6 +108,7 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 
 	for originalKey, balanceStr := range balances {
 		balance, err := strconv.ParseFloat(balanceStr, 64)
+		// This check correctly ignores assets with a zero balance, like your "XETH" entry.
 		if err != nil || balance == 0 {
 			continue
 		}
@@ -115,6 +116,12 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 		krakenAssetName := originalKey
 		if strings.HasSuffix(originalKey, ".F") {
 			krakenAssetName = strings.TrimSuffix(originalKey, ".F")
+		}
+
+		// When the loop processes your "ETH.F" balance, this logic correctly
+		// translates the resulting "ETH" key to "XETH" for the price lookup.
+		if krakenAssetName == "ETH" {
+			krakenAssetName = "XETH"
 		}
 
 		commonName, err := a.client.GetCommonAssetName(ctx, krakenAssetName)
