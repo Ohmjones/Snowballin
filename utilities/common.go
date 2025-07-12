@@ -144,19 +144,20 @@ type FearGreedConfig struct {
 
 // IndicatorsConfig holds parameters for various technical indicators.
 type IndicatorsConfig struct {
-	RSIPeriod             int     `mapstructure:"rsi_period"`
-	StochRSIPeriod        int     `mapstructure:"stoch_rsi_period"`
-	StochRSIBuyThreshold  float64 `mapstructure:"stoch_rsi_buy_threshold"`
-	StochRSISellThreshold float64 `mapstructure:"stoch_rsi_sell_threshold"`
-	MACDFastPeriod        int     `mapstructure:"macd_fast_period"`
-	MACDSlowPeriod        int     `mapstructure:"macd_slow_period"`
-	MACDSignalPeriod      int     `mapstructure:"macd_signal_period"`
-	ATRPeriod             int     `mapstructure:"atr_period"`
-	VolumeSpikeFactor     float64 `mapstructure:"volume_spike_factor"`
-	VolumeLookbackPeriod  int     `mapstructure:"volume_lookback_period"`
-	OBVPositiveThreshold  float64 `mapstructure:"obv_positive_threshold"`
-	OBVNegativeThreshold  float64 `mapstructure:"obv_negative_threshold"`
-	OBVMAPeriod           int     `mapstructure:"obv_ma_period"`
+	RSIPeriod             int                 `mapstructure:"rsi_period"`
+	StochRSIPeriod        int                 `mapstructure:"stoch_rsi_period"`
+	StochRSIBuyThreshold  float64             `mapstructure:"stoch_rsi_buy_threshold"`
+	StochRSISellThreshold float64             `mapstructure:"stoch_rsi_sell_threshold"`
+	MACDFastPeriod        int                 `mapstructure:"macd_fast_period"`
+	MACDSlowPeriod        int                 `mapstructure:"macd_slow_period"`
+	MACDSignalPeriod      int                 `mapstructure:"macd_signal_period"`
+	ATRPeriod             int                 `mapstructure:"atr_period"`
+	VolumeSpikeFactor     float64             `mapstructure:"volume_spike_factor"`
+	VolumeLookbackPeriod  int                 `mapstructure:"volume_lookback_period"`
+	OBVPositiveThreshold  float64             `mapstructure:"obv_positive_threshold"`
+	OBVNegativeThreshold  float64             `mapstructure:"obv_negative_threshold"`
+	OBVMAPeriod           int                 `mapstructure:"obv_ma_period"`
+	LiquidityHunt         LiquidityHuntConfig `mapstructure:"liquidity_hunt"`
 }
 
 // InMemoryNonceCounter provides a simple in-memory nonce generator.
@@ -213,6 +214,13 @@ func (n *KrakenNonceGenerator) Nonce() uint64 {
 	defer n.mu.Unlock()
 	n.counter++
 	return n.counter
+}
+
+// LiquidityHuntConfig holds parameters for the liquidity hunt indicator.
+type LiquidityHuntConfig struct {
+	MinWickPercent     float64 `mapstructure:"min_wick_percent"`
+	VolSpikeMultiplier float64 `mapstructure:"vol_spike_multiplier"`
+	VolMAPeriod        int     `mapstructure:"vol_ma_period"`
 }
 
 // Logger provides a structured logger with different levels.
@@ -340,10 +348,11 @@ type PreflightConfig struct {
 
 // TradingConfig holds general trading parameters, updated for the new DCA strategy.
 type TradingConfig struct {
-	AssetPairs            []string `mapstructure:"asset_pairs"`
-	QuoteCurrency         string   `mapstructure:"quote_currency"`
-	MaxPortfolioDrawdown  float64  `mapstructure:"max_portfolio_drawdown"`
-	PortfolioRiskPerTrade float64  `mapstructure:"portfolio_risk_per_trade"`
+	AssetPairs                   []string `mapstructure:"asset_pairs"`
+	QuoteCurrency                string   `mapstructure:"quote_currency"`
+	MaxPortfolioDrawdown         float64  `mapstructure:"max_portfolio_drawdown"`
+	PortfolioRiskPerTrade        float64  `mapstructure:"portfolio_risk_per_trade"`
+	TakeProfitPartialSellPercent float64  `mapstructure:"take_profit_partial_sell_percent"`
 
 	// --- ADDED: Fields for ATR Spacing Mode ---
 	DcaSpacingMode          string  `mapstructure:"dca_spacing_mode"` // "percentage" or "atr"

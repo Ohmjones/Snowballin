@@ -16,7 +16,7 @@ type BacktestResult struct {
 	WinRate       float64
 }
 
-// --- MODIFIED: The function now accepts TradingConfig to access the correct DCA parameters ---
+// RunBacktest simulates a trading strategy over historical data.
 func RunBacktest(bars []utilities.OHLCVBar, indicatorParams utilities.IndicatorsConfig, tradingParams utilities.TradingConfig) BacktestResult {
 	var netProfit float64
 	var totalTrades, winningTrades int
@@ -35,36 +35,39 @@ func RunBacktest(bars []utilities.OHLCVBar, indicatorParams utilities.Indicators
 	if indicatorParams.RSIPeriod > requiredBars {
 		requiredBars = indicatorParams.RSIPeriod
 	}
-	// --- MODIFIED: Ensure enough bars for OBV MA calculation ---
 	if indicatorParams.OBVMAPeriod > requiredBars {
 		requiredBars = indicatorParams.OBVMAPeriod
 	}
 
-	// Pre-calculate the full OBV series once for efficiency
+	// Pre-calculate the full OBV series and close prices once for efficiency
 	fullObvSeries := make([]float64, len(bars))
-	for i := 1; i < len(bars); i++ {
-		if bars[i].Close > bars[i-1].Close {
-			fullObvSeries[i] = fullObvSeries[i-1] + bars[i].Volume
-		} else if bars[i].Close < bars[i-1].Close {
-			fullObvSeries[i] = fullObvSeries[i-1] - bars[i].Volume
-		} else {
-			fullObvSeries[i] = fullObvSeries[i-1]
+	closePrices := make([]float64, len(bars))
+	for i := range bars {
+		closePrices[i] = bars[i].Close
+		if i > 0 {
+			if bars[i].Close > bars[i-1].Close {
+				fullObvSeries[i] = fullObvSeries[i-1] + bars[i].Volume
+			} else if bars[i].Close < bars[i-1].Close {
+				fullObvSeries[i] = fullObvSeries[i-1] - bars[i].Volume
+			} else {
+				fullObvSeries[i] = fullObvSeries[i-1]
+			}
 		}
 	}
 
 	for i := requiredBars; i < len(bars); i++ {
 		currentBars := bars[:i+1]
 		currentBar := currentBars[len(currentBars)-1]
+		currentCloses := closePrices[:i+1]
 
 		if !currentTrade.IsActive {
 			rsi := CalculateRSI(currentBars, indicatorParams.RSIPeriod)
-			macdHist := CalculateMACD(currentBars, indicatorParams.MACDFastPeriod, indicatorParams.MACDSlowPeriod, indicatorParams.MACDSignalPeriod)
+			// [FIX] Correctly call CalculateMACD with close prices and capture all return values
+			_, _, macdHist := CalculateMACD(currentCloses, indicatorParams.MACDFastPeriod, indicatorParams.MACDSlowPeriod, indicatorParams.MACDSignalPeriod)
 
-			// --- MODIFIED: Incorporate OBV trend confirmation ---
 			currentOBV := fullObvSeries[i]
 			obvSMA := CalculateSMA(fullObvSeries[:i+1], indicatorParams.OBVMAPeriod)
 
-			// Entry Condition: MACD bullish, RSI is not overbought, AND OBV confirms rising volume trend
 			if macdHist > 0 && rsi < 60 && currentOBV > obvSMA {
 				currentTrade = simulatedPosition{
 					IsActive:           true,
@@ -94,23 +97,19 @@ func RunBacktest(bars []utilities.OHLCVBar, indicatorParams utilities.Indicators
 			}
 
 			nextSONumber := currentTrade.FilledSafetyOrders + 1
-
 			var totalDeviationPercentage float64
 			currentStep := tradingParams.PriceDeviationToOpenSafetyOrders
 			for j := 0; j < nextSONumber; j++ {
 				totalDeviationPercentage += currentStep
 				currentStep *= tradingParams.SafetyOrderStepScale
 			}
-
 			safetyOrderPrice := currentTrade.EntryPrice * (1.0 - (totalDeviationPercentage / 100.0))
 
 			if currentBar.Low <= safetyOrderPrice {
 				soVolume := currentTrade.BaseOrderSize * math.Pow(tradingParams.SafetyOrderVolumeScale, float64(nextSONumber))
-
 				oldCost := currentTrade.AveragePrice * currentTrade.TotalVolume
 				newCost := safetyOrderPrice * soVolume
 				newTotalVolume := currentTrade.TotalVolume + soVolume
-
 				currentTrade.AveragePrice = (oldCost + newCost) / newTotalVolume
 				currentTrade.TotalVolume = newTotalVolume
 				currentTrade.FilledSafetyOrders++

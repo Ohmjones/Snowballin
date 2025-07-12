@@ -228,3 +228,35 @@ func CalculateVPVR(bars []utilities.OHLCVBar, bins int) []VPVREntry {
 	})
 	return entries
 }
+
+// FindBestLimitPrice analyzes the order book to find a strategic price for a limit buy order.
+// It looks for a "buy wall" (a bid with high volume) within a certain percentage
+// of the initial targetPrice to improve the probability of a successful fill and bounce.
+func FindBestLimitPrice(orderBook broker.OrderBookData, targetPrice float64, searchDepthPercent float64) float64 {
+	if len(orderBook.Bids) == 0 {
+		return targetPrice // Fallback if order book is empty
+	}
+
+	// Define the search range around the target price
+	searchCutoff := targetPrice * (1.0 - (searchDepthPercent / 100.0))
+
+	bestPrice := targetPrice
+	maxVolume := 0.0
+
+	// Iterate through the bids to find the one with the highest volume within our search range
+	for _, bid := range orderBook.Bids {
+		// Stop searching if the bid price is too far below our target
+		if bid.Price < searchCutoff {
+			break
+		}
+
+		// If this bid's volume is the largest we've seen so far, it's our new best price
+		if bid.Volume > maxVolume {
+			maxVolume = bid.Volume
+			bestPrice = bid.Price
+		}
+	}
+
+	// Return the price with the highest volume found, or the original target if no better price was identified.
+	return bestPrice
+}

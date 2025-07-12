@@ -88,6 +88,7 @@ type Order struct {
 	ExecutedVol   float64
 	TimePlaced    time.Time
 	TimeCompleted time.Time
+	RequestedVol  float64
 
 	// Fields below seem to be from a different context or older version based on your screenshot
 	// OrderType     interface{} // Not in screenshot errors

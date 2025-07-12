@@ -74,6 +74,8 @@
       "ETH/USD",
       "SOL/USD"
     ],
+    "trailing_stop_enabled": true,
+    "take_profit_partial_sell_percent": 50.0,
     "quote_currency": "USD",
     "portfolio_risk_per_trade": 0.5,
     "base_order_size": 10.0,
@@ -83,7 +85,6 @@
     "safety_order_step_scale": 1.5,
     "safety_order_volume_scale": 1.5,
     "take_profit_percentage": 0.025,
-    "trailing_stop_enabled": false,
     "stop_loss_enabled": false,
     "recalculate_after_dca_fill": true
   },
@@ -97,7 +98,13 @@
     "macd_signal_period": 9,
     "atr_period": 14,
     "volume_spike_factor": 2.0,
-    "volume_lookback_period": 10
+    "volume_lookback_period": 10,
+
+    "liquidity_hunt": {
+      "min_wick_percent": 60.0,
+      "vol_spike_multiplier": 1.8,
+      "vol_ma_period": 20
+    }
   },
   "consensus": {
     "use_multi_timeframe_consensus": true,
