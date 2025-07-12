@@ -112,20 +112,20 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 			continue
 		}
 
-		commonName, err := a.client.GetCommonAssetName(ctx, krakenAssetName)
-		if err != nil {
-			a.logger.LogWarn("GetAccountValue: could not get common name for Kraken asset %s: %v. This balance will be skipped.", krakenAssetName, err)
-			continue
+		originalKey := krakenAssetName
+		if strings.HasSuffix(krakenAssetName, ".F") {
+			krakenAssetName = strings.TrimSuffix(krakenAssetName, ".F")
 		}
 
-		if strings.HasSuffix(krakenAssetName, ".F") {
-			commonName = strings.TrimSuffix(commonName, ".F")
-			a.logger.LogDebug("GetAccountValue: Including futures asset %s as %s", krakenAssetName, commonName)
+		commonName, err := a.client.GetCommonAssetName(ctx, krakenAssetName)
+		if err != nil {
+			a.logger.LogWarn("GetAccountValue: could not get common name for %s (original: %s): %v. Skipping.", krakenAssetName, originalKey, err)
+			continue
 		}
 
 		if strings.EqualFold(commonName, quoteCurrencyUpper) {
 			totalValue += balance
-			a.logger.LogDebug("GetAccountValue: Added %.2f from cash balance (%s).", balance, commonName)
+			a.logger.LogDebug("GetAccountValue: Added %.2f from cash balance (%s, original key: %s).", balance, commonName, originalKey)
 			continue
 		}
 
