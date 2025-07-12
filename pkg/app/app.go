@@ -123,12 +123,12 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 	if krakenErr != nil {
 		return fmt.Errorf("pre-flight check failed: could not initialize Kraken adapter: %w", krakenErr)
 	}
+	if err := krakenAdapter.RefreshAssetInfo(ctx); err != nil {
+		return fmt.Errorf("pre-flight check failed: could not refresh broker asset info: %w", err)
+	}
 	initialPortfolioValue, portfolioErr := krakenAdapter.GetAccountValue(ctx, cfg.Trading.QuoteCurrency)
 	if portfolioErr != nil {
 		return fmt.Errorf("pre-flight check failed: could not get account value from broker. Check API keys and permissions: %w", portfolioErr)
-	}
-	if err := krakenAdapter.RefreshAssetInfo(ctx); err != nil {
-		return fmt.Errorf("pre-flight check failed: could not refresh broker asset info: %w", err)
 	}
 	logger.LogInfo("Pre-Flight: Broker verification passed. Initial portfolio value: %.2f %s", initialPortfolioValue, cfg.Trading.QuoteCurrency)
 
