@@ -116,10 +116,8 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 			commonPairToFetch := commonName + "/" + quoteCurrencyUpper
 			krakenPairForTicker, err := a.client.GetKrakenPairName(ctx, commonPairToFetch)
 			if err != nil {
-				a.logger.LogWarn("GetAccountValue: could not get Kraken pair for %s to fetch ticker: %v. Cannot value asset %s.", commonPairToFetch, err, commonName)
-				continue // Skip if pair is not tradable
+				return 0, fmt.Errorf("failed to find a tradable pair for asset %s...", commonName, balance, quoteCurrencyUpper, err)
 			}
-
 			tickerInfo, err := a.client.GetTickerAPI(ctx, krakenPairForTicker)
 
 			// --- CRITICAL FIX: All-or-Nothing Logic ---
