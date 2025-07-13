@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -97,6 +99,13 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 	defer discordClient.SendMessage("🛑 **Snowballin' Bot Shutting Down**")
 
 	logger.LogInfo("AppRun: Starting pre-flight checks...")
+
+	// --- FIX: Corrected cfg.DB.Path to cfg.DB.DBPath ---
+	logger.LogInfo("Pre-Flight: Ensuring database directory exists at: %s", cfg.DB.DBPath)
+	dbDir := filepath.Dir(cfg.DB.DBPath)
+	if err := os.MkdirAll(dbDir, 0755); err != nil {
+		return fmt.Errorf("pre-flight check failed: could not create database directory %s: %w", dbDir, err)
+	}
 
 	sqliteCache, err := dataprovider.NewSQLiteCache(cfg.DB)
 	if err != nil {
@@ -216,7 +225,6 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 	}
 	logger.LogInfo("AppRun: Loaded %d open position(s) and %d pending order(s) from database.", len(loadedPositions), len(loadedPendingOrders))
 
-	// --- [MODIFICATION] Self-healing logic to reconcile state for ALL configured assets. ---
 	logger.LogInfo("Reconciliation: Verifying consistency between database state and exchange balances...")
 	tempStateForRecon := &TradingState{broker: krakenAdapter, logger: logger, config: cfg}
 
@@ -226,16 +234,13 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 
 		balanceInfo, err := krakenAdapter.GetBalance(ctx, baseAsset)
 		if err != nil {
-			logger.LogDebug("Reconciliation: Could not get balance for %s, likely not held. Skipping.", baseAsset)
+			logger.LogError("Reconciliation: Could not get balance for %s, this should not happen. Error: %v", baseAsset, err)
 			continue
 		}
 
-		// Check if we have a balance on the exchange but no corresponding position in our database.
 		if balanceInfo.Total > 0.00000001 && !hasPositionInDB {
-			// Pass the actual balance to the reconstruction function.
 			reconstructedPos, reconErr := ReconstructOrphanedPosition(ctx, tempStateForRecon, pair, balanceInfo.Total)
 			if reconErr != nil {
-				// Use LogFatal to halt the bot if reconstruction fails, as this is a critical state mismatch.
 				logger.LogFatal("ORPHANED POSITION DETECTED for %s, but reconstruction failed: %v. Manual intervention required.", pair, reconErr)
 			}
 
@@ -246,7 +251,6 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 		}
 	}
 	logger.LogInfo("Reconciliation: State verification complete.")
-	// --- End of modification ---
 
 	state := &TradingState{
 		broker:                  krakenAdapter,
@@ -277,11 +281,9 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 	}
 }
 
-// --- [NEW] This function reconstructs an orphaned position by matching trade history to the actual exchange balance. ---
 func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, assetPair string, actualBalance float64) (*utilities.Position, error) {
 	state.logger.LogWarn("Reconstruction: Attempting to reconstruct orphaned position for %s. Target balance: %f", assetPair, actualBalance)
 
-	// Fetch the last 90 days of trades specifically for the orphaned asset pair.
 	ninetyDaysAgo := time.Now().Add(-90 * 24 * time.Hour)
 	tradeHistory, err := state.broker.GetTrades(ctx, assetPair, ninetyDaysAgo)
 	if err != nil {
@@ -292,29 +294,23 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 		return nil, fmt.Errorf("no trade history found for this asset in the last 90 days, cannot reconstruct")
 	}
 
-	// Sort trades from most recent to oldest, which is the default from the broker but we ensure it.
 	sort.Slice(tradeHistory, func(i, j int) bool {
 		return tradeHistory[i].Timestamp.After(tradeHistory[j].Timestamp)
 	})
 
 	var positionTrades []broker.Trade
 	accumulatedVolume := 0.0
-	const tolerance = 1e-8 // Tolerance for float comparisons
+	const tolerance = 1e-8
 
-	// Iterate backwards from the most recent trade.
 	for _, trade := range tradeHistory {
-		// Stop if we have accumulated enough volume to match the balance.
 		if accumulatedVolume >= actualBalance-tolerance {
 			break
 		}
 
 		if trade.Side == "buy" {
-			// Prepend the buy trade to the list to maintain chronological order for calculations.
 			positionTrades = append([]broker.Trade{trade}, positionTrades...)
 			accumulatedVolume += trade.Volume
 		} else if trade.Side == "sell" {
-			// If we encounter a sell, it means the trades before it belonged to a prior, closed position.
-			// We stop here, as we only want the trades that constitute the current open position.
 			break
 		}
 	}
@@ -324,14 +320,12 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 	}
 
 	var totalCost float64
-	// The first trade in our collected list is the base order of this position.
 	baseOrderTrade := positionTrades[0]
 
 	for _, trade := range positionTrades {
 		totalCost += trade.Cost
 	}
 
-	// Use the actual balance from the exchange as the source of truth for volume.
 	finalVolume := actualBalance
 	if finalVolume <= tolerance {
 		return nil, errors.New("reconstructed trades have zero or negative total volume, cannot reconstruct")
@@ -342,8 +336,8 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 	reconstructedPosition := &utilities.Position{
 		AssetPair:          assetPair,
 		EntryTimestamp:     baseOrderTrade.Timestamp,
-		AveragePrice:       totalCost / accumulatedVolume, // Calculate avg price based on the actual trades
-		TotalVolume:        finalVolume,                   // Set volume to the actual balance
+		AveragePrice:       totalCost / accumulatedVolume,
+		TotalVolume:        finalVolume,
 		BaseOrderPrice:     baseOrderTrade.Price,
 		BaseOrderSize:      baseOrderTrade.Cost,
 		FilledSafetyOrders: filledSafetyOrders,
@@ -601,7 +595,6 @@ func updatePositionFromFill(state *TradingState, order broker.Order, assetPair s
 		}
 	} else { // Sell order
 		if pos, ok := state.openPositions[assetPair]; ok {
-			// Using a tolerance for float comparison
 			if math.Abs(pos.TotalVolume-order.ExecutedVol) < 1e-8 {
 				profit := (order.Price - pos.AveragePrice) * pos.TotalVolume
 				profitPercent := ((order.Price - pos.AveragePrice) / pos.AveragePrice) * 100

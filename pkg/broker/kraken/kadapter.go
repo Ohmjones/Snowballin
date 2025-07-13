@@ -50,13 +50,6 @@ func NewAdapter(appCfg *utilities.KrakenConfig, HTTPClient *http.Client, logger 
 	return adapter, nil
 }
 
-func (a *Adapter) GetInternalClient() (*Client, bool) {
-	if a.client != nil {
-		return a.client, true
-	}
-	return nil, false
-}
-
 func (a *Adapter) RefreshAssetInfo(ctx context.Context) error {
 	a.logger.LogInfo("Adapter: Refreshing Kraken asset information...")
 	if err := a.client.RefreshAssets(ctx); err != nil {
@@ -69,6 +62,176 @@ func (a *Adapter) RefreshAssetInfo(ctx context.Context) error {
 	return nil
 }
 
+func (a *Adapter) GetBalance(ctx context.Context, currency string) (broker.Balance, error) {
+	balances, err := a.client.GetBalancesAPI(ctx)
+	if err != nil {
+		return broker.Balance{}, fmt.Errorf("GetBalance: failed to get balances from API: %w", err)
+	}
+
+	krakenAssetName, err := a.client.GetKrakenAssetName(ctx, currency)
+	if err != nil {
+		a.logger.LogDebug("GetBalance: Could not resolve Kraken asset name for '%s'. It may not be a traded asset or may have a zero balance. Error: %v", currency, err)
+		return broker.Balance{Currency: currency, Total: 0, Available: 0}, nil
+	}
+
+	var balanceStr string
+	var exists bool
+
+	balanceStr, exists = balances[krakenAssetName]
+	if !exists {
+		assetInfo, infoErr := a.client.GetAssetInfo(ctx, krakenAssetName)
+		if infoErr == nil && assetInfo.Altname != "" {
+			balanceStr, exists = balances[assetInfo.Altname]
+		}
+	}
+	if !exists {
+		balanceStr, exists = balances[krakenAssetName+".S"]
+	}
+
+	if !exists {
+		return broker.Balance{Currency: currency, Total: 0, Available: 0}, nil
+	}
+
+	bal, err := strconv.ParseFloat(balanceStr, 64)
+	if err != nil {
+		return broker.Balance{}, fmt.Errorf("GetBalance: could not parse balance string '%s' for %s: %w", balanceStr, currency, err)
+	}
+
+	return broker.Balance{
+		Currency:  currency,
+		Total:     bal,
+		Available: bal,
+	}, nil
+}
+
+func intervalToDuration(interval string) (time.Duration, error) {
+	minutes, err := strconv.Atoi(interval)
+	if err != nil {
+		return 0, fmt.Errorf("invalid interval format: %s", interval)
+	}
+	return time.Duration(minutes) * time.Minute, nil
+}
+
+func (a *Adapter) GetLastNOHLCVBars(ctx context.Context, pair string, intervalMinutes string, nBars int) ([]utilities.OHLCVBar, error) {
+	const cacheProvider = "kraken"
+	cacheKey := fmt.Sprintf("%s-%s", strings.ReplaceAll(pair, "/", "-"), intervalMinutes)
+
+	interval, err := intervalToDuration(intervalMinutes)
+	if err != nil {
+		return nil, fmt.Errorf("could not determine lookback for cache: %w", err)
+	}
+	lookbackDuration := time.Duration(nBars+5) * interval
+	startTime := time.Now().Add(-lookbackDuration)
+
+	cachedBars, err := a.cache.GetBars(cacheProvider, cacheKey, startTime.UnixMilli(), time.Now().UnixMilli())
+	if err == nil && len(cachedBars) >= nBars {
+		if time.Since(time.UnixMilli(cachedBars[len(cachedBars)-1].Timestamp)) < (2 * interval) {
+			a.logger.LogInfo("kadapter GetLastNOHLCVBars [%s]: Cache hit. Returning %d bars.", pair, nBars)
+			if len(cachedBars) > nBars {
+				return cachedBars[len(cachedBars)-nBars:], nil
+			}
+			return cachedBars, nil
+		}
+	}
+
+	a.logger.LogInfo("kadapter GetLastNOHLCVBars [%s]: Cache miss or insufficient data. Fetching from API.", pair)
+	krakenPair, err := a.client.GetPrimaryKrakenPairName(ctx, pair)
+	if err != nil {
+		return nil, fmt.Errorf("GetLastNOHLCVBars: failed to get Kraken pair name for %s: %w", pair, err)
+	}
+
+	sinceTimestamp := time.Now().Add(-lookbackDuration).Unix()
+	krakenOHLCV, err := a.client.GetOHLCVAPI(ctx, krakenPair, intervalMinutes, sinceTimestamp, 0)
+	if err != nil {
+		return nil, fmt.Errorf("GetLastNOHLCVBars: client call failed for %s: %w", pair, err)
+	}
+
+	if len(krakenOHLCV) == 0 {
+		return nil, fmt.Errorf("no OHLCV data returned from API for %s", pair)
+	}
+
+	var fetchedBars []utilities.OHLCVBar
+	for _, kBar := range krakenOHLCV {
+		bar, parseErr := a.client.ParseOHLCV(kBar)
+		if parseErr != nil {
+			a.logger.LogWarn("kadapter GetLastNOHLCVBars [%s]: Failed to parse a bar, skipping: %v", pair, parseErr)
+			continue
+		}
+		fetchedBars = append(fetchedBars, bar)
+	}
+
+	for _, bar := range fetchedBars {
+		if err := a.cache.SaveBar(cacheProvider, cacheKey, bar); err != nil {
+			a.logger.LogWarn("kadapter GetLastNOHLCVBars [%s]: Failed to save new bar to cache: %v", pair, err)
+		}
+	}
+	a.logger.LogInfo("kadapter GetLastNOHLCVBars [%s]: Fetched and cached %d new bar(s).", pair, len(fetchedBars))
+
+	if len(fetchedBars) < nBars {
+		a.logger.LogWarn("kadapter GetLastNOHLCVBars [%s]: API returned fewer bars (%d) than requested (%d).", pair, len(fetchedBars), nBars)
+		return fetchedBars, nil
+	}
+
+	return fetchedBars[len(fetchedBars)-nBars:], nil
+}
+
+func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) ([]broker.Trade, error) {
+	params := url.Values{}
+	if !since.IsZero() {
+		params.Set("start", strconv.FormatInt(since.Unix(), 10))
+	}
+
+	if pair != "" {
+		krakenPair, err := a.client.GetPrimaryKrakenPairName(ctx, pair)
+		if err != nil {
+			return nil, fmt.Errorf("GetTrades: could not resolve pair name for %s: %w", pair, err)
+		}
+		params.Set("pair", krakenPair)
+	}
+
+	tradesMap, _, err := a.client.QueryTradesAPI(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+
+	var trades []broker.Trade
+	for tradeID, trade := range tradesMap {
+		commonPair, commonPairErr := a.client.GetCommonPairName(ctx, trade.Pair)
+		if commonPairErr != nil {
+			a.logger.LogWarn("GetTrades: could not get common pair name for %s, skipping trade. Error: %v", trade.Pair, commonPairErr)
+			continue
+		}
+
+		if pair != "" && commonPair != pair {
+			continue
+		}
+
+		price, _ := strconv.ParseFloat(trade.Price, 64)
+		volume, _ := strconv.ParseFloat(trade.Vol, 64)
+		fee, _ := strconv.ParseFloat(trade.Fee, 64)
+		cost, _ := strconv.ParseFloat(trade.Cost, 64)
+
+		trades = append(trades, broker.Trade{
+			ID:          tradeID,
+			OrderID:     trade.Ordtxid,
+			Pair:        commonPair,
+			Side:        trade.Type,
+			Price:       price,
+			Volume:      volume,
+			Cost:        cost,
+			Fee:         fee,
+			FeeCurrency: strings.Split(commonPair, "/")[1],
+			Timestamp:   time.Unix(int64(trade.Time), 0),
+		})
+	}
+
+	sort.Slice(trades, func(i, j int) bool {
+		return trades[i].Timestamp.Before(trades[j].Timestamp)
+	})
+
+	return trades, nil
+}
+
 func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (float64, error) {
 	a.logger.LogInfo("Fetching account balances from Kraken to calculate total portfolio value in %s...", quoteCurrency)
 	balances, err := a.client.GetBalancesAPI(ctx)
@@ -78,20 +241,6 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 
 	totalValue := 0.0
 	quoteCurrencyUpper := strings.ToUpper(quoteCurrency)
-
-	// Establish the pivot ticker (for triangulation) using its primary data name.
-	pivotPrimaryPair, err := a.client.GetPrimaryKrakenPairName(ctx, "BTC/USD")
-	if err != nil {
-		return 0, fmt.Errorf("could not resolve pivot pair BTC/USD: %w", err)
-	}
-	pivotTicker, pivotTickerErr := a.client.GetTickerAPI(ctx, pivotPrimaryPair)
-	if pivotTickerErr != nil {
-		return 0, fmt.Errorf("GetAccountValue: failed to get pivot ticker for %s: %w", pivotPrimaryPair, pivotTickerErr)
-	}
-	pivotBidPrice, _ := strconv.ParseFloat(pivotTicker.Bid[0], 64)
-	if pivotBidPrice <= 0 {
-		return 0, fmt.Errorf("GetAccountValue: pivot asset BTC has non-positive bid price (%.2f)", pivotBidPrice)
-	}
 
 	for originalKey, balanceStr := range balances {
 		balance, err := strconv.ParseFloat(balanceStr, 64)
@@ -111,78 +260,76 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 			continue
 		}
 
-		var priceInQuote float64
-		commonPairToFetch := commonName + "/" + quoteCurrencyUpper
-
-		primaryPairName, err1 := a.client.GetPrimaryKrakenPairName(ctx, commonPairToFetch)
-		if err1 == nil {
-			ticker, err := a.client.GetTickerAPI(ctx, primaryPairName)
-			if err == nil && len(ticker.Bid) > 0 && ticker.Bid[0] != "" {
-				price, pErr := strconv.ParseFloat(ticker.Bid[0], 64)
-				if pErr == nil && price > 0 {
-					priceInQuote = price
-				}
-			}
-		}
-
-		if priceInQuote == 0 {
-			tradeablePairName, err2 := a.client.GetTradeableKrakenPairName(ctx, commonPairToFetch)
-			if err2 == nil {
-				ticker, err := a.client.GetTickerAPI(ctx, tradeablePairName)
-				if err == nil && len(ticker.Bid) > 0 && ticker.Bid[0] != "" {
-					price, pErr := strconv.ParseFloat(ticker.Bid[0], 64)
-					if pErr == nil && price > 0 {
-						priceInQuote = price
-					}
-				}
-			}
-		}
-
-		if priceInQuote > 0 {
-			assetValueInQuote := balance * priceInQuote
-			totalValue += assetValueInQuote
-			a.logger.LogDebug("GetAccountValue: Valued %f of %s at %.2f %s/COIN (Direct Ticker)", balance, commonName, priceInQuote, quoteCurrencyUpper)
-			continue
-		}
-
-		a.logger.LogWarn("GetAccountValue: No direct %s ticker for %s, attempting triangulation via BTC.", quoteCurrencyUpper, commonName)
-
-		// --- FIX: Correctly form the triangulation pair using the resolved common name ---
-		triangulationPair := commonName + "/BTC"
-		primaryTriangulationPair, err := a.client.GetPrimaryKrakenPairName(ctx, triangulationPair)
+		priceInQuote, err := a.getAssetPriceInQuote(ctx, commonName, quoteCurrencyUpper)
 		if err != nil {
-			a.logger.LogWarn("GetAccountValue: Triangulation failed for %s: could not resolve %s.", commonName, triangulationPair)
+			a.logger.LogWarn("GetAccountValue: %v. Skipping value calculation for %s.", err, commonName)
 			continue
 		}
 
-		triangTicker, err := a.client.GetTickerAPI(ctx, primaryTriangulationPair)
-		if err != nil {
-			a.logger.LogWarn("GetAccountValue: Triangulation failed for %s: could not get ticker for %s.", commonName, primaryTriangulationPair)
-			continue
-		}
-
-		if len(triangTicker.Bid) == 0 || triangTicker.Bid[0] == "" {
-			a.logger.LogWarn("GetAccountValue: Triangulation ticker for %s had no bid price.", primaryTriangulationPair)
-			continue
-		}
-
-		triangBidPrice, err := strconv.ParseFloat(triangTicker.Bid[0], 64)
-		if err != nil || triangBidPrice <= 0 {
-			a.logger.LogWarn("GetAccountValue: Triangulation failed for %s: invalid price in ticker.", commonName)
-			continue
-		}
-
-		assetValueInBtc := balance * triangBidPrice
-		assetValueInQuote := assetValueInBtc * pivotBidPrice
+		assetValueInQuote := balance * priceInQuote
 		totalValue += assetValueInQuote
+		a.logger.LogDebug("GetAccountValue: Valued %f of %s at %.2f %s/COIN", balance, commonName, priceInQuote, quoteCurrencyUpper)
 	}
 
 	a.logger.LogInfo("Calculated total account value: %.2f %s", totalValue, quoteCurrencyUpper)
 	return totalValue, nil
 }
 
+func (a *Adapter) getAssetPriceInQuote(ctx context.Context, commonBase, commonQuote string) (float64, error) {
+	directPair := fmt.Sprintf("%s/%s", commonBase, commonQuote)
+	krakenPair, err := a.client.GetPrimaryKrakenPairName(ctx, directPair)
+	if err == nil {
+		ticker, tickerErr := a.client.GetTickerAPI(ctx, krakenPair)
+		if tickerErr == nil {
+			price, pErr := strconv.ParseFloat(ticker.Bid[0], 64)
+			if pErr == nil && price > 0 {
+				return price, nil
+			}
+		}
+	}
+
+	a.logger.LogDebug("getAssetPriceInQuote: No direct ticker for %s, attempting triangulation via BTC.", directPair)
+	pivotPair := "BTC/USD"
+	if commonQuote != "USD" {
+		pivotPair = fmt.Sprintf("BTC/%s", commonQuote)
+	}
+
+	krakenPivotPair, err := a.client.GetPrimaryKrakenPairName(ctx, pivotPair)
+	if err != nil {
+		return 0, fmt.Errorf("could not resolve pivot pair %s for triangulation", pivotPair)
+	}
+	pivotTicker, err := a.client.GetTickerAPI(ctx, krakenPivotPair)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get pivot ticker for %s", krakenPivotPair)
+	}
+	pivotPrice, _ := strconv.ParseFloat(pivotTicker.Bid[0], 64)
+	if pivotPrice <= 0 {
+		return 0, fmt.Errorf("pivot asset %s has non-positive price", pivotPair)
+	}
+
+	if commonBase == "BTC" {
+		return pivotPrice, nil
+	}
+
+	triangulationPair := fmt.Sprintf("%s/BTC", commonBase)
+	krakenTriangulationPair, err := a.client.GetPrimaryKrakenPairName(ctx, triangulationPair)
+	if err != nil {
+		return 0, fmt.Errorf("could not resolve triangulation pair %s", triangulationPair)
+	}
+	triangTicker, err := a.client.GetTickerAPI(ctx, krakenTriangulationPair)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get ticker for triangulation pair %s", krakenTriangulationPair)
+	}
+	triangPrice, _ := strconv.ParseFloat(triangTicker.Bid[0], 64)
+	if triangPrice <= 0 {
+		return 0, fmt.Errorf("triangulation asset %s has non-positive price", triangulationPair)
+	}
+
+	return triangPrice * pivotPrice, nil
+}
+
 func (a *Adapter) GetOrderBook(ctx context.Context, commonPair string, depth int) (broker.OrderBookData, error) {
-	krakenPair, err := a.client.GetKrakenPairName(ctx, commonPair)
+	krakenPair, err := a.client.GetPrimaryKrakenPairName(ctx, commonPair)
 	if err != nil {
 		return broker.OrderBookData{}, fmt.Errorf("GetOrderBook: failed to get Kraken pair name for %s: %w", commonPair, err)
 	}
@@ -192,128 +339,13 @@ func (a *Adapter) GetOrderBook(ctx context.Context, commonPair string, depth int
 		return broker.OrderBookData{}, err
 	}
 
-	bids := make([]broker.OrderBookLevel, len(rawOrderBook.Bids))
-	for i, b := range rawOrderBook.Bids {
-		price, pErr := utilities.ParseFloatFromInterface(b[0])
-		volume, vErr := utilities.ParseFloatFromInterface(b[1])
-		if pErr != nil || vErr != nil {
-			return broker.OrderBookData{}, fmt.Errorf("error parsing bid level %d: priceErr=%v, volErr=%v", i, pErr, vErr)
-		}
-		bids[i] = broker.OrderBookLevel{Price: price, Volume: volume}
-	}
-
-	asks := make([]broker.OrderBookLevel, len(rawOrderBook.Asks))
-	for i, ask := range rawOrderBook.Asks {
-		price, pErr := utilities.ParseFloatFromInterface(ask[0])
-		volume, vErr := utilities.ParseFloatFromInterface(ask[1])
-		if pErr != nil || vErr != nil {
-			return broker.OrderBookData{}, fmt.Errorf("error parsing ask level %d: priceErr=%v, volErr=%v", i, pErr, vErr)
-		}
-		asks[i] = broker.OrderBookLevel{Price: price, Volume: volume}
-	}
-
-	return broker.OrderBookData{
-		Pair:      commonPair,
-		Bids:      bids,
-		Asks:      asks,
-		Timestamp: time.Now().UTC(),
-	}, nil
-}
-
-func (a *Adapter) GetLastNOHLCVBars(ctx context.Context, pair string, intervalMinutes string, nBars int) ([]utilities.OHLCVBar, error) {
-	cacheProvider := "kraken"
-	cacheCoinID := fmt.Sprintf("%s-%s", pair, intervalMinutes)
-	intervalDuration, _ := time.ParseDuration(fmt.Sprintf("%sm", intervalMinutes))
-	lookbackDuration := time.Duration(nBars) * intervalDuration
-	startTime := time.Now().Add(-lookbackDuration)
-	cachedBars, err := a.cache.GetBars(cacheProvider, cacheCoinID, startTime.UnixMilli(), time.Now().UnixMilli())
-	if err != nil {
-		a.logger.LogWarn("kadapter GetLastNOHLCVBars [%s]: Failed to get bars from cache: %v", pair, err)
-	}
-	if len(cachedBars) >= nBars {
-		a.logger.LogInfo("kadapter GetLastNOHLCVBars [%s]: Using %d bars from cache.", pair, len(cachedBars))
-		return cachedBars, nil
-	}
-
-	a.logger.LogInfo("kadapter GetLastNOHLCVBars [%s]: Cache miss or insufficient data. Fetching from API.", pair)
-	krakenPair, err := a.client.GetKrakenPairName(ctx, pair)
-	if err != nil {
-		return nil, fmt.Errorf("GetLastNOHLCVBars: failed to get Kraken pair name for %s: %w", pair, err)
-	}
-
-	krakenOHLCV, err := a.client.GetOHLCVAPI(ctx, krakenPair, intervalMinutes, 0, nBars)
-	if err != nil {
-		return nil, fmt.Errorf("GetLastNOHLCVBars: client call failed for %s: %w", pair, err)
-	}
-
-	var ohlcvBars []utilities.OHLCVBar
-	for _, kBar := range krakenOHLCV {
-		if len(kBar) < 7 {
-			continue
-		}
-		ts, errTs := utilities.ParseFloatFromInterface(kBar[0])
-		open, errO := utilities.ParseFloatFromInterface(kBar[1])
-		high, errH := utilities.ParseFloatFromInterface(kBar[2])
-		low, errL := utilities.ParseFloatFromInterface(kBar[3])
-		closeVal, errC := utilities.ParseFloatFromInterface(kBar[4])
-		volume, errV := utilities.ParseFloatFromInterface(kBar[6])
-		if errTs != nil || errO != nil || errH != nil || errL != nil || errC != nil || errV != nil {
-			continue
-		}
-		bar := utilities.OHLCVBar{
-			Timestamp: int64(ts) * 1000,
-			Open:      open, High: high, Low: low, Close: closeVal, Volume: volume,
-		}
-		ohlcvBars = append(ohlcvBars, bar)
-		if err := a.cache.SaveBar(cacheProvider, cacheCoinID, bar); err != nil {
-			a.logger.LogWarn("kadapter GetLastNOHLCVBars [%s]: Failed to save bar to cache: %v", pair, err)
-		}
-	}
-
-	sort.Slice(ohlcvBars, func(i, j int) bool {
-		return ohlcvBars[i].Timestamp < ohlcvBars[j].Timestamp
-	})
-
-	if len(ohlcvBars) > nBars {
-		ohlcvBars = ohlcvBars[len(ohlcvBars)-nBars:]
-	}
-
-	return ohlcvBars, nil
-}
-
-func (ka *Adapter) CalculateMarketCap(ctx context.Context, pair string, circulatingSupply float64) (float64, error) {
-	ticker, err := ka.client.GetTickerAPI(ctx, pair)
-	if err != nil {
-		ka.logger.LogError("CalculateMarketCap: Failed to fetch ticker for %s: %v", pair, err)
-		return 0, err
-	}
-
-	price, err := strconv.ParseFloat(ticker.LastTradeClosed[0], 64)
-	if err != nil {
-		ka.logger.LogError("CalculateMarketCap: Price conversion error for %s: %v", pair, err)
-		return 0, err
-	}
-
-	marketCap := price * circulatingSupply
-	ka.logger.LogDebug("CalculateMarketCap: Kraken market cap for %s calculated as %f", pair, marketCap)
-	return marketCap, nil
+	return a.client.ParseOrderBook(rawOrderBook, commonPair)
 }
 
 func (a *Adapter) PlaceOrder(ctx context.Context, assetPair, side, orderType string, volume, price, stopPrice float64, clientOrderID string) (string, error) {
-	// --- FIX: Use the correct TRADEABLE name for placing an order ---
-	var tradeableKrakenPair string
-	switch assetPair {
-	case "BTC/USD":
-		tradeableKrakenPair = "XBTUSD"
-	case "ETH/USD":
-		tradeableKrakenPair = "ETHUSD"
-	case "SOL/USD":
-		tradeableKrakenPair = "SOLUSD"
-	default:
-		// This fallback may not work for future assets with inconsistent naming.
-		// For now, it handles the defined scope.
-		a.logger.LogWarn("PlaceOrder: Attempting to use unresolved pair name for %s. This may fail.", assetPair)
-		tradeableKrakenPair = strings.Replace(assetPair, "/", "", 1)
+	tradeableKrakenPair, err := a.client.GetTradeableKrakenPairName(ctx, assetPair)
+	if err != nil {
+		return "", fmt.Errorf("PlaceOrder: could not resolve tradeable pair name for %s: %w", assetPair, err)
 	}
 
 	pairDetail, err := a.client.GetPairDetail(ctx, tradeableKrakenPair)
@@ -361,89 +393,20 @@ func (a *Adapter) GetOrderStatus(ctx context.Context, orderID string) (broker.Or
 
 	krakenOrder, ok := ordersInfo[orderID]
 	if !ok {
-		a.logger.LogDebug("GetOrderStatus: order %s not found in closed/cancelled query. It may still be open.", orderID)
-		return broker.Order{}, fmt.Errorf("GetOrderStatus: order %s not found in trade history query", orderID)
+		return broker.Order{}, fmt.Errorf("order %s not found in query result", orderID)
 	}
 
-	price, _ := strconv.ParseFloat(krakenOrder.Price, 64)
-	volume, _ := strconv.ParseFloat(krakenOrder.Volume, 64)
-	filledVolume, _ := strconv.ParseFloat(krakenOrder.VolExec, 64)
-	fee, _ := strconv.ParseFloat(krakenOrder.Fee, 64)
-	cost, _ := strconv.ParseFloat(krakenOrder.Cost, 64)
-
-	var avgFillPrice float64
-	if filledVolume > 0 {
-		avgFillPrice = cost / filledVolume
-	}
-
-	openTime := time.Unix(int64(krakenOrder.Opentm), 0)
-	closeTime := time.Unix(int64(krakenOrder.Closetm), 0)
-
-	return broker.Order{
-		ID:            orderID,
-		Pair:          krakenOrder.Descr.Pair,
-		Side:          krakenOrder.Descr.Type,
-		Type:          krakenOrder.Descr.OrderType,
-		Status:        krakenOrder.Status,
-		Price:         price,
-		Volume:        volume,
-		FilledVolume:  filledVolume,
-		AvgFillPrice:  avgFillPrice,
-		Cost:          cost,
-		Fee:           fee,
-		CreatedAt:     openTime,
-		TimePlaced:    openTime,
-		UpdatedAt:     closeTime,
-		TimeCompleted: closeTime,
-		Reason:        krakenOrder.Reason,
-	}, nil
-}
-
-func (a *Adapter) GetBalance(ctx context.Context, currency string) (broker.Balance, error) {
-	balances, err := a.client.GetBalancesAPI(ctx)
+	commonPair, err := a.client.GetCommonPairName(ctx, krakenOrder.Descr.Pair)
 	if err != nil {
-		return broker.Balance{}, err
+		a.logger.LogWarn("GetOrderStatus: could not resolve common pair for %s. Using original.", krakenOrder.Descr.Pair)
+		commonPair = krakenOrder.Descr.Pair
 	}
 
-	// --- FIX: Use the client's mapping to find the asset by its common name ---
-	krakenAssetName, err := a.client.GetKrakenAssetName(ctx, currency)
-	if err != nil {
-		// Fallback for fiat or other naming conventions
-		if currency == "USD" {
-			krakenAssetName = "ZUSD"
-		} else {
-			return broker.Balance{}, fmt.Errorf("GetBalance: could not get Kraken asset name for %s: %w", currency, err)
-		}
-	}
-
-	// Check for the primary name (e.g., XXBT) and derivative names (e.g., XBT.F)
-	var balanceStr string
-	var exists bool
-
-	balanceStr, exists = balances[krakenAssetName]
-	if !exists {
-		balanceStr, exists = balances[krakenAssetName+".F"] // Check for futures balance, e.g., ETH.F
-	}
-
-	if !exists {
-		// It's possible to have a 0 balance and not have the key, so we return 0 instead of an error.
-		return broker.Balance{Currency: currency, Total: 0, Available: 0}, nil
-	}
-
-	bal, err := strconv.ParseFloat(balanceStr, 64)
-	if err != nil {
-		return broker.Balance{}, fmt.Errorf("GetBalance: could not parse balance for %s: %w", currency, err)
-	}
-
-	return broker.Balance{
-		Currency:  currency,
-		Total:     bal,
-		Available: bal,
-	}, nil
+	return a.client.ParseOrder(orderID, krakenOrder, commonPair), nil
 }
 
 func (a *Adapter) GetTicker(ctx context.Context, pair string) (broker.TickerData, error) {
-	krakenPair, err := a.client.GetKrakenPairName(ctx, pair)
+	krakenPair, err := a.client.GetPrimaryKrakenPairName(ctx, pair)
 	if err != nil {
 		return broker.TickerData{}, err
 	}
@@ -453,107 +416,5 @@ func (a *Adapter) GetTicker(ctx context.Context, pair string) (broker.TickerData
 		return broker.TickerData{}, err
 	}
 
-	lastPrice, err := strconv.ParseFloat(tickerInfo.LastTradeClosed[0], 64)
-	if err != nil {
-		return broker.TickerData{}, err
-	}
-	highPrice, err := strconv.ParseFloat(tickerInfo.High[1], 64)
-	if err != nil {
-		return broker.TickerData{}, err
-	}
-	lowPrice, err := strconv.ParseFloat(tickerInfo.Low[1], 64)
-	if err != nil {
-		return broker.TickerData{}, err
-	}
-	volume, err := strconv.ParseFloat(tickerInfo.Volume[1], 64)
-	if err != nil {
-		return broker.TickerData{}, err
-	}
-
-	return broker.TickerData{
-		Pair:      pair,
-		LastPrice: lastPrice,
-		High:      highPrice,
-		Low:       lowPrice,
-		Volume:    volume,
-		Timestamp: time.Now(),
-	}, nil
-}
-
-func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) ([]broker.Trade, error) {
-	params := url.Values{}
-	if !since.IsZero() {
-		// Use the 'start' parameter to limit the history fetch to a reasonable time frame.
-		params.Set("start", strconv.FormatInt(since.Unix(), 10))
-	}
-
-	// We intentionally do not set the 'pair' parameter here.
-	// Fetching all trades and filtering them locally is more reliable due to
-	// Kraken API's inconsistencies with pair naming in its filter.
-	tradesMap, _, err := a.client.QueryTradesAPI(ctx, params)
-	if err != nil {
-		return nil, err
-	}
-
-	var trades []broker.Trade
-	for tradeID, trade := range tradesMap {
-		// This diagnostic log is helpful for debugging what the API is returning.
-		a.logger.LogDebug("Processing trade from API: ID=%s, Pair=%s, Type=%s, Vol=%s", tradeID, trade.Pair, trade.Type, trade.Vol)
-
-		// Parse all numeric fields from the string-based API response.
-		price, err := strconv.ParseFloat(trade.Price, 64)
-		if err != nil {
-			a.logger.LogWarn("GetTrades: could not parse price for trade %s, skipping.", tradeID)
-			continue
-		}
-		volume, err := strconv.ParseFloat(trade.Vol, 64)
-		if err != nil {
-			a.logger.LogWarn("GetTrades: could not parse volume for trade %s, skipping.", tradeID)
-			continue
-		}
-		fee, err := strconv.ParseFloat(trade.Fee, 64)
-		if err != nil {
-			a.logger.LogWarn("GetTrades: could not parse fee for trade %s, skipping.", tradeID)
-			continue
-		}
-		cost, err := strconv.ParseFloat(trade.Cost, 64)
-		if err != nil {
-			a.logger.LogWarn("GetTrades: could not parse cost for trade %s, skipping.", tradeID)
-			continue
-		}
-
-		// Use the robust client function to translate the Kraken pair name (e.g., "XXBTZUSD")
-		// into the common format used by the bot (e.g., "BTC/USD").
-		commonPair, commonPairErr := a.client.GetCommonPairName(ctx, trade.Pair)
-		if commonPairErr != nil {
-			a.logger.LogWarn("GetTrades: could not get common pair name for %s, skipping trade. Error: %v", trade.Pair, commonPairErr)
-			continue
-		}
-
-		// Perform the critical local filtering. If a pair was requested (e.g., "BTC/USD"),
-		// skip any trades that don't match after translation.
-		if pair != "" && commonPair != pair {
-			continue
-		}
-
-		trades = append(trades, broker.Trade{
-			ID:          tradeID,
-			OrderID:     trade.Ordtxid,
-			Pair:        commonPair,
-			Side:        trade.Type, // Correctly populate the side from the 'type' field.
-			Price:       price,
-			Volume:      volume,
-			Cost:        cost,
-			Fee:         fee,
-			FeeCurrency: strings.Split(commonPair, "/")[1],
-			Timestamp:   time.Unix(int64(trade.Time), 0),
-		})
-	}
-
-	// The API returns trades most recent first; sort them oldest first for correct processing.
-	sort.Slice(trades, func(i, j int) bool {
-		return trades[i].Timestamp.Before(trades[j].Timestamp)
-	})
-
-	return trades, nil
+	return a.client.ParseTicker(tickerInfo, pair), nil
 }
