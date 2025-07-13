@@ -79,12 +79,14 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 	totalValue := 0.0
 	quoteCurrencyUpper := strings.ToUpper(quoteCurrency)
 
-	pivotAsset := "XBT"
+	// --- FIX: Change the pivot asset from "XBT" to "BTC" ---
+	pivotAsset := "BTC"
 	pivotPair := pivotAsset + "/" + quoteCurrencyUpper
 	pivotKrakenPair, pivotErr := a.client.GetKrakenPairName(ctx, pivotPair)
 	if pivotErr != nil {
 		return 0, fmt.Errorf("GetAccountValue: failed to get pivot pair %s for triangulation: %w", pivotPair, pivotErr)
 	}
+
 	pivotTicker, pivotTickerErr := a.client.GetTickerAPI(ctx, pivotKrakenPair)
 	if pivotTickerErr != nil {
 		return 0, fmt.Errorf("GetAccountValue: failed to get pivot ticker for %s: %w", pivotKrakenPair, pivotTickerErr)
