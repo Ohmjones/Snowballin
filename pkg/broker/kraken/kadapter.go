@@ -79,15 +79,14 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 	totalValue := 0.0
 	quoteCurrencyUpper := strings.ToUpper(quoteCurrency)
 
-	// --- FIX: Use the correct PRIMARY data-fetching name for the pivot ticker ---
-	pivotKrakenPair := "XXBTZUSD" // This is the name the Ticker endpoint expects for BTC/USD
-
-	pivotTicker, pivotTickerErr := a.client.GetTickerAPI(ctx, pivotKrakenPair)
-	if pivotTickerErr != nil {
-		return 0, fmt.Errorf("GetAccountValue: failed to get pivot ticker for BTC/USD (%s): %w", pivotKrakenPair, pivotTickerErr)
+	// Establish the pivot ticker (for triangulation) using its primary data name.
+	pivotPrimaryPair, err := a.client.GetPrimaryKrakenPairName(ctx, "BTC/USD")
+	if err != nil {
+		return 0, fmt.Errorf("could not resolve pivot pair BTC/USD: %w", err)
 	}
-	if len(pivotTicker.Bid) == 0 || pivotTicker.Bid[0] == "" {
-		return 0, fmt.Errorf("GetAccountValue: pivot ticker for %s returned no Bid price data", pivotKrakenPair)
+	pivotTicker, pivotTickerErr := a.client.GetTickerAPI(ctx, pivotPrimaryPair)
+	if pivotTickerErr != nil {
+		return 0, fmt.Errorf("GetAccountValue: failed to get pivot ticker for %s: %w", pivotPrimaryPair, pivotTickerErr)
 	}
 	pivotBidPrice, _ := strconv.ParseFloat(pivotTicker.Bid[0], 64)
 	if pivotBidPrice <= 0 {
@@ -100,57 +99,87 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 			continue
 		}
 
-		// This logic for getting the common name remains the same
 		krakenAssetName := strings.TrimSuffix(originalKey, ".F")
 		commonName, err := a.client.GetCommonAssetName(ctx, krakenAssetName)
 		if err != nil {
-			a.logger.LogWarn("GetAccountValue: could not get common name for %s (original: %s): %v. Skipping.", krakenAssetName, originalKey, err)
+			a.logger.LogWarn("GetAccountValue: could not get common name for %s, skipping.", krakenAssetName)
 			continue
 		}
 
+		// If the asset is the quote currency itself (e.g., USD), just add its balance to the total.
 		if strings.EqualFold(commonName, quoteCurrencyUpper) {
 			totalValue += balance
 			continue
 		}
 
+		var priceInQuote float64
 		commonPairToFetch := commonName + "/" + quoteCurrencyUpper
-		var krakenPairForTicker string
 
-		// --- FIX: Ensure the correct DATA-FETCHING name is used for each asset ---
-		switch commonPairToFetch {
-		case "BTC/USD":
-			krakenPairForTicker = "XXBTZUSD"
-		case "ETH/USD":
-			krakenPairForTicker = "XETHZUSD"
-		case "SOL/USD":
-			krakenPairForTicker = "SOLUSD"
-		default:
-			// Fallback for other assets, though it may fail if they also have inconsistent names
-			krakenPairForTicker, err = a.client.GetKrakenPairName(ctx, commonPairToFetch)
-			if err != nil {
-				a.logger.LogWarn("GetAccountValue: Could not resolve pair %s to a kraken pair name, attempting triangulation.", commonPairToFetch)
-			}
-		}
+		// --- NEW RESILIENT LOGIC ---
+		// Try to find a direct price by checking the ticker with both possible pair names.
 
-		var bidPrice float64
-		if krakenPairForTicker != "" {
-			tickerInfo, err := a.client.GetTickerAPI(ctx, krakenPairForTicker)
-			if err == nil && len(tickerInfo.Bid) > 0 && tickerInfo.Bid[0] != "" {
-				bidPrice, err = strconv.ParseFloat(tickerInfo.Bid[0], 64)
-				if err == nil && bidPrice > 0 {
-					assetValueInQuote := balance * bidPrice
-					totalValue += assetValueInQuote
-					a.logger.LogDebug("GetAccountValue: Valued %f of %s at %.2f %s/COIN (BID PRICE, direct), adding %.2f to total.", balance, commonName, bidPrice, quoteCurrencyUpper, assetValueInQuote)
-					continue
+		// Attempt 1: Use the primary data-fetching name (e.g., "XETHZUSD")
+		primaryPairName, err1 := a.client.GetPrimaryKrakenPairName(ctx, commonPairToFetch)
+		if err1 == nil {
+			ticker, err := a.client.GetTickerAPI(ctx, primaryPairName)
+			if err == nil && len(ticker.Bid) > 0 && ticker.Bid[0] != "" {
+				price, pErr := strconv.ParseFloat(ticker.Bid[0], 64)
+				if pErr == nil && price > 0 {
+					priceInQuote = price
 				}
 			}
 		}
 
-		// Triangulation logic for assets without a direct USD pair remains the same...
-		a.logger.LogWarn("GetAccountValue: Could not find direct ticker for %s. Attempting triangulation via BTC.", commonPairToFetch)
-		// ...
+		// Attempt 2: If the primary name didn't work, try the tradeable 'altname' (e.g., "ETHUSD")
+		if priceInQuote == 0 {
+			tradeablePairName, err2 := a.client.GetTradeableKrakenPairName(ctx, commonPairToFetch)
+			if err2 == nil {
+				ticker, err := a.client.GetTickerAPI(ctx, tradeablePairName)
+				if err == nil && len(ticker.Bid) > 0 && ticker.Bid[0] != "" {
+					price, pErr := strconv.ParseFloat(ticker.Bid[0], 64)
+					if pErr == nil && price > 0 {
+						priceInQuote = price
+					}
+				}
+			}
+		}
+
+		if priceInQuote > 0 {
+			assetValueInQuote := balance * priceInQuote
+			totalValue += assetValueInQuote
+			a.logger.LogDebug("GetAccountValue: Valued %f of %s at %.2f %s/COIN (Direct Ticker)", balance, commonName, priceInQuote, quoteCurrencyUpper)
+			continue
+		}
+		// --- END OF NEW LOGIC ---
+
+		// --- Triangulation logic (fallback if no direct ticker was found) ---
+		a.logger.LogWarn("GetAccountValue: No direct %s ticker for %s, attempting triangulation via BTC.", quoteCurrencyUpper, commonName)
+
+		triangulationPair := commonName + "/BTC"
+		primaryTriangulationPair, err := a.client.GetPrimaryKrakenPairName(ctx, triangulationPair)
+		if err != nil {
+			a.logger.LogWarn("GetAccountValue: Triangulation failed for %s: could not resolve %s.", commonName, triangulationPair)
+			continue
+		}
+
+		triangTicker, err := a.client.GetTickerAPI(ctx, primaryTriangulationPair)
+		if err != nil {
+			a.logger.LogWarn("GetAccountValue: Triangulation failed for %s: could not get ticker for %s.", commonName, primaryTriangulationPair)
+			continue
+		}
+
+		triangBidPrice, err := strconv.ParseFloat(triangTicker.Bid[0], 64)
+		if err != nil || triangBidPrice <= 0 {
+			a.logger.LogWarn("GetAccountValue: Triangulation failed for %s: invalid price in ticker.", commonName)
+			continue
+		}
+
+		assetValueInBtc := balance * triangBidPrice
+		assetValueInQuote := assetValueInBtc * pivotBidPrice
+		totalValue += assetValueInQuote
 	}
-	// ...
+
+	a.logger.LogInfo("Calculated total account value: %.2f %s", totalValue, quoteCurrencyUpper)
 	return totalValue, nil
 }
 

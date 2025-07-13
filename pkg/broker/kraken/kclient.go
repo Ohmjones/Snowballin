@@ -35,14 +35,19 @@ type Client struct {
 	cfg            *utilities.KrakenConfig
 	dataMu         sync.RWMutex
 
-	// --- FIX: Centralized and enhanced maps for robust translation ---
-	assetInfoMap        map[string]AssetInfo // Maps a Kraken asset name (e.g., "XXBT") to its full info.
-	commonToKrakenAsset map[string]string    // Maps a common name (e.g., "BTC") to a primary Kraken name ("XXBT").
+	// Maps for asset name translation
+	assetInfoMap        map[string]AssetInfo
+	commonToKrakenAsset map[string]string
 
-	pairInfoMap        map[string]AssetPairAPIInfo // Maps a Kraken pair name (e.g., "XXBTZUSD") to its info.
-	pairDetailsCache   map[string]PairDetail       // Maps a Kraken pair name to its decimals and order minimums.
-	commonToKrakenPair map[string]string           // Maps a common pair (e.g., "BTC/USD") to a Kraken pair ("XXBTZUSD").
-	krakenToCommonPair map[string]string           // Maps a Kraken pair ("XXBTZUSD") back to a common pair ("BTC/USD").
+	// Maps for pair name translation
+	pairInfoMap           map[string]AssetPairAPIInfo
+	pairDetailsCache      map[string]PairDetail
+	commonToTradeablePair map[string]string
+	commonToPrimaryPair   map[string]string
+
+	// --- FIX: Add the missing map here ---
+	commonToKrakenPair map[string]string
+	krakenToCommonPair map[string]string
 }
 
 func (c *Client) GetCommonPairName(ctx context.Context, krakenPair string) (string, error) {
@@ -438,7 +443,6 @@ func (c *Client) callPublic(ctx context.Context, path string, params url.Values,
 	return utilities.DoJSONRequest(c.HTTPClient, req, 2, 2*time.Second, target)
 }
 
-// --- [MODIFIED] This function now populates the new reverse map for pair name translation. ---
 func (c *Client) RefreshAssetPairs(ctx context.Context) error {
 	c.logger.LogInfo("Kraken Client: Refreshing asset pairs info...")
 	var resp struct {
@@ -446,10 +450,10 @@ func (c *Client) RefreshAssetPairs(ctx context.Context) error {
 		Result map[string]AssetPairAPIInfo `json:"result"`
 	}
 	if err := c.callPublic(ctx, "/0/public/AssetPairs", nil, &resp); err != nil {
-		return fmt.Errorf("kraken: RefreshAssetPairs API call failed: %w", err)
+		return err
 	}
 	if len(resp.Error) > 0 {
-		return fmt.Errorf("kraken: AssetPairs API error: %s", strings.Join(resp.Error, ", "))
+		return errors.New(strings.Join(resp.Error, ", "))
 	}
 
 	c.dataMu.Lock()
@@ -459,38 +463,36 @@ func (c *Client) RefreshAssetPairs(ctx context.Context) error {
 		return errors.New("asset map not initialized, call RefreshAssets first")
 	}
 
-	// Clear and initialize all pair-related maps
+	// Initialize all pair-related maps
 	c.pairInfoMap = resp.Result
-	c.commonToKrakenPair = make(map[string]string)
+	c.commonToTradeablePair = make(map[string]string)
+	c.commonToPrimaryPair = make(map[string]string)
 	c.krakenToCommonPair = make(map[string]string)
 	c.pairDetailsCache = make(map[string]PairDetail)
 
-	for krakenPairName, pairInfo := range resp.Result {
-		baseAssetInfo, baseOk := c.assetInfoMap[pairInfo.Base]
-		quoteAssetInfo, quoteOk := c.assetInfoMap[pairInfo.Quote]
+	for primaryPairName, pairInfo := range resp.Result {
+		baseInfo, baseOk := c.assetInfoMap[pairInfo.Base]
+		quoteInfo, quoteOk := c.assetInfoMap[pairInfo.Quote]
 		if !baseOk || !quoteOk {
 			continue
 		}
 
-		commonBase := getCommonAssetName(baseAssetInfo)
-		commonQuote := getCommonAssetName(quoteAssetInfo)
+		commonBase := getCommonAssetName(baseInfo)
+		commonQuote := getCommonAssetName(quoteInfo)
 		if commonBase == "" || commonQuote == "" {
 			continue
 		}
 
 		commonPairKey := fmt.Sprintf("%s/%s", commonBase, commonQuote)
-
-		// The 'altname' is the tradeable pair name (e.g., XBTUSD).
 		tradeablePairName := pairInfo.Altname
 
-		// 1. Map the common name ("BTC/USD") to the TRADEABLE name ("XBTUSD").
-		c.commonToKrakenPair[commonPairKey] = tradeablePairName
+		// Populate all maps with the correct names
+		c.commonToPrimaryPair[commonPairKey] = primaryPairName
+		c.commonToTradeablePair[commonPairKey] = tradeablePairName
+		c.krakenToCommonPair[primaryPairName] = commonPairKey
+		c.krakenToCommonPair[tradeablePairName] = commonPairKey
 
-		// 2. For reverse lookups (from trade history), map BOTH variants back to the common name.
-		c.krakenToCommonPair[krakenPairName] = commonPairKey    // "XXBTZUSD" -> "BTC/USD"
-		c.krakenToCommonPair[tradeablePairName] = commonPairKey // "XBTUSD"   -> "BTC/USD"
-
-		// 3. Cache the pair details using the TRADEABLE name as the key.
+		// Cache details by the tradeable name, which is used for placing orders
 		c.pairDetailsCache[tradeablePairName] = PairDetail{
 			PairDecimals: pairInfo.PairDecimals,
 			LotDecimals:  pairInfo.LotDecimals,
@@ -499,6 +501,52 @@ func (c *Client) RefreshAssetPairs(ctx context.Context) error {
 	}
 	c.logger.LogInfo("Kraken Client: Refreshed %d asset pairs and built comprehensive translation maps.", len(c.pairInfoMap))
 	return nil
+}
+
+// GetPrimaryKrakenPairName provides the name needed for data-fetching endpoints (e.g., Ticker, OHLC).
+func (c *Client) GetPrimaryKrakenPairName(ctx context.Context, commonPair string) (string, error) {
+	c.dataMu.RLock()
+	pair, ok := c.commonToPrimaryPair[commonPair]
+	c.dataMu.RUnlock()
+	if ok {
+		return pair, nil
+	}
+
+	// If not found, refresh and try again
+	if err := c.RefreshAssetPairs(ctx); err != nil {
+		return "", err
+	}
+
+	c.dataMu.RLock()
+	defer c.dataMu.RUnlock()
+	pair, ok = c.commonToPrimaryPair[commonPair]
+	if !ok {
+		return "", fmt.Errorf("primary pair for %s not found after refresh", commonPair)
+	}
+	return pair, nil
+}
+
+// GetTradeableKrakenPairName provides the 'altname' needed for trading endpoints (e.g., AddOrder).
+func (c *Client) GetTradeableKrakenPairName(ctx context.Context, commonPair string) (string, error) {
+	c.dataMu.RLock()
+	pair, ok := c.commonToTradeablePair[commonPair]
+	c.dataMu.RUnlock()
+	if ok {
+		return pair, nil
+	}
+
+	// If not found, refresh and try again
+	if err := c.RefreshAssetPairs(ctx); err != nil {
+		return "", err
+	}
+
+	c.dataMu.RLock()
+	defer c.dataMu.RUnlock()
+	pair, ok = c.commonToTradeablePair[commonPair]
+	if !ok {
+		return "", fmt.Errorf("tradeable pair for %s not found after refresh", commonPair)
+	}
+	return pair, nil
 }
 
 func (c *Client) RefreshAssets(ctx context.Context) error {
