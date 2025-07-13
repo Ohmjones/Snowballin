@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -215,7 +216,7 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 	}
 	logger.LogInfo("AppRun: Loaded %d open position(s) and %d pending order(s) from database.", len(loadedPositions), len(loadedPendingOrders))
 
-	// --- [MODIFICATION] Self-healing logic added to the startup sequence. ---
+	// --- [MODIFICATION] Self-healing logic to reconcile state for ALL configured assets. ---
 	logger.LogInfo("Reconciliation: Verifying consistency between database state and exchange balances...")
 	tempStateForRecon := &TradingState{broker: krakenAdapter, logger: logger, config: cfg}
 
@@ -229,9 +230,12 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 			continue
 		}
 
-		if balanceInfo.Total > 0.00001 && !hasPositionInDB {
-			reconstructedPos, reconErr := ReconstructOrphanedPosition(ctx, tempStateForRecon, pair)
+		// Check if we have a balance on the exchange but no corresponding position in our database.
+		if balanceInfo.Total > 0.00000001 && !hasPositionInDB {
+			// Pass the actual balance to the reconstruction function.
+			reconstructedPos, reconErr := ReconstructOrphanedPosition(ctx, tempStateForRecon, pair, balanceInfo.Total)
 			if reconErr != nil {
+				// Use LogFatal to halt the bot if reconstruction fails, as this is a critical state mismatch.
 				logger.LogFatal("ORPHANED POSITION DETECTED for %s, but reconstruction failed: %v. Manual intervention required.", pair, reconErr)
 			}
 
@@ -273,9 +277,9 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 	}
 }
 
-// --- [NEW] This function reconstructs an orphaned position by analyzing the exchange's trade history. ---
-func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, assetPair string) (*utilities.Position, error) {
-	state.logger.LogWarn("Reconstruction: Attempting to reconstruct orphaned position for %s from trade history.", assetPair)
+// --- [NEW] This function reconstructs an orphaned position by matching trade history to the actual exchange balance. ---
+func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, assetPair string, actualBalance float64) (*utilities.Position, error) {
+	state.logger.LogWarn("Reconstruction: Attempting to reconstruct orphaned position for %s. Target balance: %f", assetPair, actualBalance)
 
 	// Fetch the last 90 days of trades specifically for the orphaned asset pair.
 	ninetyDaysAgo := time.Now().Add(-90 * 24 * time.Hour)
@@ -285,38 +289,52 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 	}
 
 	if len(tradeHistory) == 0 {
-		return nil, fmt.Errorf("no trade history found for this asset, cannot reconstruct")
+		return nil, fmt.Errorf("no trade history found for this asset in the last 90 days, cannot reconstruct")
 	}
 
+	// Sort trades from most recent to oldest, which is the default from the broker but we ensure it.
+	sort.Slice(tradeHistory, func(i, j int) bool {
+		return tradeHistory[i].Timestamp.After(tradeHistory[j].Timestamp)
+	})
+
 	var positionTrades []broker.Trade
+	accumulatedVolume := 0.0
+	const tolerance = 1e-8 // Tolerance for float comparisons
+
 	// Iterate backwards from the most recent trade.
-	for i := len(tradeHistory) - 1; i >= 0; i-- {
-		trade := tradeHistory[i]
-		// Stop collecting when we hit the first "sell" trade, which signifies the end of the last position.
-		if trade.Side == "sell" {
+	for _, trade := range tradeHistory {
+		// Stop if we have accumulated enough volume to match the balance.
+		if accumulatedVolume >= actualBalance-tolerance {
 			break
 		}
-		// Prepend the buy trade to the list to maintain chronological order.
-		positionTrades = append([]broker.Trade{trade}, positionTrades...)
+
+		if trade.Side == "buy" {
+			// Prepend the buy trade to the list to maintain chronological order for calculations.
+			positionTrades = append([]broker.Trade{trade}, positionTrades...)
+			accumulatedVolume += trade.Volume
+		} else if trade.Side == "sell" {
+			// If we encounter a sell, it means the trades before it belonged to a prior, closed position.
+			// We stop here, as we only want the trades that constitute the current open position.
+			break
+		}
 	}
 
 	if len(positionTrades) == 0 {
-		return nil, fmt.Errorf("found trade history for %s, but could not isolate a sequence of buys for the current position", assetPair)
+		return nil, fmt.Errorf("found trade history for %s, but could not isolate a sequence of buys for the current balance of %f", assetPair, actualBalance)
 	}
 
-	var totalCost, totalVolume float64
+	var totalCost float64
 	// The first trade in our collected list is the base order of this position.
 	baseOrderTrade := positionTrades[0]
 
 	for _, trade := range positionTrades {
-		if trade.Side == "buy" {
-			totalCost += trade.Cost
-			totalVolume += trade.Volume
-		}
+		totalCost += trade.Cost
 	}
 
-	if totalVolume == 0 {
-		return nil, errors.New("isolated trades have zero total volume, cannot reconstruct")
+	// Use the actual balance from the exchange as the source of truth for volume.
+	finalVolume := actualBalance
+	if finalVolume <= tolerance {
+		return nil, errors.New("reconstructed trades have zero or negative total volume, cannot reconstruct")
 	}
 
 	filledSafetyOrders := len(positionTrades) - 1
@@ -324,17 +342,17 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 	reconstructedPosition := &utilities.Position{
 		AssetPair:          assetPair,
 		EntryTimestamp:     baseOrderTrade.Timestamp,
-		AveragePrice:       totalCost / totalVolume,
-		TotalVolume:        totalVolume,
+		AveragePrice:       totalCost / accumulatedVolume, // Calculate avg price based on the actual trades
+		TotalVolume:        finalVolume,                   // Set volume to the actual balance
 		BaseOrderPrice:     baseOrderTrade.Price,
-		BaseOrderSize:      baseOrderTrade.Cost, // Approximate base size
+		BaseOrderSize:      baseOrderTrade.Cost,
 		FilledSafetyOrders: filledSafetyOrders,
 		IsDcaActive:        true,
 		BrokerOrderID:      baseOrderTrade.OrderID,
 	}
 	reconstructedPosition.CurrentTakeProfit = reconstructedPosition.AveragePrice * (1 + state.config.Trading.TakeProfitPercentage)
 
-	state.logger.LogInfo("Reconstruction SUCCESS for %s. Avg Price: %.2f, Volume: %.4f, SOs Filled: %d",
+	state.logger.LogInfo("Reconstruction SUCCESS for %s. Avg Price: %.2f, Volume: %.8f (matches exchange), SOs Filled: %d",
 		assetPair, reconstructedPosition.AveragePrice, reconstructedPosition.TotalVolume, reconstructedPosition.FilledSafetyOrders)
 
 	return reconstructedPosition, nil
@@ -581,9 +599,10 @@ func updatePositionFromFill(state *TradingState, order broker.Order, assetPair s
 				state.logger.LogError("PendingOrders: Failed to update position in DB for %s: %v", assetPair, err)
 			}
 		}
-	} else {
+	} else { // Sell order
 		if pos, ok := state.openPositions[assetPair]; ok {
-			if math.Abs(pos.TotalVolume-order.ExecutedVol) < 1e-9 {
+			// Using a tolerance for float comparison
+			if math.Abs(pos.TotalVolume-order.ExecutedVol) < 1e-8 {
 				profit := (order.Price - pos.AveragePrice) * pos.TotalVolume
 				profitPercent := ((order.Price - pos.AveragePrice) / pos.AveragePrice) * 100
 				state.discordClient.NotifyOrderFilled(order, fmt.Sprintf("💰 Position Closed\nProfit: %.2f %s (%.2f%%)", profit, state.config.Trading.QuoteCurrency, profitPercent))
