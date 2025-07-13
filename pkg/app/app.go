@@ -420,16 +420,53 @@ func processTradingCycle(ctx context.Context, state *TradingState) {
 	processPendingOrders(ctx, state)
 	reapStaleOrders(ctx, state)
 
+	// =========================================================================================
+	// ==                            CORE LOGIC MODIFICATION START                            ==
+	// =========================================================================================
 	for _, assetPair := range state.config.Trading.AssetPairs {
+		// Step 1: ALWAYS gather data for the asset pair.
+		consolidatedData, err := gatherConsolidatedData(ctx, state, assetPair, currentPortfolioValue)
+		if err != nil {
+			state.logger.LogError("Cycle [%s]: Failed to gather consolidated data: %v", assetPair, err)
+			continue // Skip this pair for this cycle if data is unavailable.
+		}
+
+		// Step 2: ALWAYS generate the main entry/hold/exit signals based on the data.
+		stratInstance := strategy.NewStrategy(state.logger)
+		signals, _ := stratInstance.GenerateSignals(ctx, *consolidatedData, *state.config)
+
+		// Step 3: Log the generated signal for visibility, fulfilling the user's requirement.
+		// This block ensures a signal is logged for every asset, every cycle.
+		if len(signals) > 0 && signals[0].Direction != "hold" {
+			mainSignal := signals[0]
+			state.logger.LogInfo("GenerateSignals: %s -> %s - Reason: %s", assetPair, strings.ToUpper(mainSignal.Direction), mainSignal.Reason)
+		} else {
+			// Log a hold or no-signal state for clarity in logs.
+			holdReason := "Conditions for buy/sell not met."
+			if len(signals) > 0 {
+				holdReason = signals[0].Reason
+			}
+			state.logger.LogInfo("GenerateSignals: %s -> HOLD - Reason: %s", assetPair, holdReason)
+		}
+
+		// Step 4: Get the current position state for the asset pair.
 		state.stateMutex.RLock()
 		position, hasPosition := state.openPositions[assetPair]
 		state.stateMutex.RUnlock()
+
+		// Step 5: Based on whether a position exists, pass the generated signals and data
+		// to the appropriate handling function.
 		if hasPosition {
-			manageOpenPosition(ctx, state, position)
+			// A position exists. Manage it using the latest market data AND the new signals.
+			manageOpenPosition(ctx, state, position, signals, consolidatedData)
 		} else {
-			seekEntryOpportunity(ctx, state, assetPair, currentPortfolioValue)
+			// No position exists. Look for a BUY signal among the generated signals to open one.
+			seekEntryOpportunity(ctx, state, assetPair, signals, consolidatedData)
 		}
 	}
+	// =======================================================================================
+	// ==                             CORE LOGIC MODIFICATION END                             ==
+	// =======================================================================================
 }
 
 func reapStaleOrders(ctx context.Context, state *TradingState) {
@@ -621,39 +658,57 @@ func updatePositionFromFill(state *TradingState, order broker.Order, assetPair s
 	}
 }
 
-func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities.Position) {
+func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities.Position, signals []strategy.StrategySignal, consolidatedData *strategy.ConsolidatedMarketPicture) {
 	state.logger.LogInfo("ManagePosition [%s]: Managing position. AvgPrice: %.2f, Vol: %.8f, SOs: %d, TP: %.2f",
 		pos.AssetPair, pos.AveragePrice, pos.TotalVolume, pos.FilledSafetyOrders, pos.CurrentTakeProfit)
 
-	ticker, err := state.broker.GetTicker(ctx, pos.AssetPair)
-	if err != nil {
-		state.logger.LogError("ManagePosition [%s]: Could not get ticker: %v", pos.AssetPair, err)
-		return
-	}
-	currentPrice := ticker.LastPrice
-
-	portfolioValue, _ := state.broker.GetAccountValue(ctx, state.config.Trading.QuoteCurrency)
-	consolidatedData, err := gatherConsolidatedData(ctx, state, pos.AssetPair, portfolioValue)
-	if err != nil {
-		state.logger.LogError("ManagePosition [%s]: Could not gather data for exit signal check: %v", pos.AssetPair, err)
-	} else {
-		stratInstance := strategy.NewStrategy(state.logger)
-		exitSignal, shouldExit := stratInstance.GenerateExitSignal(ctx, *consolidatedData, *state.config)
-		if shouldExit && exitSignal.Direction == "sell" {
-			state.logger.LogWarn("!!! [SELL] signal for %s (Strategy Exit). Reason: %s. Placing market sell order.", pos.AssetPair, exitSignal.Reason)
+	// Check for an overriding SELL signal from the main strategy.
+	for _, sig := range signals {
+		if sig.Direction == "sell" {
+			state.logger.LogWarn("!!! [SELL] signal from strategy for open position %s. Reason: %s. Liquidating.", pos.AssetPair, sig.Reason)
 			orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
 			if err != nil {
-				state.logger.LogError("ManagePosition [%s]: Failed to place market sell order for strategy exit: %v", pos.AssetPair, err)
+				state.logger.LogError("ManagePosition [%s]: Failed to place market sell order based on new SELL signal: %v", pos.AssetPair, err)
 			} else {
 				state.stateMutex.Lock()
 				state.pendingOrders[orderID] = pos.AssetPair
 				_ = state.cache.SavePendingOrder(orderID, pos.AssetPair)
 				state.stateMutex.Unlock()
 			}
-			return
+			return // Exit management; the position is being closed.
 		}
 	}
 
+	var currentPrice float64
+	for _, pData := range consolidatedData.ProvidersData {
+		if pData.Name == "kraken" {
+			currentPrice = pData.CurrentPrice
+			break
+		}
+	}
+	if currentPrice == 0 {
+		state.logger.LogError("ManagePosition [%s]: Could not find Kraken price in consolidated data.", pos.AssetPair)
+		return
+	}
+
+	// Check for a specific "emergency" exit signal.
+	stratInstance := strategy.NewStrategy(state.logger)
+	exitSignal, shouldExit := stratInstance.GenerateExitSignal(ctx, *consolidatedData, *state.config)
+	if shouldExit && exitSignal.Direction == "sell" {
+		state.logger.LogWarn("!!! [SELL] signal for %s (Strategy Exit). Reason: %s. Placing market sell order.", pos.AssetPair, exitSignal.Reason)
+		orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
+		if err != nil {
+			state.logger.LogError("ManagePosition [%s]: Failed to place market sell order for strategy exit: %v", pos.AssetPair, err)
+		} else {
+			state.stateMutex.Lock()
+			state.pendingOrders[orderID] = pos.AssetPair
+			_ = state.cache.SavePendingOrder(orderID, pos.AssetPair)
+			state.stateMutex.Unlock()
+		}
+		return
+	}
+
+	// Standard Take-Profit and Trailing Stop logic.
 	if state.config.Trading.TrailingStopEnabled && pos.IsTrailingActive {
 		if currentPrice > pos.PeakPriceSinceTP {
 			pos.PeakPriceSinceTP = currentPrice
@@ -714,6 +769,7 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 		}
 	}
 
+	// Safety Order (DCA) logic.
 	if pos.IsDcaActive && pos.FilledSafetyOrders < state.config.Trading.MaxSafetyOrders {
 		var shouldPlaceSafetyOrder bool
 		var nextSafetyOrderPrice float64
@@ -781,25 +837,24 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 	}
 }
 
-func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair string, currentPortfolioValue float64) {
-	consolidatedData, err := gatherConsolidatedData(ctx, state, assetPair, currentPortfolioValue)
-	if err != nil {
-		state.logger.LogError("SeekEntry [%s]: Failed to gather data for signal generation: %v", assetPair, err)
-		return
-	}
-
-	stratInstance := strategy.NewStrategy(state.logger)
-	signals, _ := stratInstance.GenerateSignals(ctx, *consolidatedData, *state.config)
-
+func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair string, signals []strategy.StrategySignal, consolidatedData *strategy.ConsolidatedMarketPicture) {
 	for _, sig := range signals {
 		if sig.Direction == "buy" {
-			state.logger.LogInfo("+++ [BUY] signal for %s. Reason: %s. Placing order.", assetPair, sig.Reason)
+			state.logger.LogInfo("SeekEntry [%s]: BUY signal confirmed. Placing order.", assetPair)
+
+			// --- FIX: Corrected mainSignal to sig ---
 			orderPrice := sig.RecommendedPrice
 			orderSizeInBase := sig.CalculatedSize
+
 			if orderSizeInBase <= 0 {
 				state.logger.LogWarn("SeekEntry [%s]: Calculated size is zero. Falling back to fixed base order size from config.", assetPair)
 				orderSizeInBase = state.config.Trading.BaseOrderSize / orderPrice
 			}
+			if orderPrice <= 0 {
+				state.logger.LogError("SeekEntry [%s]: Invalid order price (<= 0). Aborting order.", assetPair)
+				continue
+			}
+
 			orderID, placeErr := state.broker.PlaceOrder(ctx, assetPair, "buy", "limit", orderSizeInBase, orderPrice, 0, "")
 			if placeErr != nil {
 				state.logger.LogError("SeekEntry [%s]: Place order failed: %v", assetPair, placeErr)
@@ -812,6 +867,8 @@ func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair st
 				}
 				state.stateMutex.Unlock()
 			}
+			// Once a buy order is placed for an asset, we stop checking for other signals for it in this cycle.
+			break
 		}
 	}
 }
