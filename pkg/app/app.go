@@ -1,7 +1,15 @@
 package app
 
 import (
+	"Snowballin/dataprovider"
+	cg "Snowballin/dataprovider/coingecko"
+	cmc "Snowballin/dataprovider/coinmarketcap"
+	"Snowballin/notification/discord"
+	"Snowballin/pkg/broker"
+	krakenBroker "Snowballin/pkg/broker/kraken"
 	"Snowballin/pkg/optimizer"
+	"Snowballin/strategy"
+	"Snowballin/utilities"
 	"context"
 	"errors"
 	"fmt"
@@ -10,15 +18,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"Snowballin/dataprovider"
-	cg "Snowballin/dataprovider/coingecko"
-	cmc "Snowballin/dataprovider/coinmarketcap"
-	"Snowballin/notification/discord"
-	"Snowballin/pkg/broker"
-	krakenBroker "Snowballin/pkg/broker/kraken"
-	"Snowballin/strategy"
-	"Snowballin/utilities"
 )
 
 type TradingState struct {
@@ -216,17 +215,47 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 	}
 	logger.LogInfo("AppRun: Loaded %d open position(s) and %d pending order(s) from database.", len(loadedPositions), len(loadedPendingOrders))
 
+	// --- [MODIFICATION] Self-healing logic added to the startup sequence. ---
+	logger.LogInfo("Reconciliation: Verifying consistency between database state and exchange balances...")
+	tempStateForRecon := &TradingState{broker: krakenAdapter, logger: logger, config: cfg}
+
+	for _, pair := range cfg.Trading.AssetPairs {
+		baseAsset := strings.Split(pair, "/")[0]
+		_, hasPositionInDB := loadedPositions[pair]
+
+		balanceInfo, err := krakenAdapter.GetBalance(ctx, baseAsset)
+		if err != nil {
+			logger.LogDebug("Reconciliation: Could not get balance for %s, likely not held. Skipping.", baseAsset)
+			continue
+		}
+
+		if balanceInfo.Total > 0.00001 && !hasPositionInDB {
+			reconstructedPos, reconErr := ReconstructOrphanedPosition(ctx, tempStateForRecon, pair)
+			if reconErr != nil {
+				logger.LogFatal("ORPHANED POSITION DETECTED for %s, but reconstruction failed: %v. Manual intervention required.", pair, reconErr)
+			}
+
+			if err := sqliteCache.SavePosition(reconstructedPos); err != nil {
+				logger.LogFatal("Failed to save reconstructed position for %s to database: %v. Halting.", pair, err)
+			}
+			loadedPositions[pair] = reconstructedPos
+		}
+	}
+	logger.LogInfo("Reconciliation: State verification complete.")
+	// --- End of modification ---
+
 	state := &TradingState{
-		broker:             krakenAdapter,
-		logger:             logger,
-		config:             cfg,
-		discordClient:      discordClient,
-		cache:              sqliteCache,
-		activeDPs:          activeDPs,
-		providerNames:      providerNames,
-		peakPortfolioValue: initialPortfolioValue,
-		openPositions:      loadedPositions,
-		pendingOrders:      loadedPendingOrders,
+		broker:                  krakenAdapter,
+		logger:                  logger,
+		config:                  cfg,
+		discordClient:           discordClient,
+		cache:                   sqliteCache,
+		activeDPs:               activeDPs,
+		providerNames:           providerNames,
+		peakPortfolioValue:      initialPortfolioValue,
+		openPositions:           loadedPositions,
+		pendingOrders:           loadedPendingOrders,
+		isCircuitBreakerTripped: false,
 	}
 
 	loopInterval := time.Duration(cfg.Orders.WatcherIntervalSec) * time.Second
@@ -242,6 +271,69 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 			processTradingCycle(ctx, state)
 		}
 	}
+}
+
+// --- [NEW] This function reconstructs an orphaned position by analyzing the exchange's trade history. ---
+func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, assetPair string) (*utilities.Position, error) {
+	state.logger.LogWarn("Reconstruction: Attempting to reconstruct orphaned position for %s from trade history.", assetPair)
+
+	ninetyDaysAgo := time.Now().Add(-90 * 24 * time.Hour)
+	tradeHistory, err := state.broker.GetTrades(ctx, assetPair, ninetyDaysAgo)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get trade history for %s: %w", assetPair, err)
+	}
+
+	if len(tradeHistory) == 0 {
+		return nil, errors.New("no trade history found for this asset, cannot reconstruct")
+	}
+
+	var positionTrades []broker.Trade
+	lastSellIndex := -1
+	for i := len(tradeHistory) - 1; i >= 0; i-- {
+		if tradeHistory[i].Side == "sell" {
+			lastSellIndex = i
+			break
+		}
+	}
+	positionTrades = tradeHistory[lastSellIndex+1:]
+
+	if len(positionTrades) == 0 {
+		return nil, fmt.Errorf("found trade history for %s, but could not isolate a sequence of buys for the current position", assetPair)
+	}
+
+	var totalCost, totalVolume float64
+	baseOrderTrade := positionTrades[0]
+
+	for _, trade := range positionTrades {
+		if trade.Side == "buy" {
+			totalCost += trade.Cost
+			totalVolume += trade.Volume
+		}
+	}
+
+	if totalVolume == 0 {
+		return nil, errors.New("isolated trades have zero total volume, cannot reconstruct")
+	}
+
+	filledSafetyOrders := len(positionTrades) - 1
+
+	reconstructedPosition := &utilities.Position{
+		AssetPair:          assetPair,
+		EntryTimestamp:     baseOrderTrade.Timestamp,
+		AveragePrice:       totalCost / totalVolume,
+		TotalVolume:        totalVolume,
+		BaseOrderPrice:     baseOrderTrade.Price,
+		BaseOrderSize:      baseOrderTrade.Cost,
+		FilledSafetyOrders: filledSafetyOrders,
+		IsDcaActive:        true,
+		BrokerOrderID:      baseOrderTrade.OrderID,
+	}
+	reconstructedPosition.CurrentTakeProfit = reconstructedPosition.AveragePrice * (1 + state.config.Trading.TakeProfitPercentage)
+
+	state.logger.LogInfo("Reconstruction SUCCESS for %s. Avg Price: %.2f, Volume: %.4f, SOs Filled: %d",
+		assetPair, reconstructedPosition.AveragePrice, reconstructedPosition.TotalVolume, reconstructedPosition.FilledSafetyOrders)
+
+	return reconstructedPosition, nil
 }
 
 func processTradingCycle(ctx context.Context, state *TradingState) {
@@ -447,12 +539,10 @@ func processPendingOrders(ctx context.Context, state *TradingState) {
 	}
 }
 
-// updatePositionFromFill processes a buy or sell order fill.
-// [FIX] It now accepts assetPair as a parameter to resolve the "declared and not used" error.
 func updatePositionFromFill(state *TradingState, order broker.Order, assetPair string) {
 	if strings.EqualFold(order.Side, "buy") {
 		position, hasPosition := state.openPositions[assetPair]
-		if !hasPosition { // BASE order fill
+		if !hasPosition {
 			baseOrderSizeInQuote := order.Price * order.ExecutedVol
 			newPosition := &utilities.Position{
 				AssetPair:          assetPair,
@@ -471,7 +561,7 @@ func updatePositionFromFill(state *TradingState, order broker.Order, assetPair s
 			if err := state.cache.SavePosition(newPosition); err != nil {
 				state.logger.LogError("PendingOrders: Failed to save new position to DB for %s: %v", assetPair, err)
 			}
-		} else { // SAFETY order fill
+		} else {
 			oldVolume := position.TotalVolume
 			oldAvgPrice := position.AveragePrice
 			newVolume := order.ExecutedVol
@@ -487,15 +577,15 @@ func updatePositionFromFill(state *TradingState, order broker.Order, assetPair s
 				state.logger.LogError("PendingOrders: Failed to update position in DB for %s: %v", assetPair, err)
 			}
 		}
-	} else { // A "sell" order was filled.
+	} else {
 		if pos, ok := state.openPositions[assetPair]; ok {
-			if math.Abs(pos.TotalVolume-order.ExecutedVol) < 1e-9 { // Closed entire position
+			if math.Abs(pos.TotalVolume-order.ExecutedVol) < 1e-9 {
 				profit := (order.Price - pos.AveragePrice) * pos.TotalVolume
 				profitPercent := ((order.Price - pos.AveragePrice) / pos.AveragePrice) * 100
 				state.discordClient.NotifyOrderFilled(order, fmt.Sprintf("💰 Position Closed\nProfit: %.2f %s (%.2f%%)", profit, state.config.Trading.QuoteCurrency, profitPercent))
 				delete(state.openPositions, assetPair)
 				_ = state.cache.DeletePosition(assetPair)
-			} else { // Partial sell (from hybrid TP)
+			} else {
 				profit := (order.Price - pos.AveragePrice) * order.ExecutedVol
 				pos.TotalVolume -= order.ExecutedVol
 				state.discordClient.NotifyOrderFilled(order, fmt.Sprintf("💰 Partial Take-Profit Hit\nSold %.4f %s for a profit of %.2f %s. Trailing stop is now active on the remainder.", order.ExecutedVol, strings.Split(pos.AssetPair, "/")[0], profit, state.config.Trading.QuoteCurrency))
@@ -524,11 +614,7 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 		stratInstance := strategy.NewStrategy(state.logger)
 		exitSignal, shouldExit := stratInstance.GenerateExitSignal(ctx, *consolidatedData, *state.config)
 		if shouldExit && exitSignal.Direction == "sell" {
-			state.logger.LogWarn("ManagePosition: %s -> %s (Strategy Exit) - Reason: %s. Placing market sell order.",
-				utilities.ColorYellow+pos.AssetPair+utilities.ColorReset,
-				utilities.ColorRed+"SELL"+utilities.ColorReset,
-				exitSignal.Reason,
-			)
+			state.logger.LogWarn("!!! [SELL] signal for %s (Strategy Exit). Reason: %s. Placing market sell order.", pos.AssetPair, exitSignal.Reason)
 			orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
 			if err != nil {
 				state.logger.LogError("ManagePosition [%s]: Failed to place market sell order for strategy exit: %v", pos.AssetPair, err)
@@ -681,11 +767,7 @@ func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair st
 
 	for _, sig := range signals {
 		if sig.Direction == "buy" {
-			state.logger.LogInfo("SeekEntry: %s -> %s - Reason: %s. Placing order.",
-				utilities.ColorYellow+assetPair+utilities.ColorReset,
-				utilities.ColorCyan+"BUY"+utilities.ColorReset,
-				sig.Reason,
-			)
+			state.logger.LogInfo("+++ [BUY] signal for %s. Reason: %s. Placing order.", assetPair, sig.Reason)
 			orderPrice := sig.RecommendedPrice
 			orderSizeInBase := sig.CalculatedSize
 			if orderSizeInBase <= 0 {

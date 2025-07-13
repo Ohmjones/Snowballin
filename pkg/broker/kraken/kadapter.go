@@ -5,7 +5,7 @@ import (
 	"Snowballin/dataprovider"
 	"context"
 	"errors"
-	"fmt" // Added
+	"fmt"
 	"net/http"
 	"net/url"
 	"sort"
@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"Snowballin/pkg/broker"
-	"Snowballin/utilities" // For logger and AppConfig
+	"Snowballin/utilities"
 )
 
 type Adapter struct {
@@ -24,7 +24,7 @@ type Adapter struct {
 	cache     *dataprovider.SQLiteCache
 }
 
-func NewAdapter(appCfg *utilities.KrakenConfig, HTTPClient *http.Client, logger *utilities.Logger, cache *dataprovider.SQLiteCache) (*Adapter, error) { // <-- ADD cache PARAMETER
+func NewAdapter(appCfg *utilities.KrakenConfig, HTTPClient *http.Client, logger *utilities.Logger, cache *dataprovider.SQLiteCache) (*Adapter, error) {
 	if appCfg == nil {
 		return nil, errors.New("kraken adapter: AppConfig cannot be nil")
 	}
@@ -43,14 +43,13 @@ func NewAdapter(appCfg *utilities.KrakenConfig, HTTPClient *http.Client, logger 
 		client:    krakenClient,
 		logger:    logger,
 		appConfig: appCfg,
-		cache:     cache, // <-- ADD THIS LINE
+		cache:     cache,
 	}
 
 	logger.LogInfo("Kraken Adapter initialized successfully.")
 	return adapter, nil
 }
 
-// GetInternalClient exposes the underlying Kraken client.
 func (a *Adapter) GetInternalClient() (*Client, bool) {
 	if a.client != nil {
 		return a.client, true
@@ -58,22 +57,14 @@ func (a *Adapter) GetInternalClient() (*Client, bool) {
 	return nil, false
 }
 
-// RefreshAssetInfo ensures that the adapter's underlying client has the latest asset and pair information.
 func (a *Adapter) RefreshAssetInfo(ctx context.Context) error {
 	a.logger.LogInfo("Adapter: Refreshing Kraken asset information...")
-
-	// First, refresh the assets to get the name mapping (e.g., XXBT -> XBT).
-	// This is critical and must happen before refreshing pairs.
 	if err := a.client.RefreshAssets(ctx); err != nil {
 		return fmt.Errorf("adapter failed to refresh Kraken assets: %w", err)
 	}
-
-	// THEN, refresh the pairs. This function uses the asset map we just fetched
-	// to build the translation layer correctly.
 	if err := a.client.RefreshAssetPairs(ctx); err != nil {
 		return fmt.Errorf("adapter failed to refresh Kraken asset pairs: %w", err)
 	}
-
 	a.logger.LogInfo("Adapter: Kraken asset information refreshed.")
 	return nil
 }
@@ -108,7 +99,6 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 
 	for originalKey, balanceStr := range balances {
 		balance, err := strconv.ParseFloat(balanceStr, 64)
-		// This check correctly ignores assets with a zero balance, like your "XETH" entry.
 		if err != nil || balance == 0 {
 			continue
 		}
@@ -118,8 +108,6 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 			krakenAssetName = strings.TrimSuffix(originalKey, ".F")
 		}
 
-		// When the loop processes your "ETH.F" balance, this logic correctly
-		// translates the resulting "ETH" key to "XETH" for the price lookup.
 		if krakenAssetName == "ETH" {
 			krakenAssetName = "XETH"
 		}
@@ -161,7 +149,6 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 			a.logger.LogWarn("GetAccountValue: Could not find direct trading pair for %s. Attempting triangulation via %s.", commonPairToFetch, pivotAsset)
 		}
 
-		// Triangulation fallback
 		triangPair := commonName + "/" + pivotAsset
 		triangKrakenPair, triangErr := a.client.GetKrakenPairName(ctx, triangPair)
 		if triangErr != nil {
@@ -199,7 +186,7 @@ func (a *Adapter) GetOrderBook(ctx context.Context, commonPair string, depth int
 		return broker.OrderBookData{}, fmt.Errorf("GetOrderBook: failed to get Kraken pair name for %s: %w", commonPair, err)
 	}
 
-	rawOrderBook, err := a.client.GetOrderBookAPI(ctx, krakenPair, depth) // New method in client
+	rawOrderBook, err := a.client.GetOrderBookAPI(ctx, krakenPair, depth)
 	if err != nil {
 		return broker.OrderBookData{}, err
 	}
@@ -225,36 +212,28 @@ func (a *Adapter) GetOrderBook(ctx context.Context, commonPair string, depth int
 	}
 
 	return broker.OrderBookData{
-		Pair:      commonPair, // Return common pair name
+		Pair:      commonPair,
 		Bids:      bids,
 		Asks:      asks,
-		Timestamp: time.Now().UTC(), // Timestamp of when this conversion happened
+		Timestamp: time.Now().UTC(),
 	}, nil
 }
 
 func (a *Adapter) GetLastNOHLCVBars(ctx context.Context, pair string, intervalMinutes string, nBars int) ([]utilities.OHLCVBar, error) {
-	// For caching, we define a provider name and a unique ID for the data.
-	// The pair and interval make a good unique ID for Kraken's data.
 	cacheProvider := "kraken"
 	cacheCoinID := fmt.Sprintf("%s-%s", pair, intervalMinutes)
-
-	// Define lookback period for cache retrieval
 	intervalDuration, _ := time.ParseDuration(fmt.Sprintf("%sm", intervalMinutes))
 	lookbackDuration := time.Duration(nBars) * intervalDuration
 	startTime := time.Now().Add(-lookbackDuration)
-
-	// 1. Try to fetch from cache
 	cachedBars, err := a.cache.GetBars(cacheProvider, cacheCoinID, startTime.UnixMilli(), time.Now().UnixMilli())
 	if err != nil {
 		a.logger.LogWarn("kadapter GetLastNOHLCVBars [%s]: Failed to get bars from cache: %v", pair, err)
 	}
-	// Use cache if we have enough recent data
 	if len(cachedBars) >= nBars {
 		a.logger.LogInfo("kadapter GetLastNOHLCVBars [%s]: Using %d bars from cache.", pair, len(cachedBars))
 		return cachedBars, nil
 	}
 
-	// 2. If cache miss or insufficient, fetch from API
 	a.logger.LogInfo("kadapter GetLastNOHLCVBars [%s]: Cache miss or insufficient data. Fetching from API.", pair)
 	krakenPair, err := a.client.GetKrakenPairName(ctx, pair)
 	if err != nil {
@@ -281,12 +260,10 @@ func (a *Adapter) GetLastNOHLCVBars(ctx context.Context, pair string, intervalMi
 			continue
 		}
 		bar := utilities.OHLCVBar{
-			Timestamp: int64(ts) * 1000, // Kraken uses seconds, convert to milliseconds for consistency
+			Timestamp: int64(ts) * 1000,
 			Open:      open, High: high, Low: low, Close: closeVal, Volume: volume,
 		}
 		ohlcvBars = append(ohlcvBars, bar)
-
-		// 3. Save the newly fetched bar to the cache
 		if err := a.cache.SaveBar(cacheProvider, cacheCoinID, bar); err != nil {
 			a.logger.LogWarn("kadapter GetLastNOHLCVBars [%s]: Failed to save bar to cache: %v", pair, err)
 		}
@@ -303,7 +280,6 @@ func (a *Adapter) GetLastNOHLCVBars(ctx context.Context, pair string, intervalMi
 	return ohlcvBars, nil
 }
 
-// CalculateMarketCap computes the market cap using Kraken price and external circulating supply.
 func (ka *Adapter) CalculateMarketCap(ctx context.Context, pair string, circulatingSupply float64) (float64, error) {
 	ticker, err := ka.client.GetTickerAPI(ctx, pair)
 	if err != nil {
@@ -321,9 +297,6 @@ func (ka *Adapter) CalculateMarketCap(ctx context.Context, pair string, circulat
 	ka.logger.LogDebug("CalculateMarketCap: Kraken market cap for %s calculated as %f", pair, marketCap)
 	return marketCap, nil
 }
-
-// Ensure other methods from broker.Broker interface are implemented
-// PlaceOrder, CancelOrder, GetOrderStatus, GetBalance, GetTicker, GetTrades are already in your kadapter.go
 
 func (a *Adapter) PlaceOrder(ctx context.Context, assetPair, side, orderType string, volume, price, stopPrice float64, clientOrderID string) (string, error) {
 	krakenPair, err := a.client.GetKrakenPairName(ctx, assetPair)
@@ -375,14 +348,10 @@ func (a *Adapter) GetOrderStatus(ctx context.Context, orderID string) (broker.Or
 
 	krakenOrder, ok := ordersInfo[orderID]
 	if !ok {
-		// To prevent spamming logs for open orders that haven't been filled yet,
-		// we check if the order might still be open before returning a hard error.
-		// A more robust check might query OpenOrders endpoint, but this is a good heuristic.
 		a.logger.LogDebug("GetOrderStatus: order %s not found in closed/cancelled query. It may still be open.", orderID)
 		return broker.Order{}, fmt.Errorf("GetOrderStatus: order %s not found in trade history query", orderID)
 	}
 
-	// --- FIX: Parse all relevant fields from the Kraken response ---
 	price, _ := strconv.ParseFloat(krakenOrder.Price, 64)
 	volume, _ := strconv.ParseFloat(krakenOrder.Volume, 64)
 	filledVolume, _ := strconv.ParseFloat(krakenOrder.VolExec, 64)
@@ -397,7 +366,6 @@ func (a *Adapter) GetOrderStatus(ctx context.Context, orderID string) (broker.Or
 	openTime := time.Unix(int64(krakenOrder.Opentm), 0)
 	closeTime := time.Unix(int64(krakenOrder.Closetm), 0)
 
-	// Map the Kraken-specific data to the generic broker.Order struct
 	return broker.Order{
 		ID:            orderID,
 		Pair:          krakenOrder.Descr.Pair,
@@ -411,7 +379,7 @@ func (a *Adapter) GetOrderStatus(ctx context.Context, orderID string) (broker.Or
 		Cost:          cost,
 		Fee:           fee,
 		CreatedAt:     openTime,
-		TimePlaced:    openTime, // Redundant, but ensures compatibility
+		TimePlaced:    openTime,
 		UpdatedAt:     closeTime,
 		TimeCompleted: closeTime,
 		Reason:        krakenOrder.Reason,
@@ -423,14 +391,24 @@ func (a *Adapter) GetBalance(ctx context.Context, currency string) (broker.Balan
 	if err != nil {
 		return broker.Balance{}, err
 	}
-	balanceStr, exists := balances[currency]
-	if !exists {
-		return broker.Balance{}, errors.New("GetBalance: currency not found")
+
+	// [FIX] Translate the common currency name (e.g., "BTC") to the Kraken internal name (e.g., "XXBT")
+	krakenAssetName, err := a.client.GetKrakenAssetName(ctx, currency)
+	if err != nil {
+		return broker.Balance{}, fmt.Errorf("GetBalance: could not get Kraken asset name for %s: %w", currency, err)
 	}
+
+	balanceStr, exists := balances[krakenAssetName]
+	if !exists {
+		// It's possible to have a 0 balance and not have the key, so we return 0 instead of an error.
+		return broker.Balance{Currency: currency, Total: 0, Available: 0}, nil
+	}
+
 	bal, err := strconv.ParseFloat(balanceStr, 64)
 	if err != nil {
-		return broker.Balance{}, err
+		return broker.Balance{}, fmt.Errorf("GetBalance: could not parse balance for %s: %w", currency, err)
 	}
+
 	return broker.Balance{
 		Currency:  currency,
 		Total:     bal,
@@ -453,15 +431,15 @@ func (a *Adapter) GetTicker(ctx context.Context, pair string) (broker.TickerData
 	if err != nil {
 		return broker.TickerData{}, err
 	}
-	highPrice, err := strconv.ParseFloat(tickerInfo.High[1], 64) // 24-hour high
+	highPrice, err := strconv.ParseFloat(tickerInfo.High[1], 64)
 	if err != nil {
 		return broker.TickerData{}, err
 	}
-	lowPrice, err := strconv.ParseFloat(tickerInfo.Low[1], 64) // 24-hour low
+	lowPrice, err := strconv.ParseFloat(tickerInfo.Low[1], 64)
 	if err != nil {
 		return broker.TickerData{}, err
 	}
-	volume, err := strconv.ParseFloat(tickerInfo.Volume[1], 64) // 24-hour volume
+	volume, err := strconv.ParseFloat(tickerInfo.Volume[1], 64)
 	if err != nil {
 		return broker.TickerData{}, err
 	}
@@ -481,6 +459,13 @@ func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) (
 	if !since.IsZero() {
 		params.Set("start", strconv.FormatInt(since.Unix(), 10))
 	}
+	if pair != "" {
+		krakenPair, err := a.client.GetKrakenPairName(ctx, pair)
+		if err != nil {
+			return nil, fmt.Errorf("GetTrades: could not resolve pair name %s: %w", pair, err)
+		}
+		params.Set("pair", krakenPair)
+	}
 
 	tradesMap, _, err := a.client.QueryTradesAPI(ctx, params)
 	if err != nil {
@@ -489,37 +474,47 @@ func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) (
 
 	var trades []broker.Trade
 	for tradeID, trade := range tradesMap {
-		if pair == "" || strings.EqualFold(trade.Pair, pair) {
-			price, err := strconv.ParseFloat(trade.Price, 64)
-			if err != nil {
-				return nil, err
-			}
-			volume, err := strconv.ParseFloat(trade.Vol, 64)
-			if err != nil {
-				return nil, err
-			}
-			fee, err := strconv.ParseFloat(trade.Fee, 64)
-			if err != nil {
-				return nil, err
-			}
-			cost, err := strconv.ParseFloat(trade.Cost, 64)
-			if err != nil {
-				return nil, err
-			}
-
-			trades = append(trades, broker.Trade{
-				ID:          tradeID,
-				OrderID:     trade.Ordtxid,
-				Pair:        trade.Pair,
-				Side:        trade.Type,
-				Price:       price,
-				Volume:      volume,
-				Cost:        cost,
-				Fee:         fee,
-				FeeCurrency: strings.Split(trade.Pair, "/")[1], // Usually the quote currency
-				Timestamp:   time.Unix(int64(trade.Time), 0),
-			})
+		price, err := strconv.ParseFloat(trade.Price, 64)
+		if err != nil {
+			return nil, err
 		}
+		volume, err := strconv.ParseFloat(trade.Vol, 64)
+		if err != nil {
+			return nil, err
+		}
+		fee, err := strconv.ParseFloat(trade.Fee, 64)
+		if err != nil {
+			return nil, err
+		}
+		cost, err := strconv.ParseFloat(trade.Cost, 64)
+		if err != nil {
+			return nil, err
+		}
+
+		// [FIX] Use the new GetCommonPairName function to correctly translate the pair name
+		commonPair, commonPairErr := a.client.GetCommonPairName(ctx, trade.Pair)
+		if commonPairErr != nil {
+			a.logger.LogWarn("GetTrades: could not get common pair name for %s, using original.", trade.Pair)
+			commonPair = trade.Pair
+		}
+
+		trades = append(trades, broker.Trade{
+			ID:          tradeID,
+			OrderID:     trade.Ordtxid,
+			Pair:        commonPair,
+			Side:        trade.Type,
+			Price:       price,
+			Volume:      volume,
+			Cost:        cost,
+			Fee:         fee,
+			FeeCurrency: strings.Split(commonPair, "/")[1],
+			Timestamp:   time.Unix(int64(trade.Time), 0),
+		})
 	}
+
+	// The API returns trades most recent first, we sort them oldest first for processing.
+	sort.Slice(trades, func(i, j int) bool {
+		return trades[i].Timestamp.Before(trades[j].Timestamp)
+	})
 	return trades, nil
 }
