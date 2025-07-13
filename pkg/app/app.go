@@ -15,8 +15,6 @@ import (
 	"fmt"
 	"math"
 	"net/http"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -99,13 +97,6 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 	defer discordClient.SendMessage("🛑 **Snowballin' Bot Shutting Down**")
 
 	logger.LogInfo("AppRun: Starting pre-flight checks...")
-
-	// --- FIX: Corrected cfg.DB.Path to cfg.DB.DBPath ---
-	logger.LogInfo("Pre-Flight: Ensuring database directory exists at: %s", cfg.DB.DBPath)
-	dbDir := filepath.Dir(cfg.DB.DBPath)
-	if err := os.MkdirAll(dbDir, 0755); err != nil {
-		return fmt.Errorf("pre-flight check failed: could not create database directory %s: %w", dbDir, err)
-	}
 
 	sqliteCache, err := dataprovider.NewSQLiteCache(cfg.DB)
 	if err != nil {
@@ -225,32 +216,51 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 	}
 	logger.LogInfo("AppRun: Loaded %d open position(s) and %d pending order(s) from database.", len(loadedPositions), len(loadedPendingOrders))
 
+	// --- [THE FIX] This entire reconciliation block is rewritten for robustness. ---
 	logger.LogInfo("Reconciliation: Verifying consistency between database state and exchange balances...")
 	tempStateForRecon := &TradingState{broker: krakenAdapter, logger: logger, config: cfg}
 
-	for _, pair := range cfg.Trading.AssetPairs {
-		baseAsset := strings.Split(pair, "/")[0]
-		_, hasPositionInDB := loadedPositions[pair]
+	// 1. Get ALL balances from the exchange.
+	allBalances, err := krakenAdapter.GetAllBalances(ctx)
+	if err != nil {
+		return fmt.Errorf("reconciliation failed: could not get all balances from broker: %w", err)
+	}
 
-		balanceInfo, err := krakenAdapter.GetBalance(ctx, baseAsset)
-		if err != nil {
-			logger.LogError("Reconciliation: Could not get balance for %s, this should not happen. Error: %v", baseAsset, err)
+	// Create a quick lookup map of configured pairs.
+	configuredPairs := make(map[string]bool)
+	for _, p := range cfg.Trading.AssetPairs {
+		configuredPairs[p] = true
+	}
+
+	// 2. Iterate over the REAL balances from the exchange.
+	for _, balance := range allBalances {
+		if balance.Total < 1e-8 { // Skip zero or dust balances
 			continue
 		}
 
-		if balanceInfo.Total > 0.00000001 && !hasPositionInDB {
-			reconstructedPos, reconErr := ReconstructOrphanedPosition(ctx, tempStateForRecon, pair, balanceInfo.Total)
+		// 3. Construct the pair name (e.g., "ETH/USD") and check if we are configured to trade it.
+		assetPair := fmt.Sprintf("%s/%s", balance.Currency, cfg.Trading.QuoteCurrency)
+		if !configuredPairs[assetPair] {
+			logger.LogDebug("Reconciliation: Skipping balance for %s as it is not a configured trading pair.", balance.Currency)
+			continue
+		}
+
+		// 4. If we have a balance for a configured pair but no position in our DB, reconstruct it.
+		_, hasPositionInDB := loadedPositions[assetPair]
+		if !hasPositionInDB {
+			reconstructedPos, reconErr := ReconstructOrphanedPosition(ctx, tempStateForRecon, assetPair, balance.Total)
 			if reconErr != nil {
-				logger.LogFatal("ORPHANED POSITION DETECTED for %s, but reconstruction failed: %v. Manual intervention required.", pair, reconErr)
+				logger.LogFatal("ORPHANED POSITION DETECTED for %s, but reconstruction failed: %v. Manual intervention required.", assetPair, reconErr)
 			}
 
 			if err := sqliteCache.SavePosition(reconstructedPos); err != nil {
-				logger.LogFatal("Failed to save reconstructed position for %s to database: %v. Halting.", pair, err)
+				logger.LogFatal("Failed to save reconstructed position for %s to database: %v. Halting.", assetPair, err)
 			}
-			loadedPositions[pair] = reconstructedPos
+			loadedPositions[assetPair] = reconstructedPos
 		}
 	}
 	logger.LogInfo("Reconciliation: State verification complete.")
+	// --- End of Fix ---
 
 	state := &TradingState{
 		broker:                  krakenAdapter,

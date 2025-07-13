@@ -1,4 +1,3 @@
-// File: pkg/broker/kraken/kadapter.go
 package kraken
 
 import (
@@ -62,8 +61,38 @@ func (a *Adapter) RefreshAssetInfo(ctx context.Context) error {
 	return nil
 }
 
-// --- [MODIFICATION] This function is now more robust. It iterates through all returned balances
-// to find the correct one instead of guessing the key. This is the fix for the ETH/SOL reconstruction issue.
+// --- [THE FIX] This new function gets all balances and is used by the new reconciliation logic. ---
+func (a *Adapter) GetAllBalances(ctx context.Context) ([]broker.Balance, error) {
+	balances, err := a.client.GetBalancesAPI(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("GetAllBalances: failed to get balances from API: %w", err)
+	}
+
+	var allBalances []broker.Balance
+	for krakenName, balanceStr := range balances {
+		commonName, err := a.client.GetCommonAssetName(ctx, krakenName)
+		if err != nil {
+			a.logger.LogDebug("GetAllBalances: could not get common name for Kraken asset '%s', skipping. Error: %v", krakenName, err)
+			continue
+		}
+
+		bal, parseErr := strconv.ParseFloat(balanceStr, 64)
+		if parseErr != nil {
+			a.logger.LogWarn("GetAllBalances: could not parse balance string '%s' for %s, skipping: %v", balanceStr, commonName, parseErr)
+			continue
+		}
+
+		if bal > 0 {
+			allBalances = append(allBalances, broker.Balance{
+				Currency:  commonName,
+				Total:     bal,
+				Available: bal,
+			})
+		}
+	}
+	return allBalances, nil
+}
+
 func (a *Adapter) GetBalance(ctx context.Context, currency string) (broker.Balance, error) {
 	balances, err := a.client.GetBalancesAPI(ctx)
 	if err != nil {
@@ -72,31 +101,26 @@ func (a *Adapter) GetBalance(ctx context.Context, currency string) (broker.Balan
 
 	upperCurrency := strings.ToUpper(currency)
 
-	// Iterate through all balances returned by the API to find the one we need.
 	for krakenName, balanceStr := range balances {
-		// Translate the Kraken asset name (e.g., "XETH") back to its common name (e.g., "ETH").
 		commonName, err := a.client.GetCommonAssetName(ctx, krakenName)
 		if err != nil {
 			a.logger.LogDebug("GetBalance: could not get common name for Kraken asset '%s', skipping. Error: %v", krakenName, err)
 			continue
 		}
 
-		// If the translated common name matches the currency we're looking for...
 		if strings.EqualFold(commonName, upperCurrency) {
 			bal, parseErr := strconv.ParseFloat(balanceStr, 64)
 			if parseErr != nil {
 				return broker.Balance{}, fmt.Errorf("GetBalance: could not parse balance string '%s' for %s: %w", balanceStr, currency, parseErr)
 			}
-			// Found it. Return the correct balance.
 			return broker.Balance{
 				Currency:  currency,
 				Total:     bal,
-				Available: bal, // Assuming total is available for simplicity
+				Available: bal,
 			}, nil
 		}
 	}
 
-	// If we looped through all balances and didn't find a match, it means the balance is zero.
 	a.logger.LogDebug("GetBalance: No balance found for currency '%s' after checking all returned assets.", currency)
 	return broker.Balance{Currency: currency, Total: 0, Available: 0}, nil
 }
