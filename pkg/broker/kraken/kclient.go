@@ -45,11 +45,13 @@ type Client struct {
 	krakenToCommonPair    map[string]string
 }
 
+// getCommonAssetName is a helper that extracts the common ticker from an AssetInfo struct.
 func getCommonAssetName(info AssetInfo) string {
 	altname := info.Altname
 	if altname == "XBT" {
 		return "BTC"
 	}
+	// This correctly handles cases like "ETH2.S" -> "ETH2" from the public/Assets endpoint.
 	return strings.Split(altname, ".")[0]
 }
 
@@ -381,24 +383,55 @@ func (c *Client) GetCommonPairName(ctx context.Context, krakenPair string) (stri
 	return commonPair, nil
 }
 
+// --- [THE FIX] This function now correctly handles all Kraken asset name variations. ---
 func (c *Client) GetCommonAssetName(ctx context.Context, krakenAssetName string) (string, error) {
-	c.dataMu.RLock()
-	assetInfo, ok := c.assetInfoMap[krakenAssetName]
-	c.dataMu.RUnlock()
+	// First, sanitize the input string by removing any suffixes like .F or .S
+	sanitizedName := strings.Split(krakenAssetName, ".")[0]
 
+	c.dataMu.RLock()
+	// Check if the sanitized name is a primary asset key (e.g., "XETH", "SOL").
+	assetInfo, ok := c.assetInfoMap[sanitizedName]
 	if !ok {
-		c.logger.LogWarn("Common name for Kraken asset '%s' not found, refreshing...", krakenAssetName)
-		if err := c.RefreshAssets(ctx); err != nil {
-			return "", fmt.Errorf("failed to refresh assets while getting common name for %s: %w", krakenAssetName, err)
+		// If not found, it might be an altname (e.g., "ETH"). Iterate to find it.
+		var found bool
+		for _, info := range c.assetInfoMap {
+			if info.Altname == sanitizedName {
+				assetInfo = info
+				found = true
+				break
+			}
 		}
-		c.dataMu.RLock()
-		assetInfo, ok = c.assetInfoMap[krakenAssetName]
-		c.dataMu.RUnlock()
-		if !ok {
-			return "", fmt.Errorf("common asset name for Kraken asset %s not found even after refresh", krakenAssetName)
+		// If still not found after checking primary keys and altnames, it's an unknown asset.
+		if !found {
+			c.dataMu.RUnlock() // Unlock before logging and potentially refreshing
+			c.logger.LogWarn("Common name for Kraken asset '%s' (sanitized to '%s') not found, refreshing...", krakenAssetName, sanitizedName)
+			if err := c.RefreshAssets(ctx); err != nil {
+				return "", fmt.Errorf("failed to refresh assets while getting common name for %s: %w", krakenAssetName, err)
+			}
+			// After refresh, re-lock and try one last time.
+			c.dataMu.RLock()
+			var refreshedFound bool
+			// Re-check the primary keys first
+			assetInfo, refreshedFound = c.assetInfoMap[sanitizedName]
+			if !refreshedFound {
+				// Re-check the altnames
+				for _, info := range c.assetInfoMap {
+					if info.Altname == sanitizedName {
+						assetInfo = info
+						refreshedFound = true
+						break
+					}
+				}
+			}
+			if !refreshedFound {
+				c.dataMu.RUnlock()
+				return "", fmt.Errorf("common asset name for Kraken asset %s not found even after refresh", krakenAssetName)
+			}
 		}
 	}
+	c.dataMu.RUnlock()
 
+	// Use the helper on the now-found AssetInfo struct to get the final, clean common name.
 	return getCommonAssetName(assetInfo), nil
 }
 
