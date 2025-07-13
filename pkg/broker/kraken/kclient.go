@@ -82,28 +82,26 @@ func (c *Client) GetAssetPairAPIInfo(ctx context.Context, krakenPairName string)
 
 func (c *Client) GetCommonAssetName(ctx context.Context, krakenAssetName string) (string, error) {
 	c.dataMu.RLock()
+	// Directly look up the asset by the provided name (e.g., "ETH").
+	// The new RefreshAssets function ensures this map contains all aliases.
 	assetInfo, ok := c.assetInfoMap[krakenAssetName]
 	c.dataMu.RUnlock()
 
-	if ok && assetInfo.Altname != "" {
-		if assetInfo.Altname == "XBT" {
-			return "BTC", nil
+	if !ok {
+		c.logger.LogWarn("Common name for Kraken asset '%s' not found, refreshing...", krakenAssetName)
+		if err := c.RefreshAssets(ctx); err != nil {
+			return "", fmt.Errorf("failed to refresh assets while getting common name for %s: %w", krakenAssetName, err)
 		}
-		return assetInfo.Altname, nil
+		c.dataMu.RLock()
+		assetInfo, ok = c.assetInfoMap[krakenAssetName]
+		c.dataMu.RUnlock()
+		if !ok {
+			return "", fmt.Errorf("common asset name for Kraken asset %s not found even after refresh", krakenAssetName)
+		}
 	}
-	if err := c.RefreshAssets(ctx); err != nil {
-		return "", fmt.Errorf("failed to refresh assets while getting common name for %s: %w", krakenAssetName, err)
-	}
-	c.dataMu.RLock()
-	assetInfo, ok = c.assetInfoMap[krakenAssetName]
-	c.dataMu.RUnlock()
-	if !ok || assetInfo.Altname == "" {
-		return "", fmt.Errorf("common asset name for Kraken asset %s not found after refresh", krakenAssetName)
-	}
-	if assetInfo.Altname == "XBT" {
-		return "BTC", nil
-	}
-	return assetInfo.Altname, nil
+
+	// Call the simple, unexported helper to perform the final conversion.
+	return getCommonAssetName(assetInfo), nil
 }
 
 func (c *Client) GetKrakenAssetName(ctx context.Context, commonAssetName string) (string, error) {
@@ -565,20 +563,22 @@ func (c *Client) RefreshAssets(ctx context.Context) error {
 	c.dataMu.Lock()
 	defer c.dataMu.Unlock()
 
-	c.assetInfoMap = resp.Result
-	c.commonToKrakenAsset = make(map[string]string)
+	// Create a new map to store the comprehensive asset data.
+	c.assetInfoMap = make(map[string]AssetInfo)
 
+	// First, populate the map with the primary Kraken names (e.g., "XETH").
 	for krakenName, info := range resp.Result {
-		// Don't map derivative assets like ".S" or ".F" as the primary common asset
-		if strings.Contains(krakenName, ".") {
-			continue
-		}
-		commonName := getCommonAssetName(info)
-		if commonName != "" {
-			// Map the common name (e.g., "BTC") to its primary Kraken name (e.g., "XXBT")
-			c.commonToKrakenAsset[commonName] = krakenName
+		c.assetInfoMap[krakenName] = info
+	}
+
+	// Second, add entries for all the alternate names (e.g., "ETH").
+	// This ensures we can look up an asset by its common ticker.
+	for _, info := range resp.Result {
+		if info.Altname != "" {
+			c.assetInfoMap[info.Altname] = info
 		}
 	}
-	c.logger.LogInfo("Kraken Client: Refreshed and mapped %d primary assets.", len(c.commonToKrakenAsset))
+
+	c.logger.LogInfo("Kraken Client: Refreshed and mapped %d assets with all aliases.", len(resp.Result))
 	return nil
 }
