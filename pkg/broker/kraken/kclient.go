@@ -44,9 +44,14 @@ type Client struct {
 func (c *Client) GetCommonPairName(ctx context.Context, krakenPair string) (string, error) {
 	c.dataMu.RLock()
 	defer c.dataMu.RUnlock()
-	commonPair, ok := c.krakenToCommonPair[krakenPair]
+	normalizedPair := normalizeKrakenPair(krakenPair)
+	commonPair, ok := c.krakenToCommonPair[normalizedPair]
 	if !ok {
-		return "", fmt.Errorf("common pair name for kraken pair %s not found in map", krakenPair)
+		// As a fallback, try the original name
+		commonPair, ok = c.krakenToCommonPair[krakenPair]
+		if !ok {
+			return "", fmt.Errorf("common pair name for kraken pair %s (normalized: %s) not found in map", krakenPair, normalizedPair)
+		}
 	}
 	return commonPair, nil
 }
@@ -495,9 +500,10 @@ func (c *Client) RefreshAssetPairs(ctx context.Context) error {
 		commonQuote := quoteAssetInfo.Altname
 
 		if commonBase != "" && commonQuote != "" {
+			normalizedPair := normalizeKrakenPair(krakenPairName)
 			commonPairKey := fmt.Sprintf("%s/%s", commonBase, commonQuote)
 			c.commonToKrakenPair[commonPairKey] = krakenPairName
-			c.krakenToCommonPair[krakenPairName] = commonPairKey // Populate the reverse map
+			c.krakenToCommonPair[normalizedPair] = commonPairKey // Use normalized name
 
 			if commonBase == "XBT" {
 				btcPairKey := fmt.Sprintf("BTC/%s", commonQuote)
@@ -508,6 +514,15 @@ func (c *Client) RefreshAssetPairs(ctx context.Context) error {
 
 	c.logger.LogInfo("Kraken Client: Refreshed %d asset pairs. Mapped %d human-readable pairs to Kraken API pairs.", len(c.pairInfoMap), len(c.commonToKrakenPair))
 	return nil
+}
+func normalizeKrakenPair(pair string) string {
+	// Normalizes variations like XXBTZUSD, XBTUSD, SOLUSD -> BTCUSD, BTCUSD, SOLUSD
+	// This is a simplified example; a production version might need more rules.
+	p := strings.ToUpper(pair)
+	p = strings.Replace(p, "XBT", "BTC", 1) // Handle the most common BTC variant
+	p = strings.TrimPrefix(p, "X")
+	p = strings.Replace(p, "ZUSD", "USD", 1) // Handle USD variation
+	return p
 }
 
 func (c *Client) RefreshAssets(ctx context.Context) error {

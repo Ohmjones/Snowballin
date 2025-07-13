@@ -321,6 +321,7 @@ func (a *Adapter) PlaceOrder(ctx context.Context, assetPair, side, orderType str
 	}
 	if strings.Contains(orderType, "stop") {
 		params.Set("price", strconv.FormatFloat(stopPrice, 'f', pairDetail.PairDecimals, 64))
+		params.Set("oflags", "post")
 	}
 	if clientOrderID != "" {
 		params.Set("userref", clientOrderID)
@@ -392,10 +393,13 @@ func (a *Adapter) GetBalance(ctx context.Context, currency string) (broker.Balan
 		return broker.Balance{}, err
 	}
 
-	// [FIX] Translate the common currency name (e.g., "BTC") to the Kraken internal name (e.g., "XXBT")
-	krakenAssetName, err := a.client.GetKrakenAssetName(ctx, currency)
+	krakenAssetName, err := a.client.GetKrakenAssetName(ctx, strings.ToUpper(currency))
 	if err != nil {
-		return broker.Balance{}, fmt.Errorf("GetBalance: could not get Kraken asset name for %s: %w", currency, err)
+		// Fallback for assets like USD, EUR etc which don't have an 'X' or 'Z' prefix.
+		krakenAssetName = "Z" + strings.ToUpper(currency)
+		if asset, assetErr := a.client.GetKrakenAssetName(ctx, currency); assetErr == nil {
+			krakenAssetName = asset
+		}
 	}
 
 	balanceStr, exists := balances[krakenAssetName]
@@ -491,11 +495,17 @@ func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) (
 			return nil, err
 		}
 
-		// [FIX] Use the new GetCommonPairName function to correctly translate the pair name
 		commonPair, commonPairErr := a.client.GetCommonPairName(ctx, trade.Pair)
 		if commonPairErr != nil {
-			a.logger.LogWarn("GetTrades: could not get common pair name for %s, using original.", trade.Pair)
-			commonPair = trade.Pair
+			a.logger.LogWarn("GetTrades: could not get common pair name for %s, skipping this trade. Error: %v", trade.Pair, commonPairErr)
+			// --- FIX: Skip trades that cannot be mapped to avoid polluting position data ---
+			continue
+		}
+
+		// --- Ensure the trade belongs to the requested pair ---
+		if pair != "" && commonPair != pair {
+			a.logger.LogDebug("GetTrades: Skipping trade for pair %s as it doesn't match requested pair %s", commonPair, pair)
+			continue
 		}
 
 		trades = append(trades, broker.Trade{

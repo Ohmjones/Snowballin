@@ -21,6 +21,16 @@ func NewSQLiteCache(dbPath utilities.DatabaseConfig) (*SQLiteCache, error) {
 	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
 		return nil, fmt.Errorf("failed to create database directory '%s': %w", dir, err)
 	}
+
+	// --- FIX: Log the absolute path for clarity ---
+	absPath, err := filepath.Abs(dbPath.DBPath)
+	if err != nil {
+		log.Printf("Could not determine absolute path for database: %v", err)
+		absPath = dbPath.DBPath // fallback to original path
+	}
+	log.Printf("Initializing SQLite database at: %s", absPath)
+	// --- End of FIX ---
+
 	db, err := sql.Open("sqlite3", dbPath.DBPath)
 	if err != nil {
 		return nil, err
