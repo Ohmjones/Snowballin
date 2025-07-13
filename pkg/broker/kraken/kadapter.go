@@ -301,18 +301,22 @@ func (ka *Adapter) CalculateMarketCap(ctx context.Context, pair string, circulat
 }
 
 func (a *Adapter) PlaceOrder(ctx context.Context, assetPair, side, orderType string, volume, price, stopPrice float64, clientOrderID string) (string, error) {
-	krakenPair, err := a.client.GetKrakenPairName(ctx, assetPair)
+	// First, translate the common pair name ("BTC/USD") into the tradeable Kraken pair name ("XBTUSD").
+	// The new mapping logic ensures this returns the correct 'altname'.
+	tradeableKrakenPair, err := a.client.GetKrakenPairName(ctx, assetPair)
 	if err != nil {
 		return "", err
 	}
 
-	pairDetail, err := a.client.GetPairDetail(ctx, krakenPair)
+	// Next, get the pair's details (like decimal precision) using that same tradeable name.
+	// This will now succeed because the cache is keyed correctly.
+	pairDetail, err := a.client.GetPairDetail(ctx, tradeableKrakenPair)
 	if err != nil {
 		return "", err
 	}
 
 	params := url.Values{
-		"pair":      {krakenPair},
+		"pair":      {tradeableKrakenPair}, // Use the correct tradeable name
 		"type":      {strings.ToLower(side)},
 		"ordertype": {strings.ToLower(orderType)},
 		"volume":    {strconv.FormatFloat(volume, 'f', pairDetail.LotDecimals, 64)},
@@ -320,10 +324,10 @@ func (a *Adapter) PlaceOrder(ctx context.Context, assetPair, side, orderType str
 
 	if strings.Contains(orderType, "limit") {
 		params.Set("price", strconv.FormatFloat(price, 'f', pairDetail.PairDecimals, 64))
+		params.Set("oflags", "post") // Ensure maker-fees
 	}
 	if strings.Contains(orderType, "stop") {
 		params.Set("price", strconv.FormatFloat(stopPrice, 'f', pairDetail.PairDecimals, 64))
-		params.Set("oflags", "post")
 	}
 	if clientOrderID != "" {
 		params.Set("userref", clientOrderID)

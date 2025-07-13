@@ -459,38 +459,46 @@ func (c *Client) RefreshAssetPairs(ctx context.Context) error {
 		return errors.New("asset map not initialized, call RefreshAssets first")
 	}
 
+	// Clear and initialize all pair-related maps
 	c.pairInfoMap = resp.Result
 	c.commonToKrakenPair = make(map[string]string)
 	c.krakenToCommonPair = make(map[string]string)
+	c.pairDetailsCache = make(map[string]PairDetail)
 
 	for krakenPairName, pairInfo := range resp.Result {
 		baseAssetInfo, baseOk := c.assetInfoMap[pairInfo.Base]
 		quoteAssetInfo, quoteOk := c.assetInfoMap[pairInfo.Quote]
-
 		if !baseOk || !quoteOk {
 			continue
 		}
 
 		commonBase := getCommonAssetName(baseAssetInfo)
 		commonQuote := getCommonAssetName(quoteAssetInfo)
+		if commonBase == "" || commonQuote == "" {
+			continue
+		}
 
-		if commonBase != "" && commonQuote != "" {
-			commonPairKey := fmt.Sprintf("%s/%s", commonBase, commonQuote)
-			c.commonToKrakenPair[commonPairKey] = krakenPairName
-			c.krakenToCommonPair[krakenPairName] = commonPairKey
+		commonPairKey := fmt.Sprintf("%s/%s", commonBase, commonQuote)
+
+		// The 'altname' is the tradeable pair name (e.g., XBTUSD).
+		tradeablePairName := pairInfo.Altname
+
+		// 1. Map the common name ("BTC/USD") to the TRADEABLE name ("XBTUSD").
+		c.commonToKrakenPair[commonPairKey] = tradeablePairName
+
+		// 2. For reverse lookups (from trade history), map BOTH variants back to the common name.
+		c.krakenToCommonPair[krakenPairName] = commonPairKey    // "XXBTZUSD" -> "BTC/USD"
+		c.krakenToCommonPair[tradeablePairName] = commonPairKey // "XBTUSD"   -> "BTC/USD"
+
+		// 3. Cache the pair details using the TRADEABLE name as the key.
+		c.pairDetailsCache[tradeablePairName] = PairDetail{
+			PairDecimals: pairInfo.PairDecimals,
+			LotDecimals:  pairInfo.LotDecimals,
+			OrderMin:     pairInfo.OrderMin,
 		}
 	}
-	c.logger.LogInfo("Kraken Client: Refreshed %d asset pairs and created translation maps.", len(c.pairInfoMap))
+	c.logger.LogInfo("Kraken Client: Refreshed %d asset pairs and built comprehensive translation maps.", len(c.pairInfoMap))
 	return nil
-}
-func normalizeKrakenPair(pair string) string {
-	// Normalizes variations like XXBTZUSD, XBTUSD, SOLUSD -> BTCUSD, BTCUSD, SOLUSD
-	// This is a simplified example; a production version might need more rules.
-	p := strings.ToUpper(pair)
-	p = strings.Replace(p, "XBT", "BTC", 1) // Handle the most common BTC variant
-	p = strings.TrimPrefix(p, "X")
-	p = strings.Replace(p, "ZUSD", "USD", 1) // Handle USD variation
-	return p
 }
 
 func (c *Client) RefreshAssets(ctx context.Context) error {

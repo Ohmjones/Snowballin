@@ -277,6 +277,7 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, assetPair string) (*utilities.Position, error) {
 	state.logger.LogWarn("Reconstruction: Attempting to reconstruct orphaned position for %s from trade history.", assetPair)
 
+	// Fetch the last 90 days of trades specifically for the orphaned asset pair.
 	ninetyDaysAgo := time.Now().Add(-90 * 24 * time.Hour)
 	tradeHistory, err := state.broker.GetTrades(ctx, assetPair, ninetyDaysAgo)
 	if err != nil {
@@ -284,24 +285,27 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 	}
 
 	if len(tradeHistory) == 0 {
-		return nil, errors.New("no trade history found for this asset, cannot reconstruct")
+		return nil, fmt.Errorf("no trade history found for this asset, cannot reconstruct")
 	}
 
 	var positionTrades []broker.Trade
-	lastSellIndex := -1
+	// Iterate backwards from the most recent trade.
 	for i := len(tradeHistory) - 1; i >= 0; i-- {
-		if tradeHistory[i].Side == "sell" {
-			lastSellIndex = i
+		trade := tradeHistory[i]
+		// Stop collecting when we hit the first "sell" trade, which signifies the end of the last position.
+		if trade.Side == "sell" {
 			break
 		}
+		// Prepend the buy trade to the list to maintain chronological order.
+		positionTrades = append([]broker.Trade{trade}, positionTrades...)
 	}
-	positionTrades = tradeHistory[lastSellIndex+1:]
 
 	if len(positionTrades) == 0 {
 		return nil, fmt.Errorf("found trade history for %s, but could not isolate a sequence of buys for the current position", assetPair)
 	}
 
 	var totalCost, totalVolume float64
+	// The first trade in our collected list is the base order of this position.
 	baseOrderTrade := positionTrades[0]
 
 	for _, trade := range positionTrades {
@@ -323,7 +327,7 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 		AveragePrice:       totalCost / totalVolume,
 		TotalVolume:        totalVolume,
 		BaseOrderPrice:     baseOrderTrade.Price,
-		BaseOrderSize:      baseOrderTrade.Cost,
+		BaseOrderSize:      baseOrderTrade.Cost, // Approximate base size
 		FilledSafetyOrders: filledSafetyOrders,
 		IsDcaActive:        true,
 		BrokerOrderID:      baseOrderTrade.OrderID,
