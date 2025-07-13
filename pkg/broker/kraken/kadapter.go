@@ -62,46 +62,43 @@ func (a *Adapter) RefreshAssetInfo(ctx context.Context) error {
 	return nil
 }
 
+// --- [MODIFICATION] This function is now more robust. It iterates through all returned balances
+// to find the correct one instead of guessing the key. This is the fix for the ETH/SOL reconstruction issue.
 func (a *Adapter) GetBalance(ctx context.Context, currency string) (broker.Balance, error) {
 	balances, err := a.client.GetBalancesAPI(ctx)
 	if err != nil {
 		return broker.Balance{}, fmt.Errorf("GetBalance: failed to get balances from API: %w", err)
 	}
 
-	krakenAssetName, err := a.client.GetKrakenAssetName(ctx, currency)
-	if err != nil {
-		a.logger.LogDebug("GetBalance: Could not resolve Kraken asset name for '%s'. It may not be a traded asset or may have a zero balance. Error: %v", currency, err)
-		return broker.Balance{Currency: currency, Total: 0, Available: 0}, nil
-	}
+	upperCurrency := strings.ToUpper(currency)
 
-	var balanceStr string
-	var exists bool
+	// Iterate through all balances returned by the API to find the one we need.
+	for krakenName, balanceStr := range balances {
+		// Translate the Kraken asset name (e.g., "XETH") back to its common name (e.g., "ETH").
+		commonName, err := a.client.GetCommonAssetName(ctx, krakenName)
+		if err != nil {
+			a.logger.LogDebug("GetBalance: could not get common name for Kraken asset '%s', skipping. Error: %v", krakenName, err)
+			continue
+		}
 
-	balanceStr, exists = balances[krakenAssetName]
-	if !exists {
-		assetInfo, infoErr := a.client.GetAssetInfo(ctx, krakenAssetName)
-		if infoErr == nil && assetInfo.Altname != "" {
-			balanceStr, exists = balances[assetInfo.Altname]
+		// If the translated common name matches the currency we're looking for...
+		if strings.EqualFold(commonName, upperCurrency) {
+			bal, parseErr := strconv.ParseFloat(balanceStr, 64)
+			if parseErr != nil {
+				return broker.Balance{}, fmt.Errorf("GetBalance: could not parse balance string '%s' for %s: %w", balanceStr, currency, parseErr)
+			}
+			// Found it. Return the correct balance.
+			return broker.Balance{
+				Currency:  currency,
+				Total:     bal,
+				Available: bal, // Assuming total is available for simplicity
+			}, nil
 		}
 	}
-	if !exists {
-		balanceStr, exists = balances[krakenAssetName+".S"]
-	}
 
-	if !exists {
-		return broker.Balance{Currency: currency, Total: 0, Available: 0}, nil
-	}
-
-	bal, err := strconv.ParseFloat(balanceStr, 64)
-	if err != nil {
-		return broker.Balance{}, fmt.Errorf("GetBalance: could not parse balance string '%s' for %s: %w", balanceStr, currency, err)
-	}
-
-	return broker.Balance{
-		Currency:  currency,
-		Total:     bal,
-		Available: bal,
-	}, nil
+	// If we looped through all balances and didn't find a match, it means the balance is zero.
+	a.logger.LogDebug("GetBalance: No balance found for currency '%s' after checking all returned assets.", currency)
+	return broker.Balance{Currency: currency, Total: 0, Available: 0}, nil
 }
 
 func intervalToDuration(interval string) (time.Duration, error) {
