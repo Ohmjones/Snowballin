@@ -23,12 +23,22 @@ import (
 // LogLevel defines the severity of a log message.
 type LogLevel int
 
+// Logging Level
 const (
 	Debug LogLevel = iota
 	Info
 	Warn
 	Error
 	Fatal
+)
+
+// Colors.
+const (
+	ColorReset  = "\033[0m"
+	ColorYellow = "\033[93m" // For asset pairs
+	ColorCyan   = "\033[96m" // For Buy signals
+	ColorRed    = "\033[91m" // For Sell signals
+	ColorWhite  = "\033[97m" // For Hold signals
 )
 
 // --- Global Logger ---

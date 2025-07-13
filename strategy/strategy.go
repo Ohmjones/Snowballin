@@ -85,7 +85,11 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 
 	isBuy, reason := s.checkMultiTimeframeConsensus(data, cfg)
 	if !isBuy {
-		s.logger.LogInfo("GenerateSignals [%s]: Hold condition. Reason: %s", data.AssetPair, reason)
+		s.logger.LogInfo("GenerateSignals: %s -> %s - Reason: %s",
+			utilities.ColorYellow+data.AssetPair+utilities.ColorReset,
+			utilities.ColorWhite+"HOLD"+utilities.ColorReset,
+			strings.TrimPrefix(reason, "Hold: "), // Removes the redundant "Hold: " from the reason string.
+		)
 		return nil, nil
 	}
 	s.logger.LogInfo("GenerateSignals [%s]: MTF Consensus PASSED. Reason: %s. Performing final confirmation...", data.AssetPair, reason)

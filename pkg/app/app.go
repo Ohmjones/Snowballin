@@ -524,7 +524,11 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 		stratInstance := strategy.NewStrategy(state.logger)
 		exitSignal, shouldExit := stratInstance.GenerateExitSignal(ctx, *consolidatedData, *state.config)
 		if shouldExit && exitSignal.Direction == "sell" {
-			state.logger.LogWarn("ManagePosition [%s]: STRATEGY EXIT SIGNAL received. Reason: %s. Placing market sell order.", pos.AssetPair, exitSignal.Reason)
+			state.logger.LogWarn("ManagePosition: %s -> %s (Strategy Exit) - Reason: %s. Placing market sell order.",
+				utilities.ColorYellow+pos.AssetPair+utilities.ColorReset,
+				utilities.ColorRed+"SELL"+utilities.ColorReset,
+				exitSignal.Reason,
+			)
 			orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
 			if err != nil {
 				state.logger.LogError("ManagePosition [%s]: Failed to place market sell order for strategy exit: %v", pos.AssetPair, err)
@@ -677,7 +681,11 @@ func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair st
 
 	for _, sig := range signals {
 		if sig.Direction == "buy" {
-			state.logger.LogInfo("SeekEntry [%s]: BUY signal received. Reason: %s. Placing order.", assetPair, sig.Reason)
+			state.logger.LogInfo("SeekEntry: %s -> %s - Reason: %s. Placing order.",
+				utilities.ColorYellow+assetPair+utilities.ColorReset,
+				utilities.ColorCyan+"BUY"+utilities.ColorReset,
+				sig.Reason,
+			)
 			orderPrice := sig.RecommendedPrice
 			orderSizeInBase := sig.CalculatedSize
 			if orderSizeInBase <= 0 {
