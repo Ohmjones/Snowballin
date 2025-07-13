@@ -473,11 +473,13 @@ func (a *Adapter) GetTicker(ctx context.Context, pair string) (broker.TickerData
 func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) ([]broker.Trade, error) {
 	params := url.Values{}
 	if !since.IsZero() {
+		// Use the 'start' parameter to limit the history fetch to a reasonable time frame.
 		params.Set("start", strconv.FormatInt(since.Unix(), 10))
 	}
-	// We are intentionally NOT setting the "pair" parameter in the request
-	// to fetch all trades, as the API filter is unreliable.
 
+	// We intentionally do not set the 'pair' parameter here.
+	// Fetching all trades and filtering them locally is more reliable due to
+	// Kraken API's inconsistencies with pair naming in its filter.
 	tradesMap, _, err := a.client.QueryTradesAPI(ctx, params)
 	if err != nil {
 		return nil, err
@@ -485,31 +487,63 @@ func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) (
 
 	var trades []broker.Trade
 	for tradeID, trade := range tradesMap {
-		// ... (parsing logic for price, volume, etc.) ...
+		// This diagnostic log is helpful for debugging what the API is returning.
+		a.logger.LogDebug("Processing trade from API: ID=%s, Pair=%s, Type=%s, Vol=%s", tradeID, trade.Pair, trade.Type, trade.Vol)
 
-		// --- FIX: This translation and filtering is now reliable ---
+		// Parse all numeric fields from the string-based API response.
+		price, err := strconv.ParseFloat(trade.Price, 64)
+		if err != nil {
+			a.logger.LogWarn("GetTrades: could not parse price for trade %s, skipping.", tradeID)
+			continue
+		}
+		volume, err := strconv.ParseFloat(trade.Vol, 64)
+		if err != nil {
+			a.logger.LogWarn("GetTrades: could not parse volume for trade %s, skipping.", tradeID)
+			continue
+		}
+		fee, err := strconv.ParseFloat(trade.Fee, 64)
+		if err != nil {
+			a.logger.LogWarn("GetTrades: could not parse fee for trade %s, skipping.", tradeID)
+			continue
+		}
+		cost, err := strconv.ParseFloat(trade.Cost, 64)
+		if err != nil {
+			a.logger.LogWarn("GetTrades: could not parse cost for trade %s, skipping.", tradeID)
+			continue
+		}
+
+		// Use the robust client function to translate the Kraken pair name (e.g., "XXBTZUSD")
+		// into the common format used by the bot (e.g., "BTC/USD").
 		commonPair, commonPairErr := a.client.GetCommonPairName(ctx, trade.Pair)
 		if commonPairErr != nil {
 			a.logger.LogWarn("GetTrades: could not get common pair name for %s, skipping trade. Error: %v", trade.Pair, commonPairErr)
 			continue
 		}
 
-		// Perform the critical local filtering
+		// Perform the critical local filtering. If a pair was requested (e.g., "BTC/USD"),
+		// skip any trades that don't match after translation.
 		if pair != "" && commonPair != pair {
-			continue // Skip trades that don't match the requested pair
+			continue
 		}
 
 		trades = append(trades, broker.Trade{
-			ID:      tradeID,
-			OrderID: trade.Ordtxid,
-			Pair:    commonPair,
-			// ... rest of the struct fields
+			ID:          tradeID,
+			OrderID:     trade.Ordtxid,
+			Pair:        commonPair,
+			Side:        trade.Type, // Correctly populate the side from the 'type' field.
+			Price:       price,
+			Volume:      volume,
+			Cost:        cost,
+			Fee:         fee,
+			FeeCurrency: strings.Split(commonPair, "/")[1],
+			Timestamp:   time.Unix(int64(trade.Time), 0),
 		})
 	}
 
-	// Sort trades oldest to newest for correct position reconstruction
+	// The API returns trades most recent first; sort them oldest first for correct processing.
 	sort.Slice(trades, func(i, j int) bool {
 		return trades[i].Timestamp.Before(trades[j].Timestamp)
 	})
+
 	return trades, nil
 }
