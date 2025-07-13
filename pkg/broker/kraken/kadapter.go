@@ -106,7 +106,6 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 			continue
 		}
 
-		// If the asset is the quote currency itself (e.g., USD), just add its balance to the total.
 		if strings.EqualFold(commonName, quoteCurrencyUpper) {
 			totalValue += balance
 			continue
@@ -115,10 +114,6 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 		var priceInQuote float64
 		commonPairToFetch := commonName + "/" + quoteCurrencyUpper
 
-		// --- NEW RESILIENT LOGIC ---
-		// Try to find a direct price by checking the ticker with both possible pair names.
-
-		// Attempt 1: Use the primary data-fetching name (e.g., "XETHZUSD")
 		primaryPairName, err1 := a.client.GetPrimaryKrakenPairName(ctx, commonPairToFetch)
 		if err1 == nil {
 			ticker, err := a.client.GetTickerAPI(ctx, primaryPairName)
@@ -130,7 +125,6 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 			}
 		}
 
-		// Attempt 2: If the primary name didn't work, try the tradeable 'altname' (e.g., "ETHUSD")
 		if priceInQuote == 0 {
 			tradeablePairName, err2 := a.client.GetTradeableKrakenPairName(ctx, commonPairToFetch)
 			if err2 == nil {
@@ -150,11 +144,10 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 			a.logger.LogDebug("GetAccountValue: Valued %f of %s at %.2f %s/COIN (Direct Ticker)", balance, commonName, priceInQuote, quoteCurrencyUpper)
 			continue
 		}
-		// --- END OF NEW LOGIC ---
 
-		// --- Triangulation logic (fallback if no direct ticker was found) ---
 		a.logger.LogWarn("GetAccountValue: No direct %s ticker for %s, attempting triangulation via BTC.", quoteCurrencyUpper, commonName)
 
+		// --- FIX: Correctly form the triangulation pair using the resolved common name ---
 		triangulationPair := commonName + "/BTC"
 		primaryTriangulationPair, err := a.client.GetPrimaryKrakenPairName(ctx, triangulationPair)
 		if err != nil {
@@ -165,6 +158,11 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 		triangTicker, err := a.client.GetTickerAPI(ctx, primaryTriangulationPair)
 		if err != nil {
 			a.logger.LogWarn("GetAccountValue: Triangulation failed for %s: could not get ticker for %s.", commonName, primaryTriangulationPair)
+			continue
+		}
+
+		if len(triangTicker.Bid) == 0 || triangTicker.Bid[0] == "" {
+			a.logger.LogWarn("GetAccountValue: Triangulation ticker for %s had no bid price.", primaryTriangulationPair)
 			continue
 		}
 
