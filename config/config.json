@@ -89,7 +89,7 @@
     "recalculate_after_dca_fill": true,
     "use_order_book_for_predictive": true,
     "predictive_order_size_percent": 0.2,
-    "min_book_confidence_for_predictive": 0.7
+    "min_book_confidence_for_predictive": 0.6
   },
   "indicators": {
     "rsi_period": 14,
