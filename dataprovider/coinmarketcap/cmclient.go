@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -393,6 +392,7 @@ func (c *Client) GetOHLCVHistorical(ctx context.Context, id, vsCurrency, userInt
 }
 
 // fetchBarsFromAPI handles the actual API call and caching logic.
+// fetchBarsFromAPI handles the actual API call and caching logic.
 func (c *Client) fetchBarsFromAPI(ctx context.Context, numericalCoinID, vsCurrency, interval string) ([]utils.OHLCVBar, error) {
 	c.idMapMu.RLock()
 	assetSymbol, symbolFound := c.numericalIDToSymbolMap[numericalCoinID]
@@ -444,30 +444,37 @@ func (c *Client) fetchBarsFromAPI(ctx context.Context, numericalCoinID, vsCurren
 		"count":    {countForAPI},
 	}
 
-	// Step 1: Decode the API response into the struct containing the json.RawMessage.
+	// --- START OF NEW FIX ---
+	// Step 1: Decode into the raw response. This is unchanged.
 	var response cmcOHLCVHistoricalResponse
 	if apiErr := c.makeAPICall(ctx, "/v2/cryptocurrency/ohlcv/historical", params, &response); apiErr != nil {
 		return nil, apiErr
 	}
-
-	// Step 2: Perform the safety check on the API status.
 	if response.Status.ErrorCode != 0 {
 		return nil, fmt.Errorf("CMC API error: %s", response.Status.ErrorMessage)
 	}
 
-	// Step 3: Decode the raw 'Data' field into its own, new map variable.
-	var dataContainer map[string]cmcOHLCData
-	if err := json.Unmarshal(response.Data, &dataContainer); err != nil {
-		return nil, fmt.Errorf("failed to decode JSON response: %w", err)
+	// Step 2: Decode the 'Data' field into a map of raw messages.
+	// This lets us handle cases where one coin's data is an error (a number)
+	// while others are fine.
+	var rawDataContainer map[string]json.RawMessage
+	if err := json.Unmarshal(response.Data, &rawDataContainer); err != nil {
+		return nil, fmt.Errorf("failed to decode raw data container: %w", err)
 	}
 
-	// Step 4: Use the NEW 'dataContainer' variable to access the map data. DO NOT use 'response.Data' here.
-	apiData, dataExists := dataContainer[numericalCoinID]
+	// Step 3: Extract the specific raw message for our coin and decode it into the final struct.
+	// This is the most granular and safest step.
+	coinRawData, dataExists := rawDataContainer[numericalCoinID]
 	if !dataExists {
 		return nil, fmt.Errorf("no OHLCV data for ID %s in response", numericalCoinID)
 	}
+	var apiData cmcOHLCData
+	if err := json.Unmarshal(coinRawData, &apiData); err != nil {
+		// This will now correctly catch the "cannot unmarshal number" error for this specific coin.
+		return nil, fmt.Errorf("failed to decode JSON response: %w", err)
+	}
+	// --- END OF NEW FIX ---
 
-	// The rest of the function now works correctly because 'apiData' is the correct type.
 	fetchedBars := make([]utils.OHLCVBar, 0, len(apiData.Quotes))
 	for _, qData := range apiData.Quotes {
 		quoteSet, ok := qData.QuoteMap[strings.ToUpper(vsCurrency)]
@@ -552,30 +559,32 @@ func (c *Client) PrimeHistoricalData(ctx context.Context, id, vsCurrency, userIn
 		"count":    {countForAPI},
 	}
 
-	// Step 1: Decode the raw response.
+	// Step 1: Decode into the raw response struct.
 	var response cmcOHLCVHistoricalResponse
 	if err := c.makeAPICall(ctx, "/v2/cryptocurrency/ohlcv/historical", params, &response); err != nil {
 		return err
 	}
-
-	// Step 2: Check the API status code.
 	if response.Status.ErrorCode != 0 {
 		return fmt.Errorf("CMC API error: %s", response.Status.ErrorMessage)
 	}
 
-	// Step 3: Decode the raw 'Data' field into a new map variable.
-	var dataContainer map[string]cmcOHLCData
-	if err := json.Unmarshal(response.Data, &dataContainer); err != nil {
-		return fmt.Errorf("failed to decode historical data from raw response: %w", err)
+	// Step 2: Decode the 'Data' field into a map of raw messages.
+	var rawDataContainer map[string]json.RawMessage
+	if err := json.Unmarshal(response.Data, &rawDataContainer); err != nil {
+		return fmt.Errorf("failed to decode raw data container for priming: %w", err)
 	}
 
-	// Step 4: Use the new 'dataContainer' for the map lookup.
-	apiData, dataExists := dataContainer[id]
+	// Step 3: Decode the specific coin's raw message into the final struct.
+	coinRawData, dataExists := rawDataContainer[id]
 	if !dataExists {
-		return fmt.Errorf("no OHLCV data for ID %s in response", id)
+		return fmt.Errorf("no OHLCV data for ID %s in priming response", id)
+	}
+	var apiData cmcOHLCData
+	if err := json.Unmarshal(coinRawData, &apiData); err != nil {
+		return fmt.Errorf("failed to decode historical data for priming: %w", err)
 	}
 
-	// The rest of the function remains the same and will now work correctly.
+	// The rest of the function remains the same.
 	for _, qData := range apiData.Quotes {
 		quoteSet, ok := qData.QuoteMap[strings.ToUpper(vsCurrency)]
 		if !ok {
@@ -630,40 +639,18 @@ func resampleBars(sourceBars []utils.OHLCVBar, targetIntervalStr string, logger 
 		return []utils.OHLCVBar{}, nil
 	}
 
-	// Assuming the source is always 1h for now.
+	// For CoinMarketCap, we assume the smallest reliable source interval is 1 hour.
 	sourceDuration := time.Hour
 
-	if targetDuration >= sourceDuration {
-		logger.LogWarn("Resample: Target interval %s is >= source interval %s. Returning source bars.", targetDuration, sourceDuration)
-		return sourceBars, nil
+	// NEW LOGIC: If the user wants a smaller interval than our source can provide,
+	// do not create fake data. Log a warning and return an empty result.
+	if targetDuration < sourceDuration {
+		logger.LogWarn("Resample: Target interval %s is smaller than the best available source interval %s. Returning no data to avoid using artificial prices.", targetDuration, sourceDuration)
+		return []utils.OHLCVBar{}, nil
 	}
 
-	if sourceDuration%targetDuration != 0 {
-		return nil, fmt.Errorf("cannot evenly resample from %s to %s", sourceDuration, targetIntervalStr)
-	}
-	resamplingFactor := int(sourceDuration / targetDuration)
-
-	resampled := make([]utils.OHLCVBar, 0, len(sourceBars)*resamplingFactor)
-	for _, sourceBar := range sourceBars {
-		resampledVolume := sourceBar.Volume / float64(resamplingFactor)
-		if math.IsNaN(resampledVolume) || math.IsInf(resampledVolume, 0) {
-			resampledVolume = 0
-		}
-		startTime := time.UnixMilli(sourceBar.Timestamp)
-
-		for i := 0; i < resamplingFactor; i++ {
-			// Create flat bars. A more complex implementation could interpolate price.
-			newBar := utils.OHLCVBar{
-				Timestamp: startTime.Add(time.Duration(i) * targetDuration).UnixMilli(),
-				Open:      sourceBar.Close,
-				High:      sourceBar.Close,
-				Low:       sourceBar.Close,
-				Close:     sourceBar.Close,
-				Volume:    resampledVolume,
-			}
-			resampled = append(resampled, newBar)
-		}
-	}
-	logger.LogInfo("Resampled %d source bars into %d target bars (%s).", len(sourceBars), len(resampled), targetIntervalStr)
-	return resampled, nil
+	// The old logic for creating flat bars is removed, as it's not reliable for trading.
+	// If you need to support creating larger bars from smaller ones (e.g., 4h from 1h),
+	// that logic would be added here. For now, we just return the source bars.
+	return sourceBars, nil
 }
