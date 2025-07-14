@@ -840,7 +840,7 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 
 func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair string, signals []strategy.StrategySignal, consolidatedData *strategy.ConsolidatedMarketPicture) {
 	for _, sig := range signals {
-		if strings.Contains(sig.Direction, "buy") {
+		if strings.Contains(strings.ToLower(sig.Direction), "buy") {
 			state.logger.LogInfo("SeekEntry [%s]: BUY signal confirmed. Placing order.", assetPair)
 
 			// --- FIX: Corrected mainSignal to sig ---
