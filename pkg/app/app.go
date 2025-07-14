@@ -861,6 +861,13 @@ func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair st
 				state.logger.LogError("SeekEntry [%s]: Place order failed: %v", assetPair, placeErr)
 			} else {
 				state.logger.LogInfo("SeekEntry [%s]: Placed order ID %s at %.2f. Now tracking.", assetPair, orderID, orderPrice)
+				if sig.Direction == "predictive_buy" {
+					baseAsset := strings.Split(assetPair, "/")[0]
+					quoteAsset := strings.Split(assetPair, "/")[1]
+					message := fmt.Sprintf("🧠 **Predictive Buy Order Placed**\n**Pair:** %s\n**Size:** `%.4f %s`\n**Price:** `%.2f %s`\n**Reason:** %s",
+						assetPair, orderSizeInBase, baseAsset, orderPrice, quoteAsset, sig.Reason)
+					state.discordClient.SendMessage(message)
+				}
 				state.stateMutex.Lock()
 				state.pendingOrders[orderID] = assetPair
 				if err := state.cache.SavePendingOrder(orderID, assetPair); err != nil {
