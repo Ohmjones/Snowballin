@@ -5,6 +5,7 @@ import (
 	"Snowballin/dataprovider"
 	utils "Snowballin/utilities"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -66,9 +67,10 @@ type cmcMapResponse struct {
 	Status cmcStatus     `json:"status"`
 }
 type cmcOHLCVHistoricalResponse struct {
-	Status cmcStatus              `json:"status"`
-	Data   map[string]cmcOHLCData `json:"data"`
+	Status cmcStatus       `json:"status"`
+	Data   json.RawMessage `json:"data"` // Use RawMessage to handle flexible response types
 }
+
 type cmcOHLCData struct {
 	ID     interface{}     `json:"id"`
 	Name   string          `json:"name"`
@@ -442,20 +444,30 @@ func (c *Client) fetchBarsFromAPI(ctx context.Context, numericalCoinID, vsCurren
 		"count":    {countForAPI},
 	}
 
+	// Step 1: Decode the API response into the struct containing the json.RawMessage.
 	var response cmcOHLCVHistoricalResponse
-	apiErr := c.makeAPICall(ctx, "/v2/cryptocurrency/ohlcv/historical", params, &response)
-	if apiErr != nil {
+	if apiErr := c.makeAPICall(ctx, "/v2/cryptocurrency/ohlcv/historical", params, &response); apiErr != nil {
 		return nil, apiErr
 	}
+
+	// Step 2: Perform the safety check on the API status.
 	if response.Status.ErrorCode != 0 {
 		return nil, fmt.Errorf("CMC API error: %s", response.Status.ErrorMessage)
 	}
 
-	apiData, dataExists := response.Data[numericalCoinID]
+	// Step 3: Decode the raw 'Data' field into its own, new map variable.
+	var dataContainer map[string]cmcOHLCData
+	if err := json.Unmarshal(response.Data, &dataContainer); err != nil {
+		return nil, fmt.Errorf("failed to decode JSON response: %w", err)
+	}
+
+	// Step 4: Use the NEW 'dataContainer' variable to access the map data. DO NOT use 'response.Data' here.
+	apiData, dataExists := dataContainer[numericalCoinID]
 	if !dataExists {
 		return nil, fmt.Errorf("no OHLCV data for ID %s in response", numericalCoinID)
 	}
 
+	// The rest of the function now works correctly because 'apiData' is the correct type.
 	fetchedBars := make([]utils.OHLCVBar, 0, len(apiData.Quotes))
 	for _, qData := range apiData.Quotes {
 		quoteSet, ok := qData.QuoteMap[strings.ToUpper(vsCurrency)]
@@ -540,19 +552,30 @@ func (c *Client) PrimeHistoricalData(ctx context.Context, id, vsCurrency, userIn
 		"count":    {countForAPI},
 	}
 
+	// Step 1: Decode the raw response.
 	var response cmcOHLCVHistoricalResponse
 	if err := c.makeAPICall(ctx, "/v2/cryptocurrency/ohlcv/historical", params, &response); err != nil {
 		return err
 	}
+
+	// Step 2: Check the API status code.
 	if response.Status.ErrorCode != 0 {
 		return fmt.Errorf("CMC API error: %s", response.Status.ErrorMessage)
 	}
 
-	apiData, dataExists := response.Data[id]
+	// Step 3: Decode the raw 'Data' field into a new map variable.
+	var dataContainer map[string]cmcOHLCData
+	if err := json.Unmarshal(response.Data, &dataContainer); err != nil {
+		return fmt.Errorf("failed to decode historical data from raw response: %w", err)
+	}
+
+	// Step 4: Use the new 'dataContainer' for the map lookup.
+	apiData, dataExists := dataContainer[id]
 	if !dataExists {
 		return fmt.Errorf("no OHLCV data for ID %s in response", id)
 	}
 
+	// The rest of the function remains the same and will now work correctly.
 	for _, qData := range apiData.Quotes {
 		quoteSet, ok := qData.QuoteMap[strings.ToUpper(vsCurrency)]
 		if !ok {
