@@ -288,7 +288,7 @@ func (c *Client) GetCoinID(ctx context.Context, commonAssetSymbol string) (strin
 	// --- START OF FIX ---
 	// Step 1: Check for a manual override first.
 	if c.cfg.SymbolOverrides != nil {
-		if id, ok := c.cfg.SymbolOverrides[strings.ToUpper(commonAssetSymbol)]; ok {
+		if id, ok := c.cfg.SymbolOverrides[strings.ToLower(commonAssetSymbol)]; ok {
 			c.logger.LogDebug("GetCoinID: Using manual override for %s -> %s", commonAssetSymbol, id)
 			return id, nil
 		}
@@ -659,12 +659,12 @@ func resampleBars(sourceBars []utils.OHLCVBar, targetIntervalStr string, logger 
 	// NEW LOGIC: If the user wants a smaller interval than our source can provide,
 	// do not create fake data. Log a warning and return an empty result.
 	if targetDuration < sourceDuration {
-		logger.LogWarn("Resample: Target interval %s is smaller than the best available source interval %s. Returning no data to avoid using artificial prices.", targetDuration, sourceDuration)
+		// This log is now handled by the adaptive fetch logic, so we can be silent here.
 		return []utils.OHLCVBar{}, nil
 	}
 
-	// The old logic for creating flat bars is removed, as it's not reliable for trading.
-	// If you need to support creating larger bars from smaller ones (e.g., 4h from 1h),
-	// that logic would be added here. For now, we just return the source bars.
+	// If the target is larger or equal, we can just return the source bars.
+	// A more complex implementation could aggregate 1h bars into 4h bars, etc.
+	// but for now, this is the safest approach.
 	return sourceBars, nil
 }
