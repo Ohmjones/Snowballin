@@ -839,12 +839,17 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 
 func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair string, signals []strategy.StrategySignal, consolidatedData *strategy.ConsolidatedMarketPicture) {
 	for _, sig := range signals {
-		if sig.Direction == "buy" {
-			state.logger.LogInfo("SeekEntry [%s]: BUY signal confirmed. Placing order.", assetPair)
+		if sig.Direction == "buy" || sig.Direction == "predictive_buy" {
+			state.logger.LogInfo("SeekEntry [%s]: %s signal confirmed. Placing order.", assetPair, strings.ToUpper(sig.Direction))
 
 			// --- FIX: Corrected mainSignal to sig ---
 			orderPrice := sig.RecommendedPrice
 			orderSizeInBase := sig.CalculatedSize
+
+			// If predictive, use smaller size
+			if sig.Direction == "predictive_buy" {
+				orderSizeInBase *= state.config.Trading.PredictiveOrderSizePercent
+			}
 
 			if orderSizeInBase <= 0 {
 				state.logger.LogWarn("SeekEntry [%s]: Calculated size is zero. Falling back to fixed base order size from config.", assetPair)
@@ -869,6 +874,26 @@ func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair st
 			}
 			// Once a buy order is placed for an asset, we stop checking for other signals for it in this cycle.
 			break
+		}
+	}
+	// Handle multiple predictive signals (ladder orders)
+	if len(signals) > 1 {
+		for _, sig := range signals[1:] {
+			if sig.Direction == "predictive_buy" {
+				// Place additional small limits
+				orderPrice := sig.RecommendedPrice
+				orderSizeInBase := sig.CalculatedSize
+				orderID, placeErr := state.broker.PlaceOrder(ctx, assetPair, "buy", "limit", orderSizeInBase, orderPrice, 0, "")
+				if placeErr != nil {
+					state.logger.LogError("SeekEntry [%s]: Predictive ladder order failed: %v", assetPair, placeErr)
+				} else {
+					state.logger.LogInfo("SeekEntry [%s]: Placed predictive ladder order ID %s at %.2f.", assetPair, orderID, orderPrice)
+					state.stateMutex.Lock()
+					state.pendingOrders[orderID] = assetPair
+					_ = state.cache.SavePendingOrder(orderID, assetPair)
+					state.stateMutex.Unlock()
+				}
+			}
 		}
 	}
 }

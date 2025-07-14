@@ -4,6 +4,8 @@ import (
 	"Snowballin/utilities"
 	"context"
 	"fmt"
+	"math"
+	"sort"
 	"strings"
 	"time"
 )
@@ -123,17 +125,46 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 		return nil, err
 	}
 
-	// 2. Use VPVR to find a strategic entry price (Point of Control)
+	// Compute VPVR as a stat only (log top levels)
 	vpvr := CalculateVPVR(primaryBars, 20)
-	recommendedPrice := data.ProvidersData[0].CurrentPrice
+	vpvrStat := "No significant VPVR levels found"
+	vpvrLevels := []float64{}
 	if len(vpvr) > 0 {
-		for _, entry := range vpvr {
-			if entry.PriceLevel < recommendedPrice {
-				recommendedPrice = entry.PriceLevel
-				s.logger.LogInfo("GenerateSignals [%s]: Found VPVR support at %.2f", data.AssetPair, recommendedPrice)
-				break
-			}
+		topVpvr := vpvr[0] // Highest volume
+		vpvrStat = fmt.Sprintf("Top VPVR at %.2f with vol %.0f", topVpvr.PriceLevel, topVpvr.Volume)
+		if len(vpvr) > 1 {
+			vpvrStat += fmt.Sprintf("; Next at %.2f with vol %.0f", vpvr[1].PriceLevel, vpvr[1].Volume)
 		}
+		for _, entry := range vpvr {
+			vpvrLevels = append(vpvrLevels, entry.PriceLevel)
+		}
+		sort.Float64s(vpvrLevels) // Sort for efficient lookup
+	}
+	s.logger.LogInfo("GenerateSignals [%s]: VPVR Stat: %s", data.AssetPair, vpvrStat)
+
+	// Now use order book for predictive price (find support below current)
+	bookAnalysis := PerformOrderBookAnalysis(data.BrokerOrderBook, 1.0, 10, 1.5) // depth 1%, window 10, spike 1.5x
+	recommendedPrice := data.ProvidersData[0].CurrentPrice - atr                 // Start search below current by 1 ATR for dip
+	if len(bookAnalysis.SupportLevels) > 0 {
+		// Sort supports descending price (highest first for closest support)
+		sort.Slice(bookAnalysis.SupportLevels, func(i, j int) bool {
+			return bookAnalysis.SupportLevels[i].PriceLevel > bookAnalysis.SupportLevels[j].PriceLevel
+		})
+		// Check for VPVR alignment and prioritize
+		for _, level := range bookAnalysis.SupportLevels {
+			for _, vpvrPrice := range vpvrLevels {
+				if math.Abs(level.PriceLevel-vpvrPrice)/vpvrPrice < 0.02 { // Within 2%
+					recommendedPrice = level.PriceLevel // Prioritize aligned
+					s.logger.LogInfo("[%s]: Book support %.2f aligns with VPVR %.2f; using it.", data.AssetPair, level.PriceLevel, vpvrPrice)
+					break
+				}
+			}
+			if recommendedPrice != data.ProvidersData[0].CurrentPrice-atr {
+				break
+			} // Found aligned or use first book
+			recommendedPrice = bookAnalysis.SupportLevels[0].PriceLevel // Use strongest support if no alignment
+		}
+		s.logger.LogInfo("GenerateSignals [%s]: Found book support at %.2f", data.AssetPair, recommendedPrice)
 	}
 
 	// 3. Use ATR to calculate a dynamic position size and stop-loss
@@ -158,6 +189,34 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 		StopLossPrice:    stopLossPrice,
 	})
 
+	// New: Predictive orders if consensus failed but book is strong
+	if !isBuy && bookAnalysis.DepthScore > cfg.Trading.MinBookConfidenceForPredictive { // e.g., >0.7 buy pressure
+		s.logger.LogInfo("GenerateSignals [%s]: Consensus failed, but strong book (%f). Placing predictive buy.", data.AssetPair, bookAnalysis.DepthScore)
+		if len(bookAnalysis.SupportLevels) == 0 {
+			return nil, nil
+		}
+		// Sort and place small limits at top supports
+		sort.Slice(bookAnalysis.SupportLevels, func(i, j int) bool {
+			return bookAnalysis.SupportLevels[i].PriceLevel > bookAnalysis.SupportLevels[j].PriceLevel
+		})
+		signals = []StrategySignal{}
+		baseSize := cfg.Trading.BaseOrderSize * cfg.Trading.PredictiveOrderSizePercent                 // Small size
+		topLevels := bookAnalysis.SupportLevels[:utilities.MinInt(3, len(bookAnalysis.SupportLevels))] // Place at top 3
+		for i, level := range topLevels {
+			signals = append(signals, StrategySignal{
+				AssetPair:        data.AssetPair,
+				Direction:        "predictive_buy",
+				Confidence:       (1.0 + bookAnalysis.DepthScore) / 2.0,
+				Reason:           fmt.Sprintf("Predictive: Strong book support at %.2f", level.PriceLevel),
+				GeneratedAt:      time.Now(),
+				FearGreedIndex:   data.FearGreedIndex.Value,
+				RecommendedPrice: level.PriceLevel,
+				CalculatedSize:   baseSize / float64(i+1), // Smaller for deeper levels
+				StopLossPrice:    level.PriceLevel - atr*2.0,
+			})
+		}
+		return signals, nil
+	}
 	return signals, nil
 }
 

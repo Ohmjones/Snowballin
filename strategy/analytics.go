@@ -84,6 +84,14 @@ func PerformOrderBookAnalysis(orderBook broker.OrderBookData, depthPercent float
 	// 2. Identify significant support and resistance levels.
 	support, resistance := FindSignificantLevels(orderBook, windowSize, spikeMultiplier)
 
+	// Add sorting: Support descending price (highest/closest first), Resistance ascending (lowest/closest first)
+	sort.Slice(support, func(i, j int) bool {
+		return support[i].PriceLevel > support[j].PriceLevel
+	})
+	sort.Slice(resistance, func(i, j int) bool {
+		return resistance[i].PriceLevel < resistance[j].PriceLevel
+	})
+
 	// 3. Return the combined analysis.
 	return OrderBookAnalysis{
 		DepthScore:       depthScore,

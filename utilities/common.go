@@ -297,6 +297,14 @@ type LoggingConfig struct {
 	CompressBackups bool   `mapstructure:"compress_backups"`
 }
 
+// minInt returns the minimum of two integers.
+func MinInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // MultiTFConfig holds settings for multi-timeframe analysis.
 type MultiTFConfig struct {
 	BaseTimeframe        string   `mapstructure:"base_timeframe"`
@@ -378,11 +386,13 @@ type TradingConfig struct {
 	PriceDeviationToOpenSafetyOrders float64 `mapstructure:"price_deviation_to_open_safety_orders"`
 
 	// Profit Taking and Risk Management
-	TakeProfitPercentage    float64 `mapstructure:"take_profit_percentage"`
-	TrailingStopEnabled     bool    `mapstructure:"trailing_stop_enabled"`
-	TrailingStopDeviation   float64 `mapstructure:"trailing_stop_deviation"` // Make sure this was added in step 1
-	StopLossEnabled         bool    `mapstructure:"stop_loss_enabled"`
-	RecalculateAfterDcaFill bool    `mapstructure:"recalculate_after_dca_fill"`
+	TakeProfitPercentage           float64 `mapstructure:"take_profit_percentage"`
+	TrailingStopEnabled            bool    `mapstructure:"trailing_stop_enabled"`
+	TrailingStopDeviation          float64 `mapstructure:"trailing_stop_deviation"` // Make sure this was added in step 1
+	StopLossEnabled                bool    `mapstructure:"stop_loss_enabled"`
+	RecalculateAfterDcaFill        bool    `mapstructure:"recalculate_after_dca_fill"`
+	MinBookConfidenceForPredictive float64 `mapstructure:"min_book_confidence_for_predictive"`
+	PredictiveOrderSizePercent     float64 `mapstructure:"predictive_order_size_percent"`
 }
 
 // WithdrawalConfig holds settings for automated withdrawal of funds.

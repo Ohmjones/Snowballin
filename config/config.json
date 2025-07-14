@@ -86,7 +86,10 @@
     "safety_order_volume_scale": 1.5,
     "take_profit_percentage": 0.025,
     "stop_loss_enabled": false,
-    "recalculate_after_dca_fill": true
+    "recalculate_after_dca_fill": true,
+    "use_order_book_for_predictive": true,
+    "predictive_order_size_percent": 0.2,
+    "min_book_confidence_for_predictive": 0.7
   },
   "indicators": {
     "rsi_period": 14,
