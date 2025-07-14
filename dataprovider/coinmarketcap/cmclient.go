@@ -282,6 +282,17 @@ func (c *Client) refreshCoinIDMapIfNeeded(ctx context.Context, force bool) error
 }
 
 func (c *Client) GetCoinID(ctx context.Context, commonAssetSymbol string) (string, error) {
+	// --- START OF FIX ---
+	// Step 1: Check for a manual override first.
+	if c.cfg.SymbolOverrides != nil {
+		if id, ok := c.cfg.SymbolOverrides[strings.ToUpper(commonAssetSymbol)]; ok {
+			c.logger.LogDebug("GetCoinID: Using manual override for %s -> %s", commonAssetSymbol, id)
+			return id, nil
+		}
+	}
+	// --- END OF FIX ---
+
+	// Step 2: If no override, proceed with the normal lookup.
 	if err := c.refreshCoinIDMapIfNeeded(ctx, false); err != nil {
 		c.logger.LogWarn("CMC GetCoinID: Non-critical error refreshing ID map: %v", err)
 	}

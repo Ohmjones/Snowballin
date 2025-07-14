@@ -96,17 +96,18 @@ type CoingeckoConfig struct {
 
 // CoinmarketcapConfig holds settings for the CoinMarketCap data provider.
 type CoinmarketcapConfig struct {
-	BaseURL                   string `mapstructure:"base_url"`
-	APIKey                    string `mapstructure:"api_key"`
-	QuoteCurrency             string `mapstructure:"quote_currency"`
-	RequestTimeoutSec         int    `mapstructure:"request_timeout_sec"`
-	MaxRetries                int    `mapstructure:"max_retries"`
-	RetryDelaySec             int    `mapstructure:"retry_delay_sec"`
-	OHLCVDaysDefault          int    `mapstructure:"ohlcv_days_default"`
-	IDMapRefreshIntervalHours int    `mapstructure:"id_map_refresh_interval_hours"`
-	RateLimitPerSec           int    `mapstructure:"rate_limit_per_sec"`
-	RateLimitBurst            int    `mapstructure:"rate_limit_burst"`
-	CacheBasePath             string `mapstructure:"cache_base_path"`
+	BaseURL                   string            `mapstructure:"base_url"`
+	APIKey                    string            `mapstructure:"api_key"`
+	SymbolOverrides           map[string]string `mapstructure:"symbol_overrides"`
+	QuoteCurrency             string            `mapstructure:"quote_currency"`
+	RequestTimeoutSec         int               `mapstructure:"request_timeout_sec"`
+	MaxRetries                int               `mapstructure:"max_retries"`
+	RetryDelaySec             int               `mapstructure:"retry_delay_sec"`
+	OHLCVDaysDefault          int               `mapstructure:"ohlcv_days_default"`
+	IDMapRefreshIntervalHours int               `mapstructure:"id_map_refresh_interval_hours"`
+	RateLimitPerSec           int               `mapstructure:"rate_limit_per_sec"`
+	RateLimitBurst            int               `mapstructure:"rate_limit_burst"`
+	CacheBasePath             string            `mapstructure:"cache_base_path"`
 }
 
 // ConsensusConfig defines how different signals are weighted to reach a trading decision.

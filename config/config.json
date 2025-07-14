@@ -36,6 +36,11 @@
   "coinmarketcap": {
     "base_url": "https://pro-api.coinmarketcap.com",
     "api_key": "YOUR_CMC_PRO_API_KEY_IF_USING",
+    "symbol_overrides": {
+      "BTC": "1",
+      "ETH": "1027",
+      "SOL": "5426"
+    },
     "quote_currency": "USD",
     "request_timeout_sec": 10,
     "max_retries": 3,

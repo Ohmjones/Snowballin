@@ -21,7 +21,7 @@ const banner = `
   /_______  /___|  /\____/ \/\_/  |___  (____  /____/____/__|___|  /
           \/     \/                   \/     \/                  \/ 
 
-	Follow: @Ohmsecurities   -- A Hacker's Crypto DCA Bot'
+	Follow: @Ohmsecurities   -- A Hacker's Crypto DCA Bot
 []=========================================================================[]
 `
 
