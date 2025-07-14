@@ -182,6 +182,9 @@ func NewClient(appCfg *utils.AppConfig, logger *utils.Logger, sqliteCache *datap
 		}
 	}()
 
+	// --- DEBUGGING LINE ADDED HERE ---
+	logger.LogInfo("CoinMarketCap client initialized with symbol overrides: %v", cfg.SymbolOverrides)
+
 	logger.LogInfo("CoinMarketCap client initialized.")
 	return client, nil
 }
