@@ -839,17 +839,12 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 
 func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair string, signals []strategy.StrategySignal, consolidatedData *strategy.ConsolidatedMarketPicture) {
 	for _, sig := range signals {
-		if sig.Direction == "buy" || sig.Direction == "predictive_buy" {
-			state.logger.LogInfo("SeekEntry [%s]: %s signal confirmed. Placing order.", assetPair, strings.ToUpper(sig.Direction))
+		if sig.Direction == "buy" {
+			state.logger.LogInfo("SeekEntry [%s]: BUY signal confirmed. Placing order.", assetPair)
 
 			// --- FIX: Corrected mainSignal to sig ---
 			orderPrice := sig.RecommendedPrice
 			orderSizeInBase := sig.CalculatedSize
-
-			// If predictive, use smaller size
-			if sig.Direction == "predictive_buy" {
-				orderSizeInBase *= state.config.Trading.PredictiveOrderSizePercent
-			}
 
 			if orderSizeInBase <= 0 {
 				state.logger.LogWarn("SeekEntry [%s]: Calculated size is zero. Falling back to fixed base order size from config.", assetPair)
@@ -874,26 +869,6 @@ func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair st
 			}
 			// Once a buy order is placed for an asset, we stop checking for other signals for it in this cycle.
 			break
-		}
-	}
-	// Handle multiple predictive signals (ladder orders)
-	if len(signals) > 1 {
-		for _, sig := range signals[1:] {
-			if sig.Direction == "predictive_buy" {
-				// Place additional small limits
-				orderPrice := sig.RecommendedPrice
-				orderSizeInBase := sig.CalculatedSize
-				orderID, placeErr := state.broker.PlaceOrder(ctx, assetPair, "buy", "limit", orderSizeInBase, orderPrice, 0, "")
-				if placeErr != nil {
-					state.logger.LogError("SeekEntry [%s]: Predictive ladder order failed: %v", assetPair, placeErr)
-				} else {
-					state.logger.LogInfo("SeekEntry [%s]: Placed predictive ladder order ID %s at %.2f.", assetPair, orderID, orderPrice)
-					state.stateMutex.Lock()
-					state.pendingOrders[orderID] = assetPair
-					_ = state.cache.SavePendingOrder(orderID, assetPair)
-					state.stateMutex.Unlock()
-				}
-			}
 		}
 	}
 }
@@ -927,9 +902,6 @@ func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair 
 	var krakenBaseBars []utilities.OHLCVBar
 	baseBarsFound := false
 
-	// Fetch OHLCV data from all providers for each timeframe
-	var allBarsByTF = make(map[string]map[string][]utilities.OHLCVBar)
-	// Handle Kraken separately since it's a Broker, not a DataProvider
 	for idx, tfString := range allTFs {
 		if idx >= len(tfCfg.TFLookbackLengths) {
 			break
@@ -940,15 +912,13 @@ func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair 
 			state.logger.LogError("gatherConsolidatedData [%s]: bad interval %s: %v", assetPair, tfString, intervalErr)
 			continue
 		}
-		bars, err := state.broker.GetLastNOHLCVBars(ctx, assetPair, krakenInterval, lookback)
-		if err != nil {
-			state.logger.LogWarn("gatherConsolidatedData [%s]: kraken could not get OHLCV for %s: %v", assetPair, tfString, err)
+
+		bars, barsErr := state.broker.GetLastNOHLCVBars(ctx, assetPair, krakenInterval, lookback)
+		if barsErr != nil {
+			state.logger.LogError("gatherConsolidatedData [%s]: could not get OHLCV for %s: %v", assetPair, tfString, barsErr)
 			continue
 		}
-		if _, ok := allBarsByTF[tfString]; !ok {
-			allBarsByTF[tfString] = make(map[string][]utilities.OHLCVBar)
-		}
-		allBarsByTF[tfString]["kraken"] = bars
+		consolidatedData.PrimaryOHLCVByTF[tfString] = bars
 		if tfString == tfCfg.BaseTimeframe {
 			krakenBaseBars = bars
 			if len(bars) > 0 {
@@ -957,87 +927,10 @@ func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair 
 		}
 	}
 
-	// Now handle external DataProviders (CoinGecko, CoinMarketCap)
-	for _, provider := range state.activeDPs {
-		providerName := state.providerNames[provider]
-		baseAssetSymbol := strings.Split(assetPair, "/")[0]
-		coinID, idErr := provider.GetCoinID(ctx, baseAssetSymbol)
-		if idErr != nil {
-			state.logger.LogWarn("gatherConsolidatedData [%s]: %s GetCoinID failed: %v", assetPair, providerName, idErr)
-			continue
-		}
-		for idx, tfString := range allTFs {
-			if idx >= len(tfCfg.TFLookbackLengths) {
-				break
-			}
-			var bars []utilities.OHLCVBar
-			var err error
-			bars, err = provider.GetOHLCVHistorical(ctx, coinID, state.config.Trading.QuoteCurrency, tfString)
-			if err != nil {
-				state.logger.LogWarn("gatherConsolidatedData [%s]: %s could not get OHLCV for %s: %v", assetPair, providerName, tfString, err)
-				continue
-			}
-			if _, ok := allBarsByTF[tfString]; !ok {
-				allBarsByTF[tfString] = make(map[string][]utilities.OHLCVBar)
-			}
-			allBarsByTF[tfString][providerName] = bars
-		}
-	}
-
 	if !baseBarsFound {
 		return nil, errors.New("could not fetch base timeframe OHLCV data from broker")
 	}
 
-	// Weighted consolidation of OHLCV bars using actual timestamps
-	for tfString, providersData := range allBarsByTF {
-		var consolidatedBars []utilities.OHLCVBar
-		// Collect all unique timestamps across providers
-		timestampMap := make(map[int64]bool)
-		for _, bars := range providersData {
-			for _, bar := range bars {
-				timestampMap[bar.Timestamp] = true
-			}
-		}
-		var allTimestamps []int64
-		for ts := range timestampMap {
-			allTimestamps = append(allTimestamps, ts)
-		}
-		sort.Slice(allTimestamps, func(i, j int) bool { return allTimestamps[i] < allTimestamps[j] })
-
-		for _, timestamp := range allTimestamps {
-			var open, close, volume float64
-			var high, low float64 = -1, math.MaxFloat64
-			totalWeight := 0.0
-			for provider, bars := range providersData {
-				weight := state.config.DataProviderWeights[provider]
-				for _, bar := range bars {
-					if bar.Timestamp == timestamp {
-						open += bar.Open * weight
-						close += bar.Close * weight
-						volume += bar.Volume * weight
-						high = math.Max(high, bar.High)
-						low = math.Min(low, bar.Low)
-						totalWeight += weight
-						break
-					}
-				}
-			}
-			if totalWeight > 0 {
-				consolidatedBars = append(consolidatedBars, utilities.OHLCVBar{
-					Timestamp: timestamp,
-					Open:      open / totalWeight,
-					High:      high,
-					Low:       low,
-					Close:     close / totalWeight,
-					Volume:    volume / totalWeight,
-				})
-			}
-		}
-		consolidatedData.PrimaryOHLCVByTF[tfString] = consolidatedBars
-		state.logger.LogInfo("gatherConsolidatedData [%s]: Consolidated %d bars for %s from %d providers", assetPair, len(consolidatedBars), tfString, len(providersData))
-	}
-
-	// Populate ProvidersData with current prices and OHLCV bars
 	consolidatedData.ProvidersData = append(consolidatedData.ProvidersData, strategy.ProviderData{
 		Name: "kraken", Weight: state.config.DataProviderWeights["kraken"],
 		CurrentPrice: krakenTicker.LastPrice, OHLCVBars: krakenBaseBars,
@@ -1053,10 +946,12 @@ func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair 
 		}
 		extMarketData, mdErr := dp.GetMarketData(ctx, []string{providerCoinID}, state.config.Trading.QuoteCurrency)
 		var extOHLCVBars []utilities.OHLCVBar
-		var ohlcvErr error
-		extOHLCVBars, ohlcvErr = dp.GetOHLCVHistorical(ctx, providerCoinID, state.config.Trading.QuoteCurrency, tfCfg.BaseTimeframe)
-		if ohlcvErr != nil {
-			state.logger.LogWarn("gatherConsolidatedData [%s]: %s GetOHLCVHistorical failed: %v", assetPair, providerName, ohlcvErr)
+		if providerName == "coingecko" {
+			var ohlcvErr error
+			extOHLCVBars, ohlcvErr = dp.GetOHLCVHistorical(ctx, providerCoinID, state.config.Trading.QuoteCurrency, tfCfg.BaseTimeframe)
+			if ohlcvErr != nil {
+				state.logger.LogWarn("gatherConsolidatedData [%s]: %s GetOHLCVHistorical failed: %v", assetPair, providerName, ohlcvErr)
+			}
 		}
 		var currentPrice float64
 		if mdErr == nil && len(extMarketData) > 0 {
