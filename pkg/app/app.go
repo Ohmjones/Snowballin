@@ -1005,17 +1005,18 @@ func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair 
 		sort.Slice(allTimestamps, func(i, j int) bool { return allTimestamps[i] < allTimestamps[j] })
 
 		for _, timestamp := range allTimestamps {
-			var open, high, low, close, volume float64
+			var open, close, volume float64
+			var high, low float64 = -1, math.MaxFloat64
 			totalWeight := 0.0
 			for provider, bars := range providersData {
 				weight := state.config.DataProviderWeights[provider]
 				for _, bar := range bars {
 					if bar.Timestamp == timestamp {
 						open += bar.Open * weight
-						high = math.Max(high, bar.High)
-						low = math.Min(low, bar.Low)
 						close += bar.Close * weight
 						volume += bar.Volume * weight
+						high = math.Max(high, bar.High)
+						low = math.Min(low, bar.Low)
 						totalWeight += weight
 						break
 					}
