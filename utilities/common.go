@@ -58,7 +58,7 @@ type AppConfig struct {
 	DataCompleteness    DataCompletenessConfig `mapstructure:"data_completeness"`
 	DataProviderWeights map[string]float64     `mapstructure:"dataprovider_weights"`
 	DataDiscrepancy     DataDiscrepancyConfig  `mapstructure:"data_discrepancy"`
-	DB                  DatabaseConfig         `mapstructure:"db"`
+	DB                  DatabaseConfig         `mapstructure:"database"`
 	Discord             DiscordConfig          `mapstructure:"discord"`
 	ExitStrategy        ExitStrategyConfig     `mapstructure:"exit_strategy"`
 	FearGreed           *FearGreedConfig       `mapstructure:"FearGreed"`

@@ -1,43 +1,55 @@
-// File: dataprovider/db.go
 package dataprovider
 
 import (
 	"Snowballin/utilities"
 	"database/sql"
 	"fmt"
-	_ "github.com/mattn/go-sqlite3"
-	"log"
-	"os"
 	"path/filepath"
 	"time"
+
+	_ "github.com/mattn/go-sqlite3" // SQLite driver
+	"os"
 )
 
+// SQLiteCache now includes the application's logger for consistent logging.
 type SQLiteCache struct {
-	db *sql.DB
+	db     *sql.DB
+	logger *utilities.Logger
 }
 
-func NewSQLiteCache(dbPath utilities.DatabaseConfig) (*SQLiteCache, error) {
-	dir := filepath.Dir(dbPath.DBPath)
+// NewSQLiteCache now accepts a logger and uses it for all output.
+func NewSQLiteCache(cfg utilities.DatabaseConfig, logger *utilities.Logger) (*SQLiteCache, error) {
+	if logger == nil {
+		return nil, fmt.Errorf("logger cannot be nil")
+	}
+
+	dir := filepath.Dir(cfg.DBPath)
 	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
+		logger.LogError("Failed to create database directory '%s': %v", dir, err)
 		return nil, fmt.Errorf("failed to create database directory '%s': %w", dir, err)
 	}
+	logger.LogDebug("Database directory '%s' exists or was created.", dir)
 
-	// --- FIX: Log the absolute path for clarity ---
-	absPath, err := filepath.Abs(dbPath.DBPath)
-	if err != nil {
-		log.Printf("Could not determine absolute path for database: %v", err)
-		absPath = dbPath.DBPath // fallback to original path
-	}
-	log.Printf("Initializing SQLite database at: %s", absPath)
-	// --- End of FIX ---
+	absPath, _ := filepath.Abs(cfg.DBPath)
+	logger.LogInfo("Initializing SQLite database at: %s", absPath)
 
-	db, err := sql.Open("sqlite3", dbPath.DBPath)
+	// Open the database connection. The file will be created if it doesn't exist.
+	db, err := sql.Open("sqlite3", cfg.DBPath+"?_journal_mode=WAL")
 	if err != nil {
-		return nil, err
+		logger.LogError("Failed to open sqlite database at %s: %v", absPath, err)
+		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
 	}
-	return &SQLiteCache{db: db}, nil
+
+	// Ping the database to verify the connection.
+	if err := db.Ping(); err != nil {
+		logger.LogError("Failed to connect to the database: %v", err)
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	return &SQLiteCache{db: db, logger: logger}, nil
 }
 
+// InitSchema creates the database tables if they do not already exist.
 func (s *SQLiteCache) InitSchema() error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS ohlcv_bars (
@@ -75,9 +87,10 @@ func (s *SQLiteCache) InitSchema() error {
 	);
 	`
 	if _, err := s.db.Exec(schema); err != nil {
+		s.logger.LogError("Failed to execute database schema: %v", err)
 		return fmt.Errorf("failed to execute database schema: %w", err)
 	}
-	log.Println("Database schema initialized successfully.")
+	s.logger.LogInfo("Database schema initialized successfully.")
 	return nil
 }
 
@@ -145,7 +158,6 @@ func (s *SQLiteCache) LoadPositions() (map[string]*utilities.Position, error) {
 	return positions, nil
 }
 
-// --- MODIFIED: The entire SavePosition function is corrected ---
 func (s *SQLiteCache) SavePosition(pos *utilities.Position) error {
 	query := `INSERT OR REPLACE INTO open_positions (asset_pair, entry_timestamp, average_price, total_volume, base_order_price, filled_safety_orders, is_dca_active, base_order_size, current_take_profit, broker_order_id, is_trailing_active, peak_price_since_tp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
@@ -171,7 +183,10 @@ func (s *SQLiteCache) SavePosition(pos *utilities.Position) error {
 		pos.BrokerOrderID,
 		isTrailingActiveInt,
 		pos.PeakPriceSinceTP,
-	) // Corrected: removed misplaced '}' and added ')'
+	)
+	if err != nil {
+		s.logger.LogError("Failed to save position for %s: %v", pos.AssetPair, err)
+	}
 	return err
 }
 
@@ -220,20 +235,21 @@ func (s *SQLiteCache) Close() error {
 
 func (s *SQLiteCache) StartScheduledCleanup(interval time.Duration, provider string) {
 	go func() {
+		// Add a small initial delay to avoid running immediately at startup
 		time.Sleep(2 * time.Minute)
 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
 		for {
-			select {
-			case <-ticker.C:
-				cutoff := time.Now().AddDate(0, 0, -180)
-				if err := s.CleanupOldBars(provider, cutoff); err != nil {
-					log.Printf("Scheduled cleanup error for %s: %v", provider, err)
-				} else {
-					log.Printf("Scheduled cleanup successful for %s", provider)
-				}
+			// In a real application, a context would be used for graceful shutdown
+			<-ticker.C
+			cutoff := time.Now().AddDate(0, 0, -180) // Cleanup data older than 180 days
+			s.logger.LogInfo("Running scheduled DB cleanup for provider: %s", provider)
+			if err := s.CleanupOldBars(provider, cutoff); err != nil {
+				s.logger.LogError("Scheduled cleanup error for %s: %v", provider, err)
+			} else {
+				s.logger.LogDebug("Scheduled cleanup successful for %s", provider)
 			}
 		}
 	}()

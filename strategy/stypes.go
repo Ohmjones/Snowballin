@@ -61,6 +61,7 @@ type ProviderData struct {
 	Weight       float64
 	CurrentPrice float64
 	OHLCVBars    []utilities.OHLCVBar
+	OHLCVByTF    map[string][]utilities.OHLCVBar
 }
 
 // ConsolidatedMarketPicture brings together all data points for a single asset at a moment in time.

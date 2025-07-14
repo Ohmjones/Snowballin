@@ -98,8 +98,9 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 
 	logger.LogInfo("AppRun: Starting pre-flight checks...")
 
-	sqliteCache, err := dataprovider.NewSQLiteCache(cfg.DB)
+	sqliteCache, err := dataprovider.NewSQLiteCache(cfg.DB, logger)
 	if err != nil {
+		// The error will now be detailed and logged by NewSQLiteCache itself.
 		return fmt.Errorf("pre-flight check failed: sqlite cache init failed: %w", err)
 	}
 	defer sqliteCache.Close()
@@ -872,8 +873,8 @@ func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair st
 		}
 	}
 }
-
 func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair string, currentPortfolioValue float64) (*strategy.ConsolidatedMarketPicture, error) {
+	// --- 1. Initialize the data container ---
 	state.stateMutex.RLock()
 	consolidatedData := &strategy.ConsolidatedMarketPicture{
 		AssetPair:          assetPair,
@@ -886,84 +887,99 @@ func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair 
 	}
 	state.stateMutex.RUnlock()
 
+	// --- 2. Fetch primary data from the broker (Kraken) ---
+	// Ticker for the most recent price.
 	krakenTicker, tickerErr := state.broker.GetTicker(ctx, assetPair)
 	if tickerErr != nil {
-		state.logger.LogWarn("gatherConsolidatedData [%s]: could not get ticker: %v", assetPair, tickerErr)
+		// Log as a warning because other providers might have the price.
+		state.logger.LogWarn("gatherConsolidatedData [%s]: could not get ticker from broker: %v", assetPair, tickerErr)
 	}
 
+	// Order book for liquidity analysis.
 	krakenOrderBook, obErr := state.broker.GetOrderBook(ctx, assetPair, 20)
 	if obErr != nil {
-		state.logger.LogWarn("gatherConsolidatedData [%s]: could not get order book: %v", assetPair, obErr)
+		state.logger.LogWarn("gatherConsolidatedData [%s]: could not get order book from broker: %v", assetPair, obErr)
 	}
 	consolidatedData.BrokerOrderBook = krakenOrderBook
 
+	// --- 3. Fetch all required OHLCV timeframes from the broker ---
 	tfCfg := state.config.Consensus.MultiTimeframe
 	allTFs := append([]string{tfCfg.BaseTimeframe}, tfCfg.AdditionalTimeframes...)
-	var krakenBaseBars []utilities.OHLCVBar
-	baseBarsFound := false
 
 	for idx, tfString := range allTFs {
 		if idx >= len(tfCfg.TFLookbackLengths) {
+			state.logger.LogWarn("gatherConsolidatedData [%s]: Mismatch between timeframes and lookback lengths in config. Stopping fetch.", assetPair)
 			break
 		}
 		lookback := tfCfg.TFLookbackLengths[idx]
 		krakenInterval, intervalErr := utilities.ConvertTFToKrakenInterval(tfString)
 		if intervalErr != nil {
-			state.logger.LogError("gatherConsolidatedData [%s]: bad interval %s: %v", assetPair, tfString, intervalErr)
+			state.logger.LogError("gatherConsolidatedData [%s]: Invalid interval '%s' for broker: %v", assetPair, tfString, intervalErr)
 			continue
 		}
 
 		bars, barsErr := state.broker.GetLastNOHLCVBars(ctx, assetPair, krakenInterval, lookback)
 		if barsErr != nil {
-			state.logger.LogError("gatherConsolidatedData [%s]: could not get OHLCV for %s: %v", assetPair, tfString, barsErr)
-			continue
+			state.logger.LogError("gatherConsolidatedData [%s]: Broker failed to provide OHLCV for %s: %v", assetPair, tfString, barsErr)
+			continue // Skip this timeframe if it fails
 		}
+		// This map holds the data from the primary source (the broker).
 		consolidatedData.PrimaryOHLCVByTF[tfString] = bars
-		if tfString == tfCfg.BaseTimeframe {
-			krakenBaseBars = bars
-			if len(bars) > 0 {
-				baseBarsFound = true
-			}
-		}
 	}
 
-	if !baseBarsFound {
-		return nil, errors.New("could not fetch base timeframe OHLCV data from broker")
+	// --- 4. Verify we have the essential base timeframe data from the broker ---
+	if _, ok := consolidatedData.PrimaryOHLCVByTF[tfCfg.BaseTimeframe]; !ok {
+		return nil, errors.New("could not fetch base timeframe OHLCV data from broker; cannot proceed")
 	}
 
+	// --- 5. Add the broker's complete data to the list of providers ---
+	// This uses the new `OHLCVByTF` map field in the ProviderData struct.
 	consolidatedData.ProvidersData = append(consolidatedData.ProvidersData, strategy.ProviderData{
-		Name: "kraken", Weight: state.config.DataProviderWeights["kraken"],
-		CurrentPrice: krakenTicker.LastPrice, OHLCVBars: krakenBaseBars,
+		Name:         "kraken",
+		Weight:       state.config.DataProviderWeights["kraken"],
+		CurrentPrice: krakenTicker.LastPrice,
+		OHLCVByTF:    consolidatedData.PrimaryOHLCVByTF,
 	})
 
+	// --- 6. Fetch data from all other active external providers (CoinGecko, CoinMarketCap, etc.) ---
 	baseAssetSymbol := strings.Split(assetPair, "/")[0]
 	for _, dp := range state.activeDPs {
 		providerName := state.providerNames[dp]
 		providerCoinID, idErr := dp.GetCoinID(ctx, baseAssetSymbol)
 		if idErr != nil {
-			state.logger.LogError("gatherConsolidatedData [%s]: could not get %s ID: %v", assetPair, providerName, idErr)
+			state.logger.LogError("gatherConsolidatedData [%s]: Could not get coin ID for provider %s: %v", assetPair, providerName, idErr)
 			continue
 		}
+
+		// Get the current price from this provider.
 		extMarketData, mdErr := dp.GetMarketData(ctx, []string{providerCoinID}, state.config.Trading.QuoteCurrency)
-		var extOHLCVBars []utilities.OHLCVBar
-		if providerName == "coingecko" {
-			var ohlcvErr error
-			extOHLCVBars, ohlcvErr = dp.GetOHLCVHistorical(ctx, providerCoinID, state.config.Trading.QuoteCurrency, tfCfg.BaseTimeframe)
-			if ohlcvErr != nil {
-				state.logger.LogWarn("gatherConsolidatedData [%s]: %s GetOHLCVHistorical failed: %v", assetPair, providerName, ohlcvErr)
-			}
-		}
 		var currentPrice float64
 		if mdErr == nil && len(extMarketData) > 0 {
 			currentPrice = extMarketData[0].CurrentPrice
 		} else if mdErr != nil {
-			state.logger.LogWarn("gatherConsolidatedData [%s]: %s GetMarketData failed: %v", assetPair, providerName, mdErr)
+			state.logger.LogWarn("gatherConsolidatedData [%s]: Provider %s failed to get market data: %v", assetPair, providerName, mdErr)
 		}
+
+		// **THE FIX**: For each external provider, fetch all configured timeframes.
+		extOHLCVByTF := make(map[string][]utilities.OHLCVBar)
+		for _, tfString := range allTFs {
+			bars, ohlcvErr := dp.GetOHLCVHistorical(ctx, providerCoinID, state.config.Trading.QuoteCurrency, tfString)
+			if ohlcvErr != nil {
+				state.logger.LogWarn("gatherConsolidatedData [%s]: Provider %s failed to get OHLCV for %s: %v", assetPair, providerName, tfString, ohlcvErr)
+				continue // Skip this timeframe, but try the next one
+			}
+			extOHLCVByTF[tfString] = bars
+		}
+
+		// Add this provider's complete data to the list.
 		consolidatedData.ProvidersData = append(consolidatedData.ProvidersData, strategy.ProviderData{
-			Name: providerName, Weight: state.config.DataProviderWeights[providerName],
-			CurrentPrice: currentPrice, OHLCVBars: extOHLCVBars,
+			Name:         providerName,
+			Weight:       state.config.DataProviderWeights[providerName],
+			CurrentPrice: currentPrice,
+			OHLCVByTF:    extOHLCVByTF,
 		})
 	}
+
 	return consolidatedData, nil
 }
 
