@@ -394,6 +394,7 @@ type TradingConfig struct {
 	RecalculateAfterDcaFill        bool    `mapstructure:"recalculate_after_dca_fill"`
 	MinBookConfidenceForPredictive float64 `mapstructure:"min_book_confidence_for_predictive"`
 	PredictiveOrderSizePercent     float64 `mapstructure:"predictive_order_size_percent"`
+	DustThresholdUSD               float64 `mapstructure:"dust_threshold_usd"`
 }
 
 // WithdrawalConfig holds settings for automated withdrawal of funds.

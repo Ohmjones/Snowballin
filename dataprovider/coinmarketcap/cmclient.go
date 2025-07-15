@@ -624,8 +624,23 @@ func getBestSourceInterval(userInterval string) string {
 
 // resampleBars converts bars from a source interval to a target interval.
 func resampleBars(sourceBars []utils.OHLCVBar, targetIntervalStr string, logger *utils.Logger) ([]utils.OHLCVBar, error) {
+	// --- FIX: Manually handle the "w" for week suffix ---
+	// The time.ParseDuration function doesn't understand "w", so we convert it to hours.
+	if strings.HasSuffix(targetIntervalStr, "w") {
+		weeksStr := strings.TrimSuffix(targetIntervalStr, "w")
+		weeks, err := strconv.Atoi(weeksStr)
+		if err != nil {
+			// This case is unlikely but good to have for safety.
+			return nil, fmt.Errorf("invalid week format in interval: %s", targetIntervalStr)
+		}
+		hours := weeks * 7 * 24
+		targetIntervalStr = fmt.Sprintf("%dh", hours) // e.g., "1w" becomes "168h"
+	}
+	// --- END OF FIX ---
+
 	targetDuration, err := time.ParseDuration(targetIntervalStr)
 	if err != nil {
+		// This error should no longer occur for "1w".
 		return nil, fmt.Errorf("invalid target interval format: %s", targetIntervalStr)
 	}
 

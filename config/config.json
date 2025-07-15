@@ -94,7 +94,8 @@
     "recalculate_after_dca_fill": true,
     "use_order_book_for_predictive": true,
     "predictive_order_size_percent": 0.2,
-    "min_book_confidence_for_predictive": 0.6
+    "min_book_confidence_for_predictive": 0.6,
+    "dust_threshold_usd": 1.0
   },
   "indicators": {
     "rsi_period": 14,
@@ -107,7 +108,6 @@
     "atr_period": 14,
     "volume_spike_factor": 2.0,
     "volume_lookback_period": 10,
-
     "liquidity_hunt": {
       "min_wick_percent": 60.0,
       "vol_spike_multiplier": 1.8,

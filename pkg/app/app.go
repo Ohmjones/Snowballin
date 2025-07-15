@@ -421,28 +421,20 @@ func processTradingCycle(ctx context.Context, state *TradingState) {
 	processPendingOrders(ctx, state)
 	reapStaleOrders(ctx, state)
 
-	// =========================================================================================
-	// ==                            CORE LOGIC MODIFICATION START                            ==
-	// =========================================================================================
 	for _, assetPair := range state.config.Trading.AssetPairs {
-		// Step 1: ALWAYS gather data for the asset pair.
 		consolidatedData, err := gatherConsolidatedData(ctx, state, assetPair, currentPortfolioValue)
 		if err != nil {
 			state.logger.LogError("Cycle [%s]: Failed to gather consolidated data: %v", assetPair, err)
-			continue // Skip this pair for this cycle if data is unavailable.
+			continue
 		}
 
-		// Step 2: ALWAYS generate the main entry/hold/exit signals based on the data.
 		stratInstance := strategy.NewStrategy(state.logger)
 		signals, _ := stratInstance.GenerateSignals(ctx, *consolidatedData, *state.config)
 
-		// Step 3: Log the generated signal for visibility, fulfilling the user's requirement.
-		// This block ensures a signal is logged for every asset, every cycle.
 		if len(signals) > 0 && signals[0].Direction != "hold" {
 			mainSignal := signals[0]
 			state.logger.LogInfo("GenerateSignals: %s -> %s - Reason: %s", assetPair, strings.ToUpper(mainSignal.Direction), mainSignal.Reason)
 		} else {
-			// Log a hold or no-signal state for clarity in logs.
 			holdReason := "Conditions for buy/sell not met."
 			if len(signals) > 0 {
 				holdReason = signals[0].Reason
@@ -450,24 +442,43 @@ func processTradingCycle(ctx context.Context, state *TradingState) {
 			state.logger.LogInfo("GenerateSignals: %s -> HOLD - Reason: %s", assetPair, holdReason)
 		}
 
-		// Step 4: Get the current position state for the asset pair.
 		state.stateMutex.RLock()
 		position, hasPosition := state.openPositions[assetPair]
 		state.stateMutex.RUnlock()
 
-		// Step 5: Based on whether a position exists, pass the generated signals and data
-		// to the appropriate handling function.
+		// --- DUST LOGIC FIX ---
+		isEffectivelyDust := false
 		if hasPosition {
-			// A position exists. Manage it using the latest market data AND the new signals.
+			var currentPrice float64
+			for _, pData := range consolidatedData.ProvidersData {
+				if pData.Name == "kraken" {
+					currentPrice = pData.CurrentPrice
+					break
+				}
+			}
+
+			if currentPrice > 0 {
+				positionValueUSD := position.TotalVolume * currentPrice
+				dustThreshold := 1.0 // Default to $1 if not set in config
+				if state.config.Trading.DustThresholdUSD > 0 {
+					dustThreshold = state.config.Trading.DustThresholdUSD
+				}
+				if positionValueUSD < dustThreshold {
+					isEffectivelyDust = true
+					state.logger.LogInfo("Position for %s is considered dust (value: $%.4f). Allowing new entry check.", assetPair, positionValueUSD)
+				}
+			}
+		}
+
+		// If a position exists AND it's not dust, manage it.
+		// Otherwise, seek a new entry.
+		if hasPosition && !isEffectivelyDust {
 			manageOpenPosition(ctx, state, position, signals, consolidatedData)
 		} else {
-			// No position exists. Look for a BUY signal among the generated signals to open one.
 			seekEntryOpportunity(ctx, state, assetPair, signals, consolidatedData)
 		}
+		// --- END OF DUST LOGIC FIX ---
 	}
-	// =======================================================================================
-	// ==                             CORE LOGIC MODIFICATION END                             ==
-	// =======================================================================================
 }
 
 func reapStaleOrders(ctx context.Context, state *TradingState) {
