@@ -365,36 +365,33 @@ type PreflightConfig struct {
 	PrimingDays         int  `mapstructure:"priming_days"`
 }
 
-// TradingConfig holds general trading parameters, updated for the new DCA strategy.
+// TradingConfig holds general trading parameters.
 type TradingConfig struct {
-	AssetPairs                   []string `mapstructure:"asset_pairs"`
-	QuoteCurrency                string   `mapstructure:"quote_currency"`
-	MaxPortfolioDrawdown         float64  `mapstructure:"max_portfolio_drawdown"`
-	PortfolioRiskPerTrade        float64  `mapstructure:"portfolio_risk_per_trade"`
-	TakeProfitPartialSellPercent float64  `mapstructure:"take_profit_partial_sell_percent"`
-
-	// --- ADDED: Fields for ATR Spacing Mode ---
-	DcaSpacingMode          string  `mapstructure:"dca_spacing_mode"` // "percentage" or "atr"
-	DcaAtrPeriod            int     `mapstructure:"dca_atr_period"`
-	DcaAtrSpacingMultiplier float64 `mapstructure:"dca_atr_spacing_multiplier"`
-
-	// Martingale DCA Parameters (now for percentage mode)
-	BaseOrderSize                    float64 `mapstructure:"base_order_size"`
-	SafetyOrderSize                  float64 `mapstructure:"safety_order_size"`
-	MaxSafetyOrders                  int     `mapstructure:"max_safety_orders"`
-	SafetyOrderVolumeScale           float64 `mapstructure:"safety_order_volume_scale"`
-	SafetyOrderStepScale             float64 `mapstructure:"safety_order_step_scale"`
-	PriceDeviationToOpenSafetyOrders float64 `mapstructure:"price_deviation_to_open_safety_orders"`
-
-	// Profit Taking and Risk Management
-	TakeProfitPercentage           float64 `mapstructure:"take_profit_percentage"`
-	TrailingStopEnabled            bool    `mapstructure:"trailing_stop_enabled"`
-	TrailingStopDeviation          float64 `mapstructure:"trailing_stop_deviation"` // Make sure this was added in step 1
-	StopLossEnabled                bool    `mapstructure:"stop_loss_enabled"`
-	RecalculateAfterDcaFill        bool    `mapstructure:"recalculate_after_dca_fill"`
-	MinBookConfidenceForPredictive float64 `mapstructure:"min_book_confidence_for_predictive"`
-	PredictiveOrderSizePercent     float64 `mapstructure:"predictive_order_size_percent"`
-	DustThresholdUSD               float64 `mapstructure:"dust_threshold_usd"`
+	AssetPairs                       []string `mapstructure:"asset_pairs"`
+	QuoteCurrency                    string   `mapstructure:"quote_currency"`
+	MaxPortfolioDrawdown             float64  `mapstructure:"max_portfolio_drawdown"`
+	PortfolioRiskPerTrade            float64  `mapstructure:"portfolio_risk_per_trade"`
+	TakeProfitPartialSellPercent     float64  `mapstructure:"take_profit_partial_sell_percent"`
+	DustThresholdUSD                 float64  `mapstructure:"dust_threshold_usd"`
+	TrailingStopDeviation            float64  `mapstructure:"trailing_stop_deviation"`
+	UseOrderBookForPredictive        bool     `mapstructure:"use_order_book_for_predictive"`
+	PredictiveOrderSizePercent       float64  `mapstructure:"predictive_order_size_percent"` // This will be deprecated by the new logic
+	MinBookConfidenceForPredictive   float64  `mapstructure:"min_book_confidence_for_predictive"`
+	DcaSpacingMode                   string   `mapstructure:"dca_spacing_mode"`
+	DcaAtrPeriod                     int      `mapstructure:"dca_atr_period"`
+	DcaAtrSpacingMultiplier          float64  `mapstructure:"dca_atr_spacing_multiplier"`
+	BaseOrderSize                    float64  `mapstructure:"base_order_size"`
+	SafetyOrderSize                  float64  `mapstructure:"safety_order_size"`
+	MaxSafetyOrders                  int      `mapstructure:"max_safety_orders"`
+	SafetyOrderVolumeScale           float64  `mapstructure:"safety_order_volume_scale"`
+	SafetyOrderStepScale             float64  `mapstructure:"safety_order_step_scale"`
+	PriceDeviationToOpenSafetyOrders float64  `mapstructure:"price_deviation_to_open_safety_orders"`
+	TakeProfitPercentage             float64  `mapstructure:"take_profit_percentage"`
+	TrailingStopEnabled              bool     `mapstructure:"trailing_stop_enabled"`
+	StopLossEnabled                  bool     `mapstructure:"stop_loss_enabled"`
+	RecalculateAfterDcaFill          bool     `mapstructure:"recalculate_after_dca_fill"`
+	UseMartingaleForPredictive       bool     `mapstructure:"use_martingale_for_predictive"`
+	PredictiveBuyDeviationPercent    float64  `mapstructure:"predictive_buy_deviation_percent"`
 }
 
 // WithdrawalConfig holds settings for automated withdrawal of funds.

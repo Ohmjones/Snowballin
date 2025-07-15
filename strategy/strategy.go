@@ -136,39 +136,26 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 	// Perform Multi-Timeframe Consensus check
 	isBuy, reason := s.checkMultiTimeframeConsensus(data, cfg)
 
-	// --- PREDICTIVE BUY LOGIC (RESTORED) ---
-	// This block checks for strong order book support to place small orders,
-	// even if the main multi-timeframe consensus check fails.
+	// --- NEW PREDICTIVE BUY LOGIC ---
+	// If consensus is not a "buy", check for a predictive opportunity based on order book strength.
 	bookAnalysis := PerformOrderBookAnalysis(data.BrokerOrderBook, 1.0, 10, 1.5)
 	if !isBuy && bookAnalysis.DepthScore > cfg.Trading.MinBookConfidenceForPredictive {
-		s.logger.LogInfo("GenerateSignals [%s]: Consensus failed, but strong book (%f). Placing predictive buy.", data.AssetPair, bookAnalysis.DepthScore)
-		if len(bookAnalysis.SupportLevels) == 0 {
-			return nil, nil
-		}
-		sort.Slice(bookAnalysis.SupportLevels, func(i, j int) bool {
-			return bookAnalysis.SupportLevels[i].PriceLevel > bookAnalysis.SupportLevels[j].PriceLevel
-		})
+		// Check if the new unified Martingale logic is enabled in the config.
+		if cfg.Trading.UseMartingaleForPredictive {
+			s.logger.LogInfo("GenerateSignals [%s]: Consensus failed, but strong book (%f). Signaling for predictive buy.", data.AssetPair, bookAnalysis.DepthScore)
 
-		signals := []StrategySignal{}
-		baseSize := cfg.Trading.BaseOrderSize * cfg.Trading.PredictiveOrderSizePercent
-		topLevels := bookAnalysis.SupportLevels[:utilities.MinInt(3, len(bookAnalysis.SupportLevels))]
-
-		for i, level := range topLevels {
-			signals = append(signals, StrategySignal{
-				AssetPair:        data.AssetPair,
+			// The strategy now just signals the *intent* to make a predictive buy.
+			// The app.go logic will handle the Martingale sizing and price deviation.
+			predictiveSignal := StrategySignal{
 				Direction:        "predictive_buy",
-				Confidence:       (1.0 + bookAnalysis.DepthScore) / 2.0,
-				Reason:           fmt.Sprintf("Predictive: Strong book support at %.2f", level.PriceLevel),
-				GeneratedAt:      time.Now(),
-				FearGreedIndex:   data.FearGreedIndex.Value,
-				RecommendedPrice: level.PriceLevel,
-				CalculatedSize:   baseSize / float64(i+1),
-				StopLossPrice:    level.PriceLevel - atr*2.0,
-			})
+				Reason:           fmt.Sprintf("Predictive: Strong book support (Confidence: %.2f)", bookAnalysis.DepthScore),
+				RecommendedPrice: bookAnalysis.SupportLevels[0].PriceLevel, // Recommend the strongest support price.
+				CalculatedSize:   0,                                        // DEFER size calculation to the main app logic to enforce Martingale rules.
+			}
+			return []StrategySignal{predictiveSignal}, nil
 		}
-		return signals, nil
 	}
-	// --- END OF PREDICTIVE BUY LOGIC ---
+	// --- END OF NEW PREDICTIVE BUY LOGIC ---
 
 	if !isBuy {
 		s.logger.LogInfo("GenerateSignals: %s -> %s - Reason: %s",
@@ -203,6 +190,7 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 
 	currentPrice := data.ProvidersData[0].CurrentPrice
 	recommendedPrice := FindBestLimitPrice(data.BrokerOrderBook, currentPrice-atr, 1.0)
+	// For a standard buy, we still calculate the size here based on portfolio risk.
 	calculatedSize := AdjustPositionSize(data.PortfolioValue, atr, cfg.Trading.PortfolioRiskPerTrade)
 	stopLossPrice := VolatilityAdjustedOrderPrice(recommendedPrice, atr, 2.0, true)
 	orderBookConfidence := AnalyzeOrderBookDepth(data.BrokerOrderBook, 1.0)

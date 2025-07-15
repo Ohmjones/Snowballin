@@ -96,7 +96,9 @@
     "use_order_book_for_predictive": true,
     "predictive_order_size_percent": 0.2,
     "min_book_confidence_for_predictive": 0.6,
-    "dust_threshold_usd": 1.0
+    "dust_threshold_usd": 1.0,
+    "use_martingale_for_predictive": true,
+    "predictive_buy_deviation_percent": 0.5
   },
   "indicators": {
     "rsi_period": 14,
