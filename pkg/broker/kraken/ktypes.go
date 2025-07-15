@@ -146,3 +146,17 @@ type KrakenTradeInfo struct {
 	Net            string  `json:"net,omitempty"`
 	TradeID        string  // Map key from TradesHistory result
 }
+
+// TradeVolumeResponse parses the top-level response from the TradeVolume endpoint.
+type TradeVolumeResponse struct {
+	Error  []string          `json:"error"`
+	Result TradeVolumeResult `json:"result"`
+}
+
+// TradeVolumeResult contains the core data, including the separate fee structures for maker and taker.
+type TradeVolumeResult struct {
+	Currency  string                       `json:"currency"`
+	Volume    string                       `json:"volume"`
+	Fees      map[string]KrakenFeeTierInfo `json:"fees"`
+	FeesMaker map[string]KrakenFeeTierInfo `json:"fees_maker"`
+}

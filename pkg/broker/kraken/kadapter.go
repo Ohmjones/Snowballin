@@ -439,3 +439,49 @@ func (a *Adapter) GetTicker(ctx context.Context, pair string) (broker.TickerData
 
 	return a.client.ParseTicker(tickerInfo, pair), nil
 }
+
+// GetTradeFees fetches the user's current maker and taker fee percentages for a given asset pair.
+// It queries the TradeVolume endpoint and returns the fee for the current tier as a decimal (e.g., 0.0016 for 0.16%).
+func (a *Adapter) GetTradeFees(ctx context.Context, commonPair string) (makerFee float64, takerFee float64, err error) {
+	krakenPair, err := a.client.GetPrimaryKrakenPairName(ctx, commonPair)
+	if err != nil {
+		return 0, 0, fmt.Errorf("GetTradeFees: failed to get Kraken pair name for %s: %w", commonPair, err)
+	}
+
+	params := url.Values{
+		"pair":     {krakenPair},
+		"fee-info": {"true"},
+	}
+
+	// This calls the specific client method that queries the TradeVolume endpoint.
+	tradeVolumeResult, err := a.client.QueryTradeVolumeAPI(ctx, params)
+	if err != nil {
+		return 0, 0, fmt.Errorf("GetTradeFees: client API call failed: %w", err)
+	}
+
+	// Correctly parse TAKER fees from the "fees" object.
+	if feeInfo, ok := tradeVolumeResult.Fees[krakenPair]; ok {
+		parsedFee, parseErr := strconv.ParseFloat(feeInfo.Fee, 64)
+		if parseErr != nil {
+			return 0, 0, fmt.Errorf("GetTradeFees: could not parse taker fee '%s': %w", feeInfo.Fee, parseErr)
+		}
+		takerFee = parsedFee / 100.0 // Convert from percentage (e.g., 0.26) to decimal (0.0026)
+	} else {
+		return 0, 0, fmt.Errorf("GetTradeFees: no taker fee info found for pair %s in API response", krakenPair)
+	}
+
+	// Correctly parse MAKER fees from the "fees_maker" object.
+	if feeInfo, ok := tradeVolumeResult.FeesMaker[krakenPair]; ok {
+		parsedFee, parseErr := strconv.ParseFloat(feeInfo.Fee, 64)
+		if parseErr != nil {
+			return 0, 0, fmt.Errorf("GetTradeFees: could not parse maker fee '%s': %w", feeInfo.Fee, parseErr)
+		}
+		makerFee = parsedFee / 100.0 // Convert from percentage (e.g., 0.16) to decimal (0.0016)
+	} else {
+		// Fallback for older accounts that might not have a separate fees_maker tier.
+		a.logger.LogWarn("GetTradeFees: no maker-specific fee info for %s, falling back to using taker fee for both.", krakenPair)
+		makerFee = takerFee
+	}
+
+	return makerFee, takerFee, nil
+}

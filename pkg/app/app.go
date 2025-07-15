@@ -37,6 +37,9 @@ type TradingState struct {
 	pendingOrders           map[string]string // Maps orderID to assetPair
 	stateMutex              sync.RWMutex
 	isCircuitBreakerTripped bool
+	// --- ADDED: Store live fee rates in the trading state ---
+	makerFeeRate float64
+	takerFeeRate float64
 }
 
 var (
@@ -148,6 +151,23 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 	if err := krakenAdapter.RefreshAssetInfo(ctx); err != nil {
 		return fmt.Errorf("pre-flight check failed: could not refresh broker asset info: %w", err)
 	}
+
+	// --- ADDED: Fetch fees on startup ---
+	logger.LogInfo("AppRun: Fetching account fee schedule from Kraken...")
+	var makerFee, takerFee float64
+	var feeErr error
+	if len(cfg.Trading.AssetPairs) > 0 {
+		// The GetTradeFees method is on the broker interface, which krakenAdapter implements.
+		makerFee, takerFee, feeErr = krakenAdapter.GetTradeFees(ctx, cfg.Trading.AssetPairs[0])
+		if feeErr != nil {
+			logger.LogFatal("Could not fetch trading fees from Kraken, which is critical for profitability calculations. Halting. Error: %v", feeErr)
+		}
+		logger.LogInfo("AppRun: Successfully fetched fees. Maker: %.4f%%, Taker: %.4f%%", makerFee*100, takerFee*100)
+	} else {
+		return errors.New("cannot run without at least one asset pair to determine fees")
+	}
+	// --- END ADDED ---
+
 	initialPortfolioValue, portfolioErr := krakenAdapter.GetAccountValue(ctx, cfg.Trading.QuoteCurrency)
 	if portfolioErr != nil {
 		return fmt.Errorf("pre-flight check failed: could not get account value from broker. Check API keys and permissions: %w", portfolioErr)
@@ -244,7 +264,8 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 
 	// --- [THE FIX] This entire reconciliation block is rewritten for robustness. ---
 	logger.LogInfo("Reconciliation: Verifying consistency between database state and exchange balances...")
-	tempStateForRecon := &TradingState{broker: krakenAdapter, logger: logger, config: cfg}
+	// --- MODIFIED: Pass the fetched fees into the temporary state for reconstruction ---
+	tempStateForRecon := &TradingState{broker: krakenAdapter, logger: logger, config: cfg, makerFeeRate: makerFee, takerFeeRate: takerFee}
 
 	// 1. Get ALL balances from the exchange.
 	allBalances, err := krakenAdapter.GetAllBalances(ctx)
@@ -300,7 +321,34 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 		openPositions:           loadedPositions,
 		pendingOrders:           loadedPendingOrders,
 		isCircuitBreakerTripped: false,
+		// --- ADDED: Store fees in the main state ---
+		makerFeeRate: makerFee,
+		takerFeeRate: takerFee,
 	}
+
+	// --- ADDED: Goroutine to refresh fees periodically ---
+	go func() {
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				logger.LogInfo("AppRun: Refreshing Kraken fee schedule...")
+				newMaker, newTaker, err := state.broker.GetTradeFees(ctx, state.config.Trading.AssetPairs[0])
+				if err != nil {
+					logger.LogError("Failed to refresh trading fees: %v", err)
+				} else {
+					state.stateMutex.Lock()
+					state.makerFeeRate = newMaker
+					state.takerFeeRate = newTaker
+					state.stateMutex.Unlock()
+					logger.LogInfo("AppRun: Successfully refreshed fees. New Maker: %.4f%%, New Taker: %.4f%%", newMaker*100, newTaker*100)
+				}
+			}
+		}
+	}()
 
 	loopInterval := time.Duration(cfg.Orders.WatcherIntervalSec) * time.Second
 	ticker := time.NewTicker(loopInterval)
@@ -322,7 +370,7 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 	ninetyDaysAgo := time.Now().Add(-90 * 24 * time.Hour)
 	tradeHistory, err := state.broker.GetTrades(ctx, assetPair, ninetyDaysAgo)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get trade history for %s: %w", assetPair, err)
+		return nil, fmt.Errorf("failed to get trade history for %s: %w", err)
 	}
 
 	if len(tradeHistory) == 0 {
@@ -354,12 +402,16 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 		return nil, fmt.Errorf("found trade history for %s, but could not isolate a sequence of buys for the current balance of %f", assetPair, actualBalance)
 	}
 
-	var totalCost float64
+	// --- MODIFIED: Track total cost and fees separately for perfect accuracy ---
+	var totalCost, totalFees float64
 	baseOrderTrade := positionTrades[0]
 
 	for _, trade := range positionTrades {
 		totalCost += trade.Cost
+		totalFees += trade.Fee
 	}
+	// --- ADDED: Calculate the true total cost including fees ---
+	totalTrueBuyCost := totalCost + totalFees
 
 	finalVolume := actualBalance
 	if finalVolume <= tolerance {
@@ -371,7 +423,7 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 	reconstructedPosition := &utilities.Position{
 		AssetPair:          assetPair,
 		EntryTimestamp:     baseOrderTrade.Timestamp,
-		AveragePrice:       totalCost / accumulatedVolume,
+		AveragePrice:       totalCost / accumulatedVolume, // Average price remains fee-exclusive
 		TotalVolume:        finalVolume,
 		BaseOrderPrice:     baseOrderTrade.Price,
 		BaseOrderSize:      baseOrderTrade.Cost,
@@ -379,10 +431,12 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 		IsDcaActive:        true,
 		BrokerOrderID:      baseOrderTrade.OrderID,
 	}
-	reconstructedPosition.CurrentTakeProfit = reconstructedPosition.AveragePrice * (1 + state.config.Trading.TakeProfitPercentage)
+	// --- MODIFIED: Use the new fee-aware calculator with the exact historical cost ---
+	reconstructedPosition.CurrentTakeProfit = calculateFeeAwareTakeProfitPrice(reconstructedPosition, state, totalTrueBuyCost)
 
-	state.logger.LogInfo("Reconstruction SUCCESS for %s. Avg Price: %.2f, Volume: %.8f (matches exchange), SOs Filled: %d",
-		assetPair, reconstructedPosition.AveragePrice, reconstructedPosition.TotalVolume, reconstructedPosition.FilledSafetyOrders)
+	// --- MODIFIED: Improved log message for clarity ---
+	state.logger.LogInfo("Reconstruction SUCCESS for %s. Avg Price: %.2f, Vol: %.8f, SOs: %d, Fee-Aware TP: %.2f",
+		assetPair, reconstructedPosition.AveragePrice, reconstructedPosition.TotalVolume, reconstructedPosition.FilledSafetyOrders, reconstructedPosition.CurrentTakeProfit)
 
 	return reconstructedPosition, nil
 }
@@ -533,7 +587,8 @@ func updatePositionFromFill(state *TradingState, order broker.Order, assetPair s
 				BrokerOrderID:      order.ID,
 				BaseOrderSize:      baseOrderSizeInQuote,
 			}
-			newPosition.CurrentTakeProfit = newPosition.AveragePrice * (1 + state.config.Trading.TakeProfitPercentage)
+			// --- MODIFIED: Use the new fee-aware calculator for a new position ---
+			newPosition.CurrentTakeProfit = calculateFeeAwareTakeProfitPrice(newPosition, state, 0)
 			state.openPositions[assetPair] = newPosition
 			state.discordClient.NotifyOrderFilled(order, fmt.Sprintf("✅ New Position Opened (Base Order)\nTP: %.2f", newPosition.CurrentTakeProfit))
 			if err := state.cache.SavePosition(newPosition); err != nil {
@@ -547,7 +602,8 @@ func updatePositionFromFill(state *TradingState, order broker.Order, assetPair s
 			position.TotalVolume += newVolume
 			position.AveragePrice = ((oldAvgPrice * oldVolume) + (newPrice * newVolume)) / position.TotalVolume
 			position.FilledSafetyOrders++
-			position.CurrentTakeProfit = position.AveragePrice * (1 + state.config.Trading.TakeProfitPercentage)
+			// --- MODIFIED: Use the new fee-aware calculator for a DCA fill ---
+			position.CurrentTakeProfit = calculateFeeAwareTakeProfitPrice(position, state, 0)
 			position.IsDcaActive = true
 			state.openPositions[assetPair] = position
 			state.discordClient.NotifyOrderFilled(order, fmt.Sprintf("⤵️ Safety Order #%d Filled\nNew Avg Price: %.2f\nNew TP: %.2f", position.FilledSafetyOrders, position.AveragePrice, position.CurrentTakeProfit))
@@ -558,9 +614,13 @@ func updatePositionFromFill(state *TradingState, order broker.Order, assetPair s
 	} else { // Sell order
 		if pos, ok := state.openPositions[assetPair]; ok {
 			if math.Abs(pos.TotalVolume-order.ExecutedVol) < 1e-8 {
-				profit := (order.Price - pos.AveragePrice) * pos.TotalVolume
-				profitPercent := ((order.Price - pos.AveragePrice) / pos.AveragePrice) * 100
-				state.discordClient.NotifyOrderFilled(order, fmt.Sprintf("💰 Position Closed\nProfit: %.2f %s (%.2f%%)", profit, state.config.Trading.QuoteCurrency, profitPercent))
+				// --- MODIFIED: Calculate true profit using actual cost and fees ---
+				// Note: This is for reporting only. The decision to sell was already made based on the fee-aware TP price.
+				totalBuyCost := (pos.AveragePrice * pos.TotalVolume) * (1 + state.makerFeeRate)
+				netProceeds := (order.Cost) * (1 - state.takerFeeRate)
+				profit := netProceeds - totalBuyCost
+				profitPercent := (profit / totalBuyCost) * 100
+				state.discordClient.NotifyOrderFilled(order, fmt.Sprintf("💰 Position Closed\nNet Profit: %.2f %s (%.2f%%)", profit, state.config.Trading.QuoteCurrency, profitPercent))
 				delete(state.openPositions, assetPair)
 				_ = state.cache.DeletePosition(assetPair)
 			} else {
@@ -1105,4 +1165,26 @@ func liquidateAllPositions(ctx context.Context, state *TradingState, reason stri
 			}
 		}
 	}
+}
+
+// --- NEW FUNCTION: Calculates the take-profit price including all fees ---
+// It uses the actual historical total cost for reconstructed positions, or estimates for live fills.
+func calculateFeeAwareTakeProfitPrice(pos *utilities.Position, state *TradingState, totalBuyCostWithFees float64) float64 {
+	targetProfitRate := state.config.Trading.TakeProfitPercentage / 100.0
+
+	// If totalBuyCostWithFees is not provided (i.e., for a live order), we estimate it using the live maker fee rate.
+	// We assume all our limit buys are maker orders.
+	if totalBuyCostWithFees == 0 {
+		totalBuyCostWithFees = (pos.AveragePrice * pos.TotalVolume) * (1 + state.makerFeeRate)
+	}
+
+	// To be profitable, the proceeds from the sale (after the taker fee) must exceed the total buy cost.
+	// Formula: SellPrice * Volume * (1 - TakerFee) > TotalBuyCost
+	// Therefore, the break-even price is: TotalBuyCost / (Volume * (1 - TakerFee))
+	breakEvenPrice := totalBuyCostWithFees / (pos.TotalVolume * (1 - state.takerFeeRate))
+
+	// The final target price adds the desired profit margin to the break-even price.
+	finalTargetPrice := breakEvenPrice * (1 + targetProfitRate)
+
+	return finalTargetPrice
 }

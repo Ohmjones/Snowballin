@@ -43,6 +43,8 @@ type Broker interface {
 
 	// RefreshAssetInfo ensures that the adapter's underlying client has the latest asset and pair information.
 	RefreshAssetInfo(ctx context.Context) error // <<< NEW METHOD (from 1.d alternative)
+
+	GetTradeFees(ctx context.Context, commonPair string) (makerFee float64, takerFee float64, err error)
 }
 
 type OHLCVBar struct { // Duplicating from utilities for now to avoid import cycle if pkg/broker cannot import utilities

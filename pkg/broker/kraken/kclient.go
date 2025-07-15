@@ -655,3 +655,14 @@ func (c *Client) callPublic(ctx context.Context, path string, params url.Values,
 
 	return utilities.DoJSONRequest(c.HTTPClient, req, 2, 2*time.Second, target)
 }
+
+func (c *Client) QueryTradeVolumeAPI(ctx context.Context, params url.Values) (*TradeVolumeResult, error) {
+	var resp TradeVolumeResponse
+	if err := c.callPrivate(ctx, "/0/private/TradeVolume", params, &resp); err != nil {
+		return nil, fmt.Errorf("QueryTradeVolumeAPI: callPrivate failed: %w", err)
+	}
+	if len(resp.Error) > 0 {
+		return nil, fmt.Errorf("QueryTradeVolumeAPI: API error: %s", strings.Join(resp.Error, ", "))
+	}
+	return &resp.Result, nil
+}
