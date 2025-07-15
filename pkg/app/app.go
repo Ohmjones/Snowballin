@@ -724,7 +724,7 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 				state.logger.LogInfo("ManagePosition [%s]: Placed add-on order ID %s at %.2f.", pos.AssetPair, orderID, orderPrice)
 				baseAsset := strings.Split(pos.AssetPair, "/")[0]
 				quoteAsset := strings.Split(pos.AssetPair, "/")[1]
-				message := fmt.Sprintf("🧠 **Placing Limit Buy Order**\n**Pair:** %s\n**Size:** `%.4f %s`\n**Price:** `%.2f %s`\n**Reason:** %s",
+				message := fmt.Sprintf("🧠 **Placing Limit Buy Order**\n**Pair:** %s\n**Size:** `%.4f %s`\n**Price:** `%.2f %s`\n**Reason:** %s\n",
 					pos.AssetPair, orderSizeInBase, baseAsset, orderPrice, quoteAsset, sig.Reason)
 				state.discordClient.SendMessage(message)
 				state.stateMutex.Lock()
