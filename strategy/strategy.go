@@ -4,7 +4,6 @@ import (
 	"Snowballin/utilities"
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 )
@@ -136,31 +135,32 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 	// Perform Multi-Timeframe Consensus check
 	isBuy, reason := s.checkMultiTimeframeConsensus(data, cfg)
 
-	// --- NEW PREDICTIVE BUY LOGIC ---
-	// If consensus is not a "buy", check for a predictive opportunity based on order book strength.
+	// --- PREDICTIVE BUY LOGIC WITH PANIC FIX ---
 	bookAnalysis := PerformOrderBookAnalysis(data.BrokerOrderBook, 1.0, 10, 1.5)
 	if !isBuy && bookAnalysis.DepthScore > cfg.Trading.MinBookConfidenceForPredictive {
 		if cfg.Trading.UseMartingaleForPredictive {
 			s.logger.LogInfo("GenerateSignals [%s]: Consensus failed, but strong book (%f). Signaling for predictive buy.", data.AssetPair, bookAnalysis.DepthScore)
 
 			// --- THIS IS THE FIX ---
-			// Ensure that at least one support level was actually found before proceeding.
-			if len(bookAnalysis.SupportLevels) == 0 {
+			// A high DepthScore can exist even with no single strong support level.
+			// We must explicitly check if the SupportLevels slice is nil or has a length of zero before trying to access it.
+			if bookAnalysis.SupportLevels == nil || len(bookAnalysis.SupportLevels) == 0 {
 				s.logger.LogWarn("GenerateSignals [%s]: Predictive buy triggered, but no concrete support levels were found in the order book.", data.AssetPair)
 				return nil, nil // Return no signal to prevent a panic.
 			}
 			// --- END OF FIX ---
 
+			// By passing the check above, it is now safe to access SupportLevels[0].
 			predictiveSignal := StrategySignal{
 				Direction:        "predictive_buy",
 				Reason:           fmt.Sprintf("Predictive: Strong book support (Confidence: %.2f)", bookAnalysis.DepthScore),
-				RecommendedPrice: bookAnalysis.SupportLevels[0].PriceLevel, // Now this line is safe.
-				CalculatedSize:   0,                                        // Defer size calculation.
+				RecommendedPrice: bookAnalysis.SupportLevels[0].PriceLevel,
+				CalculatedSize:   0, // Defer size calculation.
 			}
 			return []StrategySignal{predictiveSignal}, nil
 		}
 	}
-	// --- END OF NEW PREDICTIVE BUY LOGIC ---
+	// --- END OF PREDICTIVE BUY LOGIC ---
 
 	if !isBuy {
 		s.logger.LogInfo("GenerateSignals: %s -> %s - Reason: %s",
@@ -184,15 +184,6 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 	s.logger.LogInfo("GenerateSignals [%s]: Final confirmation PASSED. Reason: %s. Generating signal.", data.AssetPair, confirmationReason)
 
 	var signals []StrategySignal
-	vpvr := CalculateVPVR(primaryBars, 20)
-	vpvrLevels := []float64{}
-	if len(vpvr) > 0 {
-		for _, entry := range vpvr {
-			vpvrLevels = append(vpvrLevels, entry.PriceLevel)
-		}
-		sort.Float64s(vpvrLevels)
-	}
-
 	currentPrice := data.ProvidersData[0].CurrentPrice
 	recommendedPrice := FindBestLimitPrice(data.BrokerOrderBook, currentPrice-atr, 1.0)
 	// For a standard buy, we still calculate the size here based on portfolio risk.
