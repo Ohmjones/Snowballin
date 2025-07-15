@@ -868,14 +868,13 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 }
 func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair string, signals []strategy.StrategySignal, consolidatedData *strategy.ConsolidatedMarketPicture) {
 	for _, sig := range signals {
-		// Check for both standard "buy" and the new "predictive_buy" signals.
-		if sig.Direction == "buy" || sig.Direction == "predictive_buy" {
+		// --- FIX: Use strings.EqualFold for case-insensitive comparison ---
+		if strings.EqualFold(sig.Direction, "buy") || strings.EqualFold(sig.Direction, "predictive_buy") {
 			state.logger.LogInfo("SeekEntry [%s]: %s signal confirmed. Calculating order...", assetPair, strings.ToUpper(sig.Direction))
 
 			var orderPrice float64
 			var orderSizeInBase float64
 
-			// Get the current price from the broker data for calculations.
 			var currentPrice float64
 			for _, pData := range consolidatedData.ProvidersData {
 				if pData.Name == "kraken" {
@@ -888,32 +887,46 @@ func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair st
 				continue
 			}
 
-			// --- UNIFIED MARTINGALE LOGIC ---
-			if sig.Direction == "predictive_buy" && state.config.Trading.UseMartingaleForPredictive {
+			// --- CORRECTED SIZING LOGIC ---
+			if strings.EqualFold(sig.Direction, "buy") {
+				// This is a high-conviction CONSENSUS buy.
+				orderPrice = sig.RecommendedPrice
+				// Use the risk-calculated size from the strategy signal as the base.
+				orderSizeInBase = sig.CalculatedSize
+				// Apply the multiplier if it's set in the config.
+				if state.config.Trading.ConsensusBuyMultiplier > 1.0 {
+					orderSizeInBase *= state.config.Trading.ConsensusBuyMultiplier
+					state.logger.LogInfo("SeekEntry [%s]: Applying x%.2f multiplier to consensus buy. New size: %.4f", assetPair, state.config.Trading.ConsensusBuyMultiplier, orderSizeInBase)
+				}
+			} else { // This is a "predictive_buy"
 				// For predictive buys, place the order at a discount to the current price.
 				deviation := state.config.Trading.PredictiveBuyDeviationPercent / 100.0
 				orderPrice = currentPrice * (1 - deviation)
-				// Use the standard Martingale base order size.
+				// Use the standard Martingale base order size, ignoring any multipliers.
 				orderSizeInBase = state.config.Trading.BaseOrderSize / orderPrice
 				state.logger.LogInfo("SeekEntry [%s]: Predictive buy will be placed at %.2f (%.2f%% below current price).", assetPair, orderPrice, state.config.Trading.PredictiveBuyDeviationPercent)
-			} else {
-				// For standard "buy" signals, use the recommended price from the strategy.
-				orderPrice = sig.RecommendedPrice
-				orderSizeInBase = state.config.Trading.BaseOrderSize / orderPrice
 			}
-			// --- END OF UNIFIED LOGIC ---
+			// --- END OF CORRECTED SIZING LOGIC ---
 
 			if orderSizeInBase <= 0 || orderPrice <= 0 {
 				state.logger.LogError("SeekEntry [%s]: Invalid order parameters (size=%.4f, price=%.2f). Aborting.", assetPair, orderSizeInBase, orderPrice)
 				continue
 			}
 
+			// --- FIX: Removed the extra argument to match the correct function signature ---
 			orderID, placeErr := state.broker.PlaceOrder(ctx, assetPair, "buy", "limit", orderSizeInBase, orderPrice, 0, "")
 			if placeErr != nil {
 				state.logger.LogError("SeekEntry [%s]: Place order failed: %v", assetPair, placeErr)
 			} else {
 				state.logger.LogInfo("SeekEntry [%s]: Placed order ID %s at %.2f. Now tracking.", assetPair, orderID, orderPrice)
-				// ... (Discord notification logic remains the same) ...
+				// Discord notification logic for predictive buys
+				if strings.EqualFold(sig.Direction, "predictive_buy") {
+					baseAsset := strings.Split(assetPair, "/")[0]
+					quoteAsset := strings.Split(assetPair, "/")[1]
+					message := fmt.Sprintf("🧠 **Predictive Buy Order Placed**\n**Pair:** %s\n**Size:** `%.4f %s`\n**Price:** `%.2f %s`\n**Reason:** %s",
+						assetPair, orderSizeInBase, baseAsset, orderPrice, quoteAsset, sig.Reason)
+					state.discordClient.SendMessage(message)
+				}
 				state.stateMutex.Lock()
 				state.pendingOrders[orderID] = assetPair
 				_ = state.cache.SavePendingOrder(orderID, assetPair)

@@ -98,7 +98,8 @@
     "min_book_confidence_for_predictive": 0.6,
     "dust_threshold_usd": 1.0,
     "use_martingale_for_predictive": true,
-    "predictive_buy_deviation_percent": 0.5
+    "predictive_buy_deviation_percent": 0.5,
+    "consensus_buy_multiplier": 2.0
   },
   "indicators": {
     "rsi_period": 14,

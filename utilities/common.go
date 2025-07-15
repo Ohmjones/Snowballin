@@ -392,6 +392,7 @@ type TradingConfig struct {
 	RecalculateAfterDcaFill          bool     `mapstructure:"recalculate_after_dca_fill"`
 	UseMartingaleForPredictive       bool     `mapstructure:"use_martingale_for_predictive"`
 	PredictiveBuyDeviationPercent    float64  `mapstructure:"predictive_buy_deviation_percent"`
+	ConsensusBuyMultiplier           float64  `mapstructure:"consensus_buy_multiplier"`
 }
 
 // WithdrawalConfig holds settings for automated withdrawal of funds.
