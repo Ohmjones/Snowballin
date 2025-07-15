@@ -77,9 +77,6 @@ func startFNGUpdater(ctx context.Context, fearGreedProvider dataprovider.FearGre
 		}
 	}()
 }
-
-// modulateConfigBySentiment creates a temporary, modified copy of the trading config
-// based on the contrarian "be greedy when others are fearful" principle.
 func modulateConfigBySentiment(originalConfig utilities.TradingConfig, fngValue int, logger *utilities.Logger) utilities.TradingConfig {
 	// Start with a copy of the original config to avoid modifying the global state.
 	modulatedConfig := originalConfig
@@ -699,8 +696,6 @@ func processTradingCycle(ctx context.Context, state *TradingState) {
 		}
 	}
 }
-
-// [MODIFIED] The function signature is updated to accept the active AppConfig.
 func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities.Position, signals []strategy.StrategySignal, consolidatedData *strategy.ConsolidatedMarketPicture, cfg *utilities.AppConfig) {
 	state.logger.LogInfo("ManagePosition [%s]: Managing position. AvgPrice: %.2f, Vol: %.8f, SOs: %d, TP: %.2f",
 		pos.AssetPair, pos.AveragePrice, pos.TotalVolume, pos.FilledSafetyOrders, pos.CurrentTakeProfit)
@@ -729,7 +724,7 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 				state.logger.LogInfo("ManagePosition [%s]: Placed add-on order ID %s at %.2f.", pos.AssetPair, orderID, orderPrice)
 				baseAsset := strings.Split(pos.AssetPair, "/")[0]
 				quoteAsset := strings.Split(pos.AssetPair, "/")[1]
-				message := fmt.Sprintf("➕ **Adding to Position**\n**Pair:** %s\n**Size:** `%.4f %s`\n**Price:** `%.2f %s`\n**Reason:** %s",
+				message := fmt.Sprintf("🧠 **Placing Limit Buy Order**\n**Pair:** %s\n**Size:** `%.4f %s`\n**Price:** `%.2f %s`\n**Reason:** %s",
 					pos.AssetPair, orderSizeInBase, baseAsset, orderPrice, quoteAsset, sig.Reason)
 				state.discordClient.SendMessage(message)
 				state.stateMutex.Lock()
@@ -901,8 +896,6 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 		}
 	}
 }
-
-// [MODIFIED] The function signature is updated to accept the active AppConfig.
 func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair string, signals []strategy.StrategySignal, consolidatedData *strategy.ConsolidatedMarketPicture, cfg *utilities.AppConfig) {
 	for _, sig := range signals {
 		if strings.EqualFold(sig.Direction, "buy") || strings.EqualFold(sig.Direction, "predictive_buy") {
