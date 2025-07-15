@@ -77,6 +77,36 @@ func startFNGUpdater(ctx context.Context, fearGreedProvider dataprovider.FearGre
 		}
 	}()
 }
+
+// modulateConfigBySentiment creates a temporary, modified copy of the trading config
+// based on the contrarian "be greedy when others are fearful" principle.
+func modulateConfigBySentiment(originalConfig utilities.TradingConfig, fngValue int, logger *utilities.Logger) utilities.TradingConfig {
+	// Start with a copy of the original config to avoid modifying the global state.
+	modulatedConfig := originalConfig
+
+	if fngValue <= 25 { // Extreme Fear -> Time to be greedy.
+		logger.LogInfo("Sentiment Overlay: EXTREME FEAR (FNG: %d). Activating aggressive buy mode.", fngValue)
+		// Become more aggressive with buys: tighten safety order spacing and increase buy size.
+		modulatedConfig.DcaAtrSpacingMultiplier *= 0.8 // Tighten the ATR spacing by 20% to buy dips faster.
+		if originalConfig.ConsensusBuyMultiplier > 1.0 {
+			modulatedConfig.ConsensusBuyMultiplier *= 1.25 // Increase the buy size multiplier by 25%.
+		} else {
+			modulatedConfig.ConsensusBuyMultiplier = 1.25 // Set a default aggressive multiplier if none exists.
+		}
+		return modulatedConfig
+	}
+
+	if fngValue >= 75 { // Extreme Greed -> Time to be fearful (conservative).
+		logger.LogInfo("Sentiment Overlay: EXTREME GREED (FNG: %d). Activating conservative profit-taking mode.", fngValue)
+		// Take profits faster and protect gains more aggressively.
+		modulatedConfig.TakeProfitPercentage *= 0.8   // Reduce take-profit target by 20% to secure profits sooner.
+		modulatedConfig.TrailingStopDeviation *= 0.75 // Tighten the trailing stop by 25%.
+		return modulatedConfig
+	}
+
+	// Return the original, unmodified config if sentiment is neutral.
+	return originalConfig
+}
 func getCurrentFNG() dataprovider.FearGreedIndex {
 	fngMutex.RLock()
 	defer fngMutex.RUnlock()
@@ -359,123 +389,6 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 
 	return reconstructedPosition, nil
 }
-func processTradingCycle(ctx context.Context, state *TradingState) {
-	state.logger.LogInfo("-------------------- New Trading Cycle --------------------")
-
-	state.stateMutex.RLock()
-	if state.isCircuitBreakerTripped {
-		state.stateMutex.RUnlock()
-		state.logger.LogWarn("Circuit breaker is active. Halting all new trading operations. Manual restart required.")
-		return
-	}
-	state.stateMutex.RUnlock()
-
-	currentPortfolioValue, valErr := state.broker.GetAccountValue(ctx, state.config.Trading.QuoteCurrency)
-	if valErr != nil {
-		state.logger.LogError("Cycle: Could not update portfolio value: %v", valErr)
-		return
-	}
-
-	state.stateMutex.Lock()
-	if currentPortfolioValue > state.peakPortfolioValue {
-		state.peakPortfolioValue = currentPortfolioValue
-	}
-	state.stateMutex.Unlock()
-
-	if state.config.CircuitBreaker.Enabled && state.peakPortfolioValue > 0 {
-		drawdownPercent := state.config.CircuitBreaker.DrawdownThresholdPercent / 100.0
-		drawdownThresholdValue := state.peakPortfolioValue * (1.0 - drawdownPercent)
-		if currentPortfolioValue <= drawdownThresholdValue {
-			reason := fmt.Sprintf("Portfolio value (%.2f) dropped below drawdown threshold (%.2f). Max drawdown of %.2f%% from peak (%.2f) was exceeded.",
-				currentPortfolioValue, drawdownThresholdValue, state.config.CircuitBreaker.DrawdownThresholdPercent, state.peakPortfolioValue)
-			state.logger.LogWarn("CIRCUIT BREAKER: %s", reason)
-			state.stateMutex.Lock()
-			state.isCircuitBreakerTripped = true
-			state.stateMutex.Unlock()
-			liquidateAllPositions(ctx, state, reason)
-			return
-		}
-	}
-
-	if time.Since(state.lastGlobalMetricsFetch) > 30*time.Minute {
-		state.logger.LogInfo("GlobalMetrics: Fetching updated global market data...")
-		if len(state.activeDPs) > 0 {
-			provider := state.activeDPs[0]
-			globalData, err := provider.GetGlobalMarketData(ctx)
-			if err != nil {
-				state.logger.LogError("GlobalMetrics: Failed to fetch global data: %v", err)
-			} else {
-				state.stateMutex.Lock()
-				state.lastBTCDominance = globalData.BTCDominance
-				state.lastGlobalMetricsFetch = time.Now()
-				state.stateMutex.Unlock()
-				state.logger.LogInfo("GlobalMetrics: Updated BTC Dominance to: %.2f%%", globalData.BTCDominance)
-			}
-		}
-	}
-
-	processPendingOrders(ctx, state)
-	reapStaleOrders(ctx, state)
-
-	for _, assetPair := range state.config.Trading.AssetPairs {
-		consolidatedData, err := gatherConsolidatedData(ctx, state, assetPair, currentPortfolioValue)
-		if err != nil {
-			state.logger.LogError("Cycle [%s]: Failed to gather consolidated data: %v", assetPair, err)
-			continue
-		}
-
-		stratInstance := strategy.NewStrategy(state.logger)
-		signals, _ := stratInstance.GenerateSignals(ctx, *consolidatedData, *state.config)
-
-		if len(signals) > 0 && signals[0].Direction != "hold" {
-			mainSignal := signals[0]
-			state.logger.LogInfo("GenerateSignals: %s -> %s - Reason: %s", assetPair, strings.ToUpper(mainSignal.Direction), mainSignal.Reason)
-		} else {
-			holdReason := "Conditions for buy/sell not met."
-			if len(signals) > 0 {
-				holdReason = signals[0].Reason
-			}
-			state.logger.LogInfo("GenerateSignals: %s -> HOLD - Reason: %s", assetPair, holdReason)
-		}
-
-		state.stateMutex.RLock()
-		position, hasPosition := state.openPositions[assetPair]
-		state.stateMutex.RUnlock()
-
-		// --- DUST LOGIC FIX ---
-		isEffectivelyDust := false
-		if hasPosition {
-			var currentPrice float64
-			for _, pData := range consolidatedData.ProvidersData {
-				if pData.Name == "kraken" {
-					currentPrice = pData.CurrentPrice
-					break
-				}
-			}
-
-			if currentPrice > 0 {
-				positionValueUSD := position.TotalVolume * currentPrice
-				dustThreshold := 1.0 // Default to $1 if not set in config
-				if state.config.Trading.DustThresholdUSD > 0 {
-					dustThreshold = state.config.Trading.DustThresholdUSD
-				}
-				if positionValueUSD < dustThreshold {
-					isEffectivelyDust = true
-					state.logger.LogInfo("Position for %s is considered dust (value: $%.4f). Allowing new entry check.", assetPair, positionValueUSD)
-				}
-			}
-		}
-
-		// If a position exists AND it's not dust, manage it.
-		// Otherwise, seek a new entry.
-		if hasPosition && !isEffectivelyDust {
-			manageOpenPosition(ctx, state, position, signals, consolidatedData)
-		} else {
-			seekEntryOpportunity(ctx, state, assetPair, signals, consolidatedData)
-		}
-		// --- END OF DUST LOGIC FIX ---
-	}
-}
 func reapStaleOrders(ctx context.Context, state *TradingState) {
 	state.stateMutex.RLock()
 	if len(state.pendingOrders) == 0 {
@@ -662,11 +575,136 @@ func updatePositionFromFill(state *TradingState, order broker.Order, assetPair s
 		}
 	}
 }
-func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities.Position, signals []strategy.StrategySignal, consolidatedData *strategy.ConsolidatedMarketPicture) {
+func processTradingCycle(ctx context.Context, state *TradingState) {
+	state.logger.LogInfo("-------------------- New Trading Cycle --------------------")
+
+	state.stateMutex.RLock()
+	if state.isCircuitBreakerTripped {
+		state.stateMutex.RUnlock()
+		state.logger.LogWarn("Circuit breaker is active. Halting all new trading operations. Manual restart required.")
+		return
+	}
+	state.stateMutex.RUnlock()
+
+	currentPortfolioValue, valErr := state.broker.GetAccountValue(ctx, state.config.Trading.QuoteCurrency)
+	if valErr != nil {
+		state.logger.LogError("Cycle: Could not update portfolio value: %v", valErr)
+		return
+	}
+
+	state.stateMutex.Lock()
+	if currentPortfolioValue > state.peakPortfolioValue {
+		state.peakPortfolioValue = currentPortfolioValue
+	}
+	state.stateMutex.Unlock()
+
+	if state.config.CircuitBreaker.Enabled && state.peakPortfolioValue > 0 {
+		drawdownPercent := state.config.CircuitBreaker.DrawdownThresholdPercent / 100.0
+		drawdownThresholdValue := state.peakPortfolioValue * (1.0 - drawdownPercent)
+		if currentPortfolioValue <= drawdownThresholdValue {
+			reason := fmt.Sprintf("Portfolio value (%.2f) dropped below drawdown threshold (%.2f). Max drawdown of %.2f%% from peak (%.2f) was exceeded.",
+				currentPortfolioValue, drawdownThresholdValue, state.config.CircuitBreaker.DrawdownThresholdPercent, state.peakPortfolioValue)
+			state.logger.LogWarn("CIRCUIT BREAKER: %s", reason)
+			state.stateMutex.Lock()
+			state.isCircuitBreakerTripped = true
+			state.stateMutex.Unlock()
+			liquidateAllPositions(ctx, state, reason)
+			return
+		}
+	}
+
+	if time.Since(state.lastGlobalMetricsFetch) > 30*time.Minute {
+		state.logger.LogInfo("GlobalMetrics: Fetching updated global market data...")
+		if len(state.activeDPs) > 0 {
+			provider := state.activeDPs[0]
+			globalData, err := provider.GetGlobalMarketData(ctx)
+			if err != nil {
+				state.logger.LogError("GlobalMetrics: Failed to fetch global data: %v", err)
+			} else {
+				state.stateMutex.Lock()
+				state.lastBTCDominance = globalData.BTCDominance
+				state.lastGlobalMetricsFetch = time.Now()
+				state.stateMutex.Unlock()
+				state.logger.LogInfo("GlobalMetrics: Updated BTC Dominance to: %.2f%%", globalData.BTCDominance)
+			}
+		}
+	}
+
+	processPendingOrders(ctx, state)
+	reapStaleOrders(ctx, state)
+
+	// [MODIFIED] Get the current FNG value once per cycle.
+	currentFNGValue := getCurrentFNG().Value
+
+	for _, assetPair := range state.config.Trading.AssetPairs {
+		// [MODIFIED] Create a temporary, modulated AppConfig for this specific trading cycle.
+		activeAppConfig := *state.config
+		activeAppConfig.Trading = modulateConfigBySentiment(state.config.Trading, currentFNGValue, state.logger)
+
+		consolidatedData, err := gatherConsolidatedData(ctx, state, assetPair, currentPortfolioValue)
+		if err != nil {
+			state.logger.LogError("Cycle [%s]: Failed to gather consolidated data: %v", assetPair, err)
+			continue
+		}
+
+		stratInstance := strategy.NewStrategy(state.logger)
+		// [MODIFIED] Pass the new sentiment-adjusted config to the strategy.
+		signals, _ := stratInstance.GenerateSignals(ctx, *consolidatedData, activeAppConfig)
+
+		if len(signals) > 0 && signals[0].Direction != "hold" {
+			mainSignal := signals[0]
+			state.logger.LogInfo("GenerateSignals: %s -> %s - Reason: %s", assetPair, strings.ToUpper(mainSignal.Direction), mainSignal.Reason)
+		} else {
+			holdReason := "Conditions for buy/sell not met."
+			if len(signals) > 0 {
+				holdReason = signals[0].Reason
+			}
+			state.logger.LogInfo("GenerateSignals: %s -> HOLD - Reason: %s", assetPair, holdReason)
+		}
+
+		state.stateMutex.RLock()
+		position, hasPosition := state.openPositions[assetPair]
+		state.stateMutex.RUnlock()
+
+		isEffectivelyDust := false
+		if hasPosition {
+			var currentPrice float64
+			for _, pData := range consolidatedData.ProvidersData {
+				if pData.Name == "kraken" {
+					currentPrice = pData.CurrentPrice
+					break
+				}
+			}
+
+			if currentPrice > 0 {
+				positionValueUSD := position.TotalVolume * currentPrice
+				// [MODIFIED] Use the active (potentially modulated) config for dust threshold.
+				dustThreshold := 1.0
+				if activeAppConfig.Trading.DustThresholdUSD > 0 {
+					dustThreshold = activeAppConfig.Trading.DustThresholdUSD
+				}
+				if positionValueUSD < dustThreshold {
+					isEffectivelyDust = true
+					state.logger.LogInfo("Position for %s is considered dust (value: $%.4f). Allowing new entry check.", assetPair, positionValueUSD)
+				}
+			}
+		}
+
+		if hasPosition && !isEffectivelyDust {
+			// [MODIFIED] Pass the sentiment-adjusted config.
+			manageOpenPosition(ctx, state, position, signals, consolidatedData, &activeAppConfig)
+		} else {
+			// [MODIFIED] Pass the sentiment-adjusted config.
+			seekEntryOpportunity(ctx, state, assetPair, signals, consolidatedData, &activeAppConfig)
+		}
+	}
+}
+
+// [MODIFIED] The function signature is updated to accept the active AppConfig.
+func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities.Position, signals []strategy.StrategySignal, consolidatedData *strategy.ConsolidatedMarketPicture, cfg *utilities.AppConfig) {
 	state.logger.LogInfo("ManagePosition [%s]: Managing position. AvgPrice: %.2f, Vol: %.8f, SOs: %d, TP: %.2f",
 		pos.AssetPair, pos.AveragePrice, pos.TotalVolume, pos.FilledSafetyOrders, pos.CurrentTakeProfit)
 
-	// --- NEW LOGIC: Prioritize adding to the position on a new BUY signal ---
 	for _, sig := range signals {
 		if sig.Direction == "buy" || sig.Direction == "predictive_buy" {
 			state.logger.LogInfo("ManagePosition [%s]: New '%s' signal received. Adding to existing position.", pos.AssetPair, strings.ToUpper(sig.Direction))
@@ -676,11 +714,12 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 
 			if orderSizeInBase <= 0 {
 				state.logger.LogWarn("ManagePosition [%s]: Calculated size for add-on order is zero. Falling back to base order size.", pos.AssetPair)
-				orderSizeInBase = state.config.Trading.BaseOrderSize / orderPrice
+				// [MODIFIED] Use the passed-in, sentiment-adjusted config.
+				orderSizeInBase = cfg.Trading.BaseOrderSize / orderPrice
 			}
 			if orderPrice <= 0 {
 				state.logger.LogError("ManagePosition [%s]: Invalid add-on order price (<= 0). Aborting.", pos.AssetPair)
-				return // Abort this action
+				return
 			}
 
 			orderID, placeErr := state.broker.PlaceOrder(ctx, pos.AssetPair, "buy", "limit", orderSizeInBase, orderPrice, 0, "")
@@ -688,26 +727,20 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 				state.logger.LogError("ManagePosition [%s]: Failed to place add-on buy order: %v", pos.AssetPair, placeErr)
 			} else {
 				state.logger.LogInfo("ManagePosition [%s]: Placed add-on order ID %s at %.2f.", pos.AssetPair, orderID, orderPrice)
-
-				// Send a specific Discord message for this action
 				baseAsset := strings.Split(pos.AssetPair, "/")[0]
 				quoteAsset := strings.Split(pos.AssetPair, "/")[1]
-				message := fmt.Sprintf("🧠 **Placing Limit Buy Order**\n**Pair:** %s\n**Size:** `%.4f %s`\n**Price:** `%.2f %s`\n**Reason:** %s",
+				message := fmt.Sprintf("➕ **Adding to Position**\n**Pair:** %s\n**Size:** `%.4f %s`\n**Price:** `%.2f %s`\n**Reason:** %s",
 					pos.AssetPair, orderSizeInBase, baseAsset, orderPrice, quoteAsset, sig.Reason)
 				state.discordClient.SendMessage(message)
-
 				state.stateMutex.Lock()
 				state.pendingOrders[orderID] = pos.AssetPair
 				_ = state.cache.SavePendingOrder(orderID, pos.AssetPair)
 				state.stateMutex.Unlock()
 			}
-			// Exit after placing the add-on order. We don't want to also place a safety order in the same cycle.
 			return
 		}
 	}
-	// --- END OF NEW LOGIC ---
 
-	// If no new buy signals, proceed with standard management (TP, SL, DCA)
 	var currentPrice float64
 	for _, pData := range consolidatedData.ProvidersData {
 		if pData.Name == "kraken" {
@@ -720,10 +753,9 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 		return
 	}
 
-	// [ ... The rest of the take-profit, trailing stop, and safety order logic remains exactly the same ... ]
-	// Check for a specific "emergency" exit signal.
 	stratInstance := strategy.NewStrategy(state.logger)
-	exitSignal, shouldExit := stratInstance.GenerateExitSignal(ctx, *consolidatedData, *state.config)
+	// [MODIFIED] Use the passed-in, sentiment-adjusted config.
+	exitSignal, shouldExit := stratInstance.GenerateExitSignal(ctx, *consolidatedData, *cfg)
 	if shouldExit && exitSignal.Direction == "sell" {
 		state.logger.LogWarn("!!! [SELL] signal for %s (Strategy Exit). Reason: %s. Placing market sell order.", pos.AssetPair, exitSignal.Reason)
 		orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
@@ -738,8 +770,8 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 		return
 	}
 
-	// Standard Take-Profit and Trailing Stop logic.
-	if state.config.Trading.TrailingStopEnabled && pos.IsTrailingActive {
+	// [MODIFIED] Use the passed-in, sentiment-adjusted config.
+	if cfg.Trading.TrailingStopEnabled && pos.IsTrailingActive {
 		if currentPrice > pos.PeakPriceSinceTP {
 			pos.PeakPriceSinceTP = currentPrice
 			state.logger.LogInfo("ManagePosition [%s]: Trailing stop active. New peak price: %.2f", pos.AssetPair, pos.PeakPriceSinceTP)
@@ -747,7 +779,8 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 				state.logger.LogError("ManagePosition [%s]: Failed to save updated peak price to DB: %v", pos.AssetPair, err)
 			}
 		}
-		trailingStopPrice := pos.PeakPriceSinceTP * (1.0 - (state.config.Trading.TrailingStopDeviation / 100.0))
+		// [MODIFIED] Use the sentiment-adjusted trailing stop deviation.
+		trailingStopPrice := pos.PeakPriceSinceTP * (1.0 - (cfg.Trading.TrailingStopDeviation / 100.0))
 		if currentPrice <= trailingStopPrice {
 			state.logger.LogInfo("ManagePosition [%s]: TRAILING STOP-LOSS HIT at %.2f (Peak was %.2f). Placing market sell order.", pos.AssetPair, currentPrice, pos.PeakPriceSinceTP)
 			orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
@@ -762,11 +795,12 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 			return
 		}
 	} else if currentPrice >= pos.CurrentTakeProfit && !pos.IsTrailingActive {
-		if state.config.Trading.TrailingStopEnabled {
-			partialSellPercent := state.config.Trading.TakeProfitPartialSellPercent / 100.0
+		// [MODIFIED] Use the passed-in, sentiment-adjusted config.
+		if cfg.Trading.TrailingStopEnabled {
+			partialSellPercent := cfg.Trading.TakeProfitPartialSellPercent / 100.0
 			if partialSellPercent > 0 && partialSellPercent < 1.0 {
 				volumeToSell := pos.TotalVolume * partialSellPercent
-				state.logger.LogInfo("ManagePosition [%s]: HYBRID TAKE-PROFIT HIT at %.2f. Selling %.2f%% of position.", pos.AssetPair, currentPrice, state.config.Trading.TakeProfitPartialSellPercent)
+				state.logger.LogInfo("ManagePosition [%s]: HYBRID TAKE-PROFIT HIT at %.2f. Selling %.2f%% of position.", pos.AssetPair, currentPrice, cfg.Trading.TakeProfitPartialSellPercent)
 				orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", volumeToSell, 0, 0, "")
 				if err != nil {
 					state.logger.LogError("ManagePosition [%s]: Failed to place partial market sell order: %v", pos.AssetPair, err)
@@ -799,23 +833,24 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 		}
 	}
 
-	// Safety Order (DCA) logic.
-	if pos.IsDcaActive && pos.FilledSafetyOrders < state.config.Trading.MaxSafetyOrders {
+	// [MODIFIED] Use the passed-in, sentiment-adjusted config for DCA logic.
+	if pos.IsDcaActive && pos.FilledSafetyOrders < cfg.Trading.MaxSafetyOrders {
 		var shouldPlaceSafetyOrder bool
 		var nextSafetyOrderPrice float64
-		if state.config.Trading.DcaSpacingMode == "atr" {
+		if cfg.Trading.DcaSpacingMode == "atr" {
 			state.logger.LogDebug("ManagePosition [%s]: Using ATR spacing mode.", pos.AssetPair)
-			tf := state.config.Consensus.MultiTimeframe.BaseTimeframe
+			tf := cfg.Consensus.MultiTimeframe.BaseTimeframe
 			krakenInterval, _ := utilities.ConvertTFToKrakenInterval(tf)
-			bars, err := state.broker.GetLastNOHLCVBars(ctx, pos.AssetPair, krakenInterval, state.config.Trading.DcaAtrPeriod+1)
-			if err != nil || len(bars) < state.config.Trading.DcaAtrPeriod+1 {
+			bars, err := state.broker.GetLastNOHLCVBars(ctx, pos.AssetPair, krakenInterval, cfg.Trading.DcaAtrPeriod+1)
+			if err != nil || len(bars) < cfg.Trading.DcaAtrPeriod+1 {
 				state.logger.LogError("ManagePosition [%s]: Could not fetch enough bars for ATR calculation: %v", pos.AssetPair, err)
 			} else {
-				atrValue, err := strategy.CalculateATR(bars, state.config.Trading.DcaAtrPeriod)
+				atrValue, err := strategy.CalculateATR(bars, cfg.Trading.DcaAtrPeriod)
 				if err != nil {
 					state.logger.LogError("ManagePosition [%s]: Error calculating ATR: %v", pos.AssetPair, err)
 				} else {
-					priceDeviation := atrValue * state.config.Trading.DcaAtrSpacingMultiplier * math.Pow(state.config.Trading.SafetyOrderStepScale, float64(pos.FilledSafetyOrders))
+					// [MODIFIED] Use the sentiment-adjusted ATR spacing multiplier.
+					priceDeviation := atrValue * cfg.Trading.DcaAtrSpacingMultiplier * math.Pow(cfg.Trading.SafetyOrderStepScale, float64(pos.FilledSafetyOrders))
 					lastFilledPrice := pos.AveragePrice
 					if pos.FilledSafetyOrders == 0 {
 						lastFilledPrice = pos.BaseOrderPrice
@@ -830,10 +865,10 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 			state.logger.LogDebug("ManagePosition [%s]: Using percentage spacing mode.", pos.AssetPair)
 			nextSONumber := pos.FilledSafetyOrders + 1
 			var totalDeviationPercentage float64
-			currentStep := state.config.Trading.PriceDeviationToOpenSafetyOrders
+			currentStep := cfg.Trading.PriceDeviationToOpenSafetyOrders
 			for i := 0; i < nextSONumber; i++ {
 				totalDeviationPercentage += currentStep
-				currentStep *= state.config.Trading.SafetyOrderStepScale
+				currentStep *= cfg.Trading.SafetyOrderStepScale
 			}
 			nextSafetyOrderPrice = pos.BaseOrderPrice * (1 - (totalDeviationPercentage / 100.0))
 			if currentPrice <= nextSafetyOrderPrice {
@@ -847,7 +882,7 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 				state.logger.LogInfo("ManagePosition [%s]: Found strategic safety order price %.2f based on order book (Original: %.2f)", pos.AssetPair, strategicSafetyPrice, nextSafetyOrderPrice)
 			}
 			nextSONumber := pos.FilledSafetyOrders + 1
-			orderSizeInQuote := pos.BaseOrderSize * math.Pow(state.config.Trading.SafetyOrderVolumeScale, float64(nextSONumber))
+			orderSizeInQuote := pos.BaseOrderSize * math.Pow(cfg.Trading.SafetyOrderVolumeScale, float64(nextSONumber))
 			orderSizeInBase := orderSizeInQuote / strategicSafetyPrice
 			state.logger.LogInfo("ManagePosition [%s]: Price condition met for Safety Order #%d. Placing limit buy.", pos.AssetPair, nextSONumber)
 			orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "buy", "limit", orderSizeInBase, strategicSafetyPrice, 0, "")
@@ -866,9 +901,10 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 		}
 	}
 }
-func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair string, signals []strategy.StrategySignal, consolidatedData *strategy.ConsolidatedMarketPicture) {
+
+// [MODIFIED] The function signature is updated to accept the active AppConfig.
+func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair string, signals []strategy.StrategySignal, consolidatedData *strategy.ConsolidatedMarketPicture, cfg *utilities.AppConfig) {
 	for _, sig := range signals {
-		// --- FIX: Use strings.EqualFold for case-insensitive comparison ---
 		if strings.EqualFold(sig.Direction, "buy") || strings.EqualFold(sig.Direction, "predictive_buy") {
 			state.logger.LogInfo("SeekEntry [%s]: %s signal confirmed. Calculating order...", assetPair, strings.ToUpper(sig.Direction))
 
@@ -887,39 +923,31 @@ func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair st
 				continue
 			}
 
-			// --- CORRECTED SIZING AND PRICING LOGIC ---
 			if strings.EqualFold(sig.Direction, "buy") {
-				// This is a high-conviction CONSENSUS buy.
 				orderPrice = sig.RecommendedPrice
-				// Use the risk-calculated size from the strategy signal as the base.
 				orderSizeInBase = sig.CalculatedSize
-				// Apply the multiplier if it's set in the config.
-				if state.config.Trading.ConsensusBuyMultiplier > 1.0 {
-					orderSizeInBase *= state.config.Trading.ConsensusBuyMultiplier
-					state.logger.LogInfo("SeekEntry [%s]: Applying x%.2f multiplier to consensus buy. New size: %.4f", assetPair, state.config.Trading.ConsensusBuyMultiplier, orderSizeInBase)
+				// [MODIFIED] Use the passed-in, sentiment-adjusted config.
+				if cfg.Trading.ConsensusBuyMultiplier > 1.0 {
+					orderSizeInBase *= cfg.Trading.ConsensusBuyMultiplier
+					state.logger.LogInfo("SeekEntry [%s]: Applying x%.2f multiplier to consensus buy. New size: %.4f", assetPair, cfg.Trading.ConsensusBuyMultiplier, orderSizeInBase)
 				}
 			} else { // This is a "predictive_buy"
-				// For predictive buys, trust the price from the order book analysis in the signal.
 				orderPrice = sig.RecommendedPrice
-				// Use the standard Martingale base order size for the predictive entry.
-				orderSizeInBase = state.config.Trading.BaseOrderSize / orderPrice
-				// CORRECTED LOG MESSAGE: Reflects that the price comes from the signal, not a static deviation.
+				// [MODIFIED] Use the passed-in, sentiment-adjusted config.
+				orderSizeInBase = cfg.Trading.BaseOrderSize / orderPrice
 				state.logger.LogInfo("SeekEntry [%s]: Predictive buy placing order at %.2f based on detected support level from strategy signal.", assetPair, orderPrice)
 			}
-			// --- END OF CORRECTED SIZING AND PRICING LOGIC ---
 
 			if orderSizeInBase <= 0 || orderPrice <= 0 {
 				state.logger.LogError("SeekEntry [%s]: Invalid order parameters (size=%.4f, price=%.2f). Aborting.", assetPair, orderSizeInBase, orderPrice)
 				continue
 			}
 
-			// --- FIX: Removed the extra argument to match the correct function signature ---
 			orderID, placeErr := state.broker.PlaceOrder(ctx, assetPair, "buy", "limit", orderSizeInBase, orderPrice, 0, "")
 			if placeErr != nil {
 				state.logger.LogError("SeekEntry [%s]: Place order failed: %v", assetPair, placeErr)
 			} else {
 				state.logger.LogInfo("SeekEntry [%s]: Placed order ID %s at %.2f. Now tracking.", assetPair, orderID, orderPrice)
-				// Discord notification logic for predictive buys
 				if strings.EqualFold(sig.Direction, "predictive_buy") {
 					baseAsset := strings.Split(assetPair, "/")[0]
 					quoteAsset := strings.Split(assetPair, "/")[1]

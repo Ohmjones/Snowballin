@@ -219,6 +219,53 @@ func IsLiquidityHuntDetected(bars []utilities.OHLCVBar, minWickPercent, volSpike
 	return wickyVolSpike || reversalVolSpike
 }
 
+// IsBearishReversalAfterHuntDetected identifies a potential bearish reversal after a bullish liquidity sweep.
+// This is a robust EXIT signal
+func IsBearishReversalAfterHuntDetected(bars []utilities.OHLCVBar, minWickPercent, volSpikeMultiplier float64, volMAPeriod int) bool {
+	// We need at least the volume lookback period + the wicky candle + the reversal candle.
+	if len(bars) < volMAPeriod+2 {
+		return false
+	}
+
+	wickyCandle := bars[len(bars)-2]    // The bullish "sweep" candle.
+	reversalCandle := bars[len(bars)-1] // The bearish "confirmation" candle.
+
+	// The sweep candle must be bullish (a push upwards).
+	if wickyCandle.Close <= wickyCandle.Open {
+		return false
+	}
+
+	candleRange := wickyCandle.High - wickyCandle.Low
+	if candleRange == 0 {
+		return false // Avoid division by zero on doji candles.
+	}
+
+	// Calculate the upper wick size. It must be a significant portion of the candle.
+	upperWick := wickyCandle.High - wickyCandle.Close
+	if (upperWick / candleRange) < (minWickPercent / 100.0) {
+		return false // The upper wick isn't long enough to suggest a rejection.
+	}
+
+	// The next candle must be a bearish reversal candle, confirming the rejection.
+	// It must be a red candle AND it must close below the open of the wicky candle.
+	if reversalCandle.Close >= reversalCandle.Open || reversalCandle.Close >= wickyCandle.Open {
+		return false
+	}
+
+	// Check for a volume spike on either the sweep or the reversal candle to confirm conviction.
+	totalVolume := 0.0
+	volumeBars := bars[len(bars)-2-volMAPeriod : len(bars)-2]
+	for _, bar := range volumeBars {
+		totalVolume += bar.Volume
+	}
+	avgVolume := totalVolume / float64(volMAPeriod)
+
+	wickyVolSpike := wickyCandle.Volume > (avgVolume * volSpikeMultiplier)
+	reversalVolSpike := reversalCandle.Volume > (avgVolume * volSpikeMultiplier)
+
+	return wickyVolSpike || reversalVolSpike
+}
+
 // CalculateIndicators aggregates all primary indicators.
 func CalculateIndicators(bars []utilities.OHLCVBar, cfg utilities.AppConfig) (
 	rsi float64,
@@ -237,12 +284,13 @@ func CalculateIndicators(bars []utilities.OHLCVBar, cfg utilities.AppConfig) (
 	obv = CalculateOBV(bars)
 	volumeSpike = CheckVolumeSpike(bars, indicatorCfg.VolumeSpikeFactor, indicatorCfg.VolumeLookbackPeriod)
 
-	// [FIX] Correctly call IsLiquidityHuntDetected with parameters from the config
-	liquidityHunt = IsLiquidityHuntDetected(
+	// Call our NEW function here
+	bearishHuntReversal := IsBearishReversalAfterHuntDetected(
 		bars,
 		indicatorCfg.LiquidityHunt.MinWickPercent,
 		indicatorCfg.LiquidityHunt.VolSpikeMultiplier,
 		indicatorCfg.LiquidityHunt.VolMAPeriod,
 	)
-	return
+	// Explicitly return all named variables to resolve the "unused variable" error.
+	return rsi, stochRSI, macdHist, obv, volumeSpike, bearishHuntReversal
 }

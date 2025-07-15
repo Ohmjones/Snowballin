@@ -211,33 +211,37 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 
 // GenerateExitSignal checks for liquidity hunts or bearish confluence to generate an exit signal.
 func (s *strategyImpl) GenerateExitSignal(ctx context.Context, data ConsolidatedMarketPicture, cfg utilities.AppConfig) (StrategySignal, bool) {
-	_ = ctx
+	_ = ctx // Acknowledge context is not used in this specific function body
 
+	// This initial check is correct and remains.
 	if len(data.ProvidersData) == 0 {
 		return StrategySignal{}, false
 	}
 
+	// This check for sufficient bar data is also correct and remains.
 	primaryBars, ok := data.PrimaryOHLCVByTF[cfg.Consensus.MultiTimeframe.BaseTimeframe]
 	if !ok || len(primaryBars) < 2 {
 		return StrategySignal{}, false
 	}
 
-	huntDetected := IsLiquidityHuntDetected(
-		primaryBars,
-		cfg.Indicators.LiquidityHunt.MinWickPercent,
-		cfg.Indicators.LiquidityHunt.VolSpikeMultiplier,
-		cfg.Indicators.LiquidityHunt.VolMAPeriod,
-	)
+	// [FIX] Call the updated CalculateIndicators function to get all signals at once.
+	// We use '_' to ignore the indicator values we don't need for this specific exit logic.
+	// The important variable is the final boolean we named 'bearishHuntReversal'.
+	_, _, _, _, _, bearishHuntReversal := CalculateIndicators(primaryBars, cfg)
 
-	if huntDetected {
-		s.logger.LogWarn("GenerateExitSignal [%s]: EXIT triggered. Reason: Bearish Liquidity Hunt Pattern Detected", data.AssetPair)
+	// [FIX] Use the new 'bearishHuntReversal' boolean for the check.
+	if bearishHuntReversal {
+		// [FIX] Updated the log message for clarity.
+		s.logger.LogWarn("GenerateExitSignal [%s]: EXIT triggered. Reason: Confirmed Bearish Reversal after Liquidity Hunt", data.AssetPair)
 		return StrategySignal{
 			AssetPair: data.AssetPair,
 			Direction: "sell",
-			Reason:    "Liquidity Hunt Pattern Detected",
+			// The reason is also updated to be more descriptive.
+			Reason: "Confirmed Bearish Reversal after Liquidity Hunt",
 		}, true
 	}
 
+	// This existing check for bearish confluence is a great fallback and remains untouched.
 	isBearish, reason := checkBearishConfluence(primaryBars, cfg)
 	if isBearish {
 		s.logger.LogWarn("GenerateExitSignal [%s]: EXIT triggered. Reason: %s", data.AssetPair, reason)
