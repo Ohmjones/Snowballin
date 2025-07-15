@@ -420,9 +420,32 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 		return nil, fmt.Errorf("found trade history for %s, but could not isolate a sequence of buys for the current balance of %f", assetPair, actualBalance)
 	}
 
-	// Check if reconstructed volume matches actual balance
-	if math.Abs(accumulatedVolume-actualBalance) > tolerance {
-		return nil, fmt.Errorf("reconstructed volume %.8f does not match actual balance %.8f for %s (difference exceeds tolerance %.8f)", accumulatedVolume, actualBalance, assetPair, tolerance)
+	// Fetch current price to evaluate mismatch in USD terms
+	ticker, tickerErr := state.broker.GetTicker(ctx, assetPair)
+	if tickerErr != nil {
+		return nil, fmt.Errorf("failed to get ticker for %s during reconstruction: %w", assetPair, tickerErr)
+	}
+	currentPrice := ticker.LastPrice
+	if currentPrice <= 0 {
+		return nil, fmt.Errorf("invalid current price (%.2f) for %s during reconstruction", currentPrice, assetPair)
+	}
+
+	diff := math.Abs(accumulatedVolume - actualBalance)
+	valueDiff := diff * currentPrice
+
+	if diff > tolerance {
+		if valueDiff < state.config.Trading.DustThresholdUSD {
+			state.logger.LogWarn("Reconstruction [%s]: Small volume mismatch (diff: %.8f, value: $%.4f < dust threshold $%.2f). Adjusting costs to match actual balance.", assetPair, diff, valueDiff, state.config.Trading.DustThresholdUSD)
+			scale := actualBalance / accumulatedVolume
+			accumulatedVolume = actualBalance
+			// Scale costs and fees proportionally (approximation for tiny diffs)
+			for i := range positionTrades {
+				positionTrades[i].Cost *= scale
+				positionTrades[i].Fee *= scale
+			}
+		} else {
+			return nil, fmt.Errorf("reconstructed volume %.8f does not match actual balance %.8f for %s (difference %.8f exceeds tolerance; value $%.4f)", accumulatedVolume, actualBalance, assetPair, diff, valueDiff)
+		}
 	}
 
 	var totalCost, totalFees float64
