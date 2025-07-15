@@ -692,7 +692,7 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 				// Send a specific Discord message for this action
 				baseAsset := strings.Split(pos.AssetPair, "/")[0]
 				quoteAsset := strings.Split(pos.AssetPair, "/")[1]
-				message := fmt.Sprintf("➕ **Adding to Position**\n**Pair:** %s\n**Size:** `%.4f %s`\n**Price:** `%.2f %s`\n**Reason:** %s",
+				message := fmt.Sprintf("🧠 **Placing Limit Buy Order**\n**Pair:** %s\n**Size:** `%.4f %s`\n**Price:** `%.2f %s`\n**Reason:** %s",
 					pos.AssetPair, orderSizeInBase, baseAsset, orderPrice, quoteAsset, sig.Reason)
 				state.discordClient.SendMessage(message)
 
