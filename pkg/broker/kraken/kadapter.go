@@ -289,91 +289,80 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 
 	totalValue := 0.0
 	quoteCurrencyUpper := strings.ToUpper(quoteCurrency)
+	pairsToFetch := make(map[string]string) // Map common pair to kraken pair
+	assetBalances := make(map[string]float64)
 
+	// 1. Go through balances, calculate value of quote currency, and build a list of other assets.
 	for originalKey, balanceStr := range balances {
 		balance, err := strconv.ParseFloat(balanceStr, 64)
-		if err != nil || balance == 0 {
+		if err != nil || balance <= 1e-8 {
 			continue
 		}
 
-		krakenAssetName := strings.TrimSuffix(originalKey, ".F")
-		commonName, err := a.client.GetCommonAssetName(ctx, krakenAssetName)
+		commonName, err := a.client.GetCommonAssetName(ctx, originalKey)
 		if err != nil {
-			a.logger.LogWarn("GetAccountValue: could not get common name for %s, skipping.", krakenAssetName)
+			a.logger.LogWarn("GetAccountValue: could not get common name for %s, skipping.", originalKey)
 			continue
 		}
 
 		if strings.EqualFold(commonName, quoteCurrencyUpper) {
 			totalValue += balance
-			continue
-		}
-
-		priceInQuote, err := a.getAssetPriceInQuote(ctx, commonName, quoteCurrencyUpper)
-		if err != nil {
-			a.logger.LogWarn("GetAccountValue: %v. Skipping value calculation for %s.", err, commonName)
-			continue
-		}
-
-		assetValueInQuote := balance * priceInQuote
-		totalValue += assetValueInQuote
-		a.logger.LogDebug("GetAccountValue: Valued %f of %s at %.2f %s/COIN", balance, commonName, priceInQuote, quoteCurrencyUpper)
-	}
-
-	a.logger.LogInfo("Calculated total account value: %.2f %s", totalValue, quoteCurrencyUpper)
-	return totalValue, nil
-}
-
-func (a *Adapter) getAssetPriceInQuote(ctx context.Context, commonBase, commonQuote string) (float64, error) {
-	directPair := fmt.Sprintf("%s/%s", commonBase, commonQuote)
-	krakenPair, err := a.client.GetPrimaryKrakenPairName(ctx, directPair)
-	if err == nil {
-		ticker, tickerErr := a.client.GetTickerAPI(ctx, krakenPair)
-		if tickerErr == nil {
-			price, pErr := strconv.ParseFloat(ticker.Bid[0], 64)
-			if pErr == nil && price > 0 {
-				return price, nil
+		} else {
+			assetBalances[commonName] = balance
+			commonPair := fmt.Sprintf("%s/%s", commonName, quoteCurrencyUpper)
+			if _, exists := pairsToFetch[commonPair]; !exists {
+				krakenPair, err := a.client.GetPrimaryKrakenPairName(ctx, commonPair)
+				if err == nil {
+					pairsToFetch[commonPair] = krakenPair
+				}
 			}
 		}
 	}
 
-	a.logger.LogDebug("getAssetPriceInQuote: No direct ticker for %s, attempting triangulation via BTC.", directPair)
-	pivotPair := "BTC/USD"
-	if commonQuote != "USD" {
-		pivotPair = fmt.Sprintf("BTC/%s", commonQuote)
+	if len(pairsToFetch) == 0 {
+		return totalValue, nil
 	}
 
-	krakenPivotPair, err := a.client.GetPrimaryKrakenPairName(ctx, pivotPair)
-	if err != nil {
-		return 0, fmt.Errorf("could not resolve pivot pair %s for triangulation", pivotPair)
+	// 2. Make ONE API call to get all tickers for the assets we hold.
+	krakenPairList := make([]string, 0, len(pairsToFetch))
+	for _, krakenPair := range pairsToFetch {
+		krakenPairList = append(krakenPairList, krakenPair)
 	}
-	pivotTicker, err := a.client.GetTickerAPI(ctx, krakenPivotPair)
+	a.logger.LogInfo("GetAccountValue: Fetching batch tickers for %d assets...", len(krakenPairList))
+
+	tickerInfoMap, err := a.client.GetTickerAPI(ctx, strings.Join(krakenPairList, ","))
 	if err != nil {
-		return 0, fmt.Errorf("failed to get pivot ticker for %s", krakenPivotPair)
-	}
-	pivotPrice, _ := strconv.ParseFloat(pivotTicker.Bid[0], 64)
-	if pivotPrice <= 0 {
-		return 0, fmt.Errorf("pivot asset %s has non-positive price", pivotPair)
+		return 0, fmt.Errorf("GetAccountValue: failed to get batch tickers: %w", err)
 	}
 
-	if commonBase == "BTC" {
-		return pivotPrice, nil
+	krakenToCommonMap := make(map[string]string)
+	for common, kraken := range pairsToFetch {
+		krakenToCommonMap[kraken] = common
 	}
 
-	triangulationPair := fmt.Sprintf("%s/BTC", commonBase)
-	krakenTriangulationPair, err := a.client.GetPrimaryKrakenPairName(ctx, triangulationPair)
-	if err != nil {
-		return 0, fmt.Errorf("could not resolve triangulation pair %s", triangulationPair)
-	}
-	triangTicker, err := a.client.GetTickerAPI(ctx, krakenTriangulationPair)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get ticker for triangulation pair %s", krakenTriangulationPair)
-	}
-	triangPrice, _ := strconv.ParseFloat(triangTicker.Bid[0], 64)
-	if triangPrice <= 0 {
-		return 0, fmt.Errorf("triangulation asset %s has non-positive price", triangulationPair)
+	// 3. Create a simple price map for easy lookup.
+	priceMap := make(map[string]float64) // commonPair -> price
+	for krakenPair, tickerInfo := range tickerInfoMap {
+		if commonPair, ok := krakenToCommonMap[krakenPair]; ok {
+			price, _ := strconv.ParseFloat(tickerInfo.LastTradeClosed[0], 64)
+			priceMap[commonPair] = price
+		}
 	}
 
-	return triangPrice * pivotPrice, nil
+	// 4. Iterate through our held assets and add their value using the fetched prices.
+	for assetName, balance := range assetBalances {
+		commonPair := fmt.Sprintf("%s/%s", assetName, quoteCurrencyUpper)
+		price, ok := priceMap[commonPair]
+		if ok && price > 0 {
+			assetValueInQuote := balance * price
+			totalValue += assetValueInQuote
+		} else {
+			a.logger.LogWarn("GetAccountValue: Could not find price for %s in batch ticker response.", assetName)
+		}
+	}
+
+	a.logger.LogInfo("Calculated total account value: %.2f %s", totalValue, quoteCurrencyUpper)
+	return totalValue, nil
 }
 
 func (a *Adapter) GetOrderBook(ctx context.Context, commonPair string, depth int) (broker.OrderBookData, error) {
@@ -459,12 +448,23 @@ func (a *Adapter) GetTicker(ctx context.Context, pair string) (broker.TickerData
 		return broker.TickerData{}, err
 	}
 
-	tickerInfo, err := a.client.GetTickerAPI(ctx, krakenPair)
+	// GetTickerAPI now returns a map, so we handle it as such.
+	tickerInfoMap, err := a.client.GetTickerAPI(ctx, krakenPair)
 	if err != nil {
 		return broker.TickerData{}, err
 	}
 
-	return a.client.ParseTicker(tickerInfo, pair), nil
+	// --- FIX STARTS HERE ---
+	// Extract the specific ticker info for our pair from the map.
+	singleTickerInfo, ok := tickerInfoMap[krakenPair]
+	if !ok {
+		// This would be unusual since we requested this specific pair, but it's good practice to handle.
+		return broker.TickerData{}, fmt.Errorf("ticker for pair %s (%s) not found in API response", pair, krakenPair)
+	}
+	// --- FIX ENDS HERE ---
+
+	// Now pass the single TickerInfo struct to the parser, which resolves the compiler error.
+	return a.client.ParseTicker(singleTickerInfo, pair), nil
 }
 
 // GetTradeFees fetches the user's current maker and taker fee percentages for a given asset pair.

@@ -571,23 +571,23 @@ func (c *Client) GetBalancesAPI(ctx context.Context) (map[string]string, error) 
 	return resp.Result, nil
 }
 
-func (c *Client) GetTickerAPI(ctx context.Context, krakenPairName string) (TickerInfo, error) {
+func (c *Client) GetTickerAPI(ctx context.Context, krakenPairNames string) (map[string]TickerInfo, error) {
 	var resp struct {
 		Error  []string              `json:"error"`
 		Result map[string]TickerInfo `json:"result"`
 	}
-	params := url.Values{"pair": {krakenPairName}}
+	// The 'pair' parameter can be a comma-separated list of pairs
+	params := url.Values{"pair": {krakenPairNames}}
 	if err := c.callPublic(ctx, "/0/public/Ticker", params, &resp); err != nil {
-		return TickerInfo{}, err
+		return nil, err
 	}
 	if len(resp.Error) > 0 {
-		return TickerInfo{}, errors.New(strings.Join(resp.Error, ", "))
+		return nil, errors.New(strings.Join(resp.Error, ", "))
 	}
-	ticker, ok := resp.Result[krakenPairName]
-	if !ok {
-		return TickerInfo{}, errors.New("Kraken GetTicker pair not found")
+	if resp.Result == nil {
+		return nil, errors.New("Kraken GetTicker returned no result for the requested pair(s)")
 	}
-	return ticker, nil
+	return resp.Result, nil
 }
 
 func (c *Client) QueryTradesAPI(ctx context.Context, params url.Values) (map[string]KrakenTradeInfo, int64, error) {
@@ -612,32 +612,66 @@ func (c *Client) callPrivate(ctx context.Context, apiPath string, data url.Value
 	if c.APIKey == "" || c.APISecret == "" {
 		return errors.New("kraken: API key or secret not configured")
 	}
-	nonce := c.nonceGenerator.Nonce()
-	nonceStr := strconv.FormatUint(nonce, 10)
-	if data == nil {
-		data = url.Values{}
-	}
-	data.Set("nonce", nonceStr)
 
-	authHeaders, err := utilities.GenerateKrakenAuthHeaders(c.APIKey, c.APISecret, apiPath, nonceStr, data)
-	if err != nil {
-		return fmt.Errorf("kraken: generate auth headers for %s: %w", apiPath, err)
+	var lastErr error
+	maxRetries := 4
+	backoff := 2 * time.Second // Initial wait time of 2 seconds
+
+	for i := 0; i < maxRetries; i++ {
+		// --- The core request logic is now inside the retry loop ---
+		nonce := c.nonceGenerator.Nonce()
+		nonceStr := strconv.FormatUint(nonce, 10)
+		if data == nil {
+			data = url.Values{}
+		}
+		data.Set("nonce", nonceStr)
+
+		authHeaders, authErr := utilities.GenerateKrakenAuthHeaders(c.APIKey, c.APISecret, apiPath, nonceStr, data)
+		if authErr != nil {
+			return fmt.Errorf("kraken: generate auth headers for %s: %w", apiPath, authErr)
+		}
+
+		fullURL := c.BaseURL + apiPath
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, strings.NewReader(data.Encode()))
+		if reqErr != nil {
+			// This is a non-retriable error
+			return fmt.Errorf("kraken: create private request for %s: %w", apiPath, reqErr)
+		}
+
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("User-Agent", "SnowballinBot/1.0")
+		for key, val := range authHeaders {
+			req.Header.Set(key, val)
+		}
+		c.logger.LogDebug("Kraken callPrivate: URL=%s, Nonce=%s, Attempt=%d", fullURL, nonceStr, i+1)
+
+		// Your DoJSONRequest is fine for handling the request and decoding.
+		// We will inspect the error it returns.
+		lastErr = utilities.DoJSONRequest(c.HTTPClient, req, 0, 0, target) // We set retries to 0 here because we are handling it now.
+
+		// --- Resilient Retry Logic ---
+		if lastErr != nil {
+			// Check if the error is the specific rate limit error.
+			if strings.Contains(lastErr.Error(), "EAPI:Rate limit exceeded") {
+				c.logger.LogWarn("Rate limit exceeded on %s. Waiting %v before retrying... (Attempt %d/%d)", apiPath, backoff, i+1, maxRetries)
+				select {
+				case <-time.After(backoff):
+					backoff *= 2 // Double the wait time for the next attempt.
+					continue     // Go to the next iteration of the loop to retry.
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			// For any other error, fail immediately.
+			return fmt.Errorf("kraken private call to %s failed: %w", apiPath, lastErr)
+		}
+
+		// If the call was successful (no error), we're done.
+		return nil
 	}
 
-	fullURL := c.BaseURL + apiPath
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, strings.NewReader(data.Encode()))
-	if err != nil {
-		return fmt.Errorf("kraken: create private request for %s: %w", apiPath, err)
-	}
-
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", "SnowballinBot/1.0")
-	for key, val := range authHeaders {
-		req.Header.Set(key, val)
-	}
-	c.logger.LogDebug("Kraken callPrivate: URL=%s, Nonce=%s", fullURL, nonceStr)
-
-	return utilities.DoJSONRequest(c.HTTPClient, req, 2, 2*time.Second, target)
+	// If we've exited the loop because of too many retries, return the last known error.
+	return fmt.Errorf("API call to %s failed after %d retries: %w", apiPath, maxRetries, lastErr)
 }
 
 func (c *Client) callPublic(ctx context.Context, path string, params url.Values, target interface{}) error {
