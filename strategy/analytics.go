@@ -86,7 +86,7 @@ func PerformOrderBookAnalysis(orderBook broker.OrderBookData, depthPercent float
 
 	// Add sorting: Support descending price (highest/closest first), Resistance ascending (lowest/closest first)
 	sort.Slice(support, func(i, j int) bool {
-		return support[i].PriceLevel > support[j].PriceLevel
+		return support[i].PriceLevel < support[j].PriceLevel // Lowest first for deeper dips
 	})
 	sort.Slice(resistance, func(i, j int) bool {
 		return resistance[i].PriceLevel < resistance[j].PriceLevel

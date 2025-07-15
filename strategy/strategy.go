@@ -135,26 +135,46 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 	// Perform Multi-Timeframe Consensus check
 	isBuy, reason := s.checkMultiTimeframeConsensus(data, cfg)
 
+	// Extract currentPrice early for use in predictive logic
+	currentPrice := data.ProvidersData[0].CurrentPrice
+
 	// --- PREDICTIVE BUY LOGIC WITH PANIC FIX ---
 	bookAnalysis := PerformOrderBookAnalysis(data.BrokerOrderBook, 1.0, 10, 1.5)
 	if !isBuy && bookAnalysis.DepthScore > cfg.Trading.MinBookConfidenceForPredictive {
 		if cfg.Trading.UseMartingaleForPredictive {
-			s.logger.LogInfo("GenerateSignals [%s]: Consensus failed, but strong book (%f). Signaling for predictive buy.", data.AssetPair, bookAnalysis.DepthScore)
+			s.logger.LogInfo("GenerateSignals [%s]: Consensus failed, but strong book (%f). Checking for dip conditions...", data.AssetPair, bookAnalysis.DepthScore)
 
-			// --- THIS IS THE FIX ---
-			// A high DepthScore can exist even with no single strong support level.
-			// We must explicitly check if the SupportLevels slice is nil or has a length of zero before trying to access it.
 			if bookAnalysis.SupportLevels == nil || len(bookAnalysis.SupportLevels) == 0 {
 				s.logger.LogWarn("GenerateSignals [%s]: Predictive buy triggered, but no concrete support levels were found in the order book.", data.AssetPair)
-				return nil, nil // Return no signal to prevent a panic.
+				return nil, nil
 			}
-			// --- END OF FIX ---
 
-			// By passing the check above, it is now safe to access SupportLevels[0].
+			// Fix: Calculate RSI from primary bars to ensure dip
+			rsi := CalculateRSI(primaryBars, cfg.Indicators.RSIPeriod)
+			if rsi >= 50 {
+				s.logger.LogInfo("GenerateSignals [%s]: Skipping predictive buy—RSI (%.2f) not oversold.", data.AssetPair, rsi)
+				return nil, nil
+			}
+
+			// Fix: Ensure no recent volume spike (avoid rips)
+			volumeSpike := CheckVolumeSpike(primaryBars, cfg.Indicators.VolumeSpikeFactor, cfg.Indicators.VolumeLookbackPeriod)
+			if volumeSpike {
+				s.logger.LogInfo("GenerateSignals [%s]: Skipping predictive buy—Recent volume spike detected (rip likely).", data.AssetPair)
+				return nil, nil
+			}
+
+			// Fix: Ensure support price is below current by at least PredictiveBuyDeviationPercent
+			supportPrice := bookAnalysis.SupportLevels[0].PriceLevel
+			minDipPrice := currentPrice * (1 - (cfg.Trading.PredictiveBuyDeviationPercent / 100.0))
+			if supportPrice >= minDipPrice {
+				s.logger.LogInfo("GenerateSignals [%s]: Skipping predictive buy—Support (%.2f) not deep enough below current (%.2f).", data.AssetPair, supportPrice, currentPrice)
+				return nil, nil
+			}
+
 			predictiveSignal := StrategySignal{
 				Direction:        "predictive_buy",
-				Reason:           fmt.Sprintf("Predictive: Strong book support (Confidence: %.2f)", bookAnalysis.DepthScore),
-				RecommendedPrice: bookAnalysis.SupportLevels[0].PriceLevel,
+				Reason:           fmt.Sprintf("Predictive: Strong book support (Confidence: %.2f) on dip (RSI: %.2f)", bookAnalysis.DepthScore, rsi),
+				RecommendedPrice: supportPrice,
 				CalculatedSize:   0, // Defer size calculation.
 			}
 			return []StrategySignal{predictiveSignal}, nil
@@ -184,7 +204,6 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 	s.logger.LogInfo("GenerateSignals [%s]: Final confirmation PASSED. Reason: %s. Generating signal.", data.AssetPair, confirmationReason)
 
 	var signals []StrategySignal
-	currentPrice := data.ProvidersData[0].CurrentPrice
 	recommendedPrice := FindBestLimitPrice(data.BrokerOrderBook, currentPrice-atr, 1.0)
 	// For a standard buy, we still calculate the size here based on portfolio risk.
 	calculatedSize := AdjustPositionSize(data.PortfolioValue, atr, cfg.Trading.PortfolioRiskPerTrade)
