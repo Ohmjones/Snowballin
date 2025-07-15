@@ -140,17 +140,22 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 	// If consensus is not a "buy", check for a predictive opportunity based on order book strength.
 	bookAnalysis := PerformOrderBookAnalysis(data.BrokerOrderBook, 1.0, 10, 1.5)
 	if !isBuy && bookAnalysis.DepthScore > cfg.Trading.MinBookConfidenceForPredictive {
-		// Check if the new unified Martingale logic is enabled in the config.
 		if cfg.Trading.UseMartingaleForPredictive {
 			s.logger.LogInfo("GenerateSignals [%s]: Consensus failed, but strong book (%f). Signaling for predictive buy.", data.AssetPair, bookAnalysis.DepthScore)
 
-			// The strategy now just signals the *intent* to make a predictive buy.
-			// The app.go logic will handle the Martingale sizing and price deviation.
+			// --- THIS IS THE FIX ---
+			// Ensure that at least one support level was actually found before proceeding.
+			if len(bookAnalysis.SupportLevels) == 0 {
+				s.logger.LogWarn("GenerateSignals [%s]: Predictive buy triggered, but no concrete support levels were found in the order book.", data.AssetPair)
+				return nil, nil // Return no signal to prevent a panic.
+			}
+			// --- END OF FIX ---
+
 			predictiveSignal := StrategySignal{
 				Direction:        "predictive_buy",
 				Reason:           fmt.Sprintf("Predictive: Strong book support (Confidence: %.2f)", bookAnalysis.DepthScore),
-				RecommendedPrice: bookAnalysis.SupportLevels[0].PriceLevel, // Recommend the strongest support price.
-				CalculatedSize:   0,                                        // DEFER size calculation to the main app logic to enforce Martingale rules.
+				RecommendedPrice: bookAnalysis.SupportLevels[0].PriceLevel, // Now this line is safe.
+				CalculatedSize:   0,                                        // Defer size calculation.
 			}
 			return []StrategySignal{predictiveSignal}, nil
 		}
