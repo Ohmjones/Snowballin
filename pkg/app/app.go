@@ -77,13 +77,11 @@ func startFNGUpdater(ctx context.Context, fearGreedProvider dataprovider.FearGre
 		}
 	}()
 }
-
 func getCurrentFNG() dataprovider.FearGreedIndex {
 	fngMutex.RLock()
 	defer fngMutex.RUnlock()
 	return currentFNG
 }
-
 func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger) error {
 	if len(cfg.Trading.AssetPairs) == 0 {
 		return errors.New("pre-flight check failed: no asset_pairs configured in config.json")
@@ -291,7 +289,6 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 		}
 	}
 }
-
 func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, assetPair string, actualBalance float64) (*utilities.Position, error) {
 	state.logger.LogWarn("Reconstruction: Attempting to reconstruct orphaned position for %s. Target balance: %f", assetPair, actualBalance)
 
@@ -362,7 +359,6 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 
 	return reconstructedPosition, nil
 }
-
 func processTradingCycle(ctx context.Context, state *TradingState) {
 	state.logger.LogInfo("-------------------- New Trading Cycle --------------------")
 
@@ -480,7 +476,6 @@ func processTradingCycle(ctx context.Context, state *TradingState) {
 		// --- END OF DUST LOGIC FIX ---
 	}
 }
-
 func reapStaleOrders(ctx context.Context, state *TradingState) {
 	state.stateMutex.RLock()
 	if len(state.pendingOrders) == 0 {
@@ -515,7 +510,6 @@ func reapStaleOrders(ctx context.Context, state *TradingState) {
 		}
 	}
 }
-
 func processPendingOrders(ctx context.Context, state *TradingState) {
 	state.stateMutex.RLock()
 	if len(state.pendingOrders) == 0 {
@@ -613,7 +607,6 @@ func processPendingOrders(ctx context.Context, state *TradingState) {
 		}
 	}
 }
-
 func updatePositionFromFill(state *TradingState, order broker.Order, assetPair string) {
 	if strings.EqualFold(order.Side, "buy") {
 		position, hasPosition := state.openPositions[assetPair]
@@ -669,28 +662,52 @@ func updatePositionFromFill(state *TradingState, order broker.Order, assetPair s
 		}
 	}
 }
-
 func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities.Position, signals []strategy.StrategySignal, consolidatedData *strategy.ConsolidatedMarketPicture) {
 	state.logger.LogInfo("ManagePosition [%s]: Managing position. AvgPrice: %.2f, Vol: %.8f, SOs: %d, TP: %.2f",
 		pos.AssetPair, pos.AveragePrice, pos.TotalVolume, pos.FilledSafetyOrders, pos.CurrentTakeProfit)
 
-	// Check for an overriding SELL signal from the main strategy.
+	// --- NEW LOGIC: Prioritize adding to the position on a new BUY signal ---
 	for _, sig := range signals {
-		if sig.Direction == "sell" {
-			state.logger.LogWarn("!!! [SELL] signal from strategy for open position %s. Reason: %s. Liquidating.", pos.AssetPair, sig.Reason)
-			orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
-			if err != nil {
-				state.logger.LogError("ManagePosition [%s]: Failed to place market sell order based on new SELL signal: %v", pos.AssetPair, err)
+		if sig.Direction == "buy" || sig.Direction == "predictive_buy" {
+			state.logger.LogInfo("ManagePosition [%s]: New '%s' signal received. Adding to existing position.", pos.AssetPair, strings.ToUpper(sig.Direction))
+
+			orderPrice := sig.RecommendedPrice
+			orderSizeInBase := sig.CalculatedSize
+
+			if orderSizeInBase <= 0 {
+				state.logger.LogWarn("ManagePosition [%s]: Calculated size for add-on order is zero. Falling back to base order size.", pos.AssetPair)
+				orderSizeInBase = state.config.Trading.BaseOrderSize / orderPrice
+			}
+			if orderPrice <= 0 {
+				state.logger.LogError("ManagePosition [%s]: Invalid add-on order price (<= 0). Aborting.", pos.AssetPair)
+				return // Abort this action
+			}
+
+			orderID, placeErr := state.broker.PlaceOrder(ctx, pos.AssetPair, "buy", "limit", orderSizeInBase, orderPrice, 0, "")
+			if placeErr != nil {
+				state.logger.LogError("ManagePosition [%s]: Failed to place add-on buy order: %v", pos.AssetPair, placeErr)
 			} else {
+				state.logger.LogInfo("ManagePosition [%s]: Placed add-on order ID %s at %.2f.", pos.AssetPair, orderID, orderPrice)
+
+				// Send a specific Discord message for this action
+				baseAsset := strings.Split(pos.AssetPair, "/")[0]
+				quoteAsset := strings.Split(pos.AssetPair, "/")[1]
+				message := fmt.Sprintf("➕ **Adding to Position**\n**Pair:** %s\n**Size:** `%.4f %s`\n**Price:** `%.2f %s`\n**Reason:** %s",
+					pos.AssetPair, orderSizeInBase, baseAsset, orderPrice, quoteAsset, sig.Reason)
+				state.discordClient.SendMessage(message)
+
 				state.stateMutex.Lock()
 				state.pendingOrders[orderID] = pos.AssetPair
 				_ = state.cache.SavePendingOrder(orderID, pos.AssetPair)
 				state.stateMutex.Unlock()
 			}
-			return // Exit management; the position is being closed.
+			// Exit after placing the add-on order. We don't want to also place a safety order in the same cycle.
+			return
 		}
 	}
+	// --- END OF NEW LOGIC ---
 
+	// If no new buy signals, proceed with standard management (TP, SL, DCA)
 	var currentPrice float64
 	for _, pData := range consolidatedData.ProvidersData {
 		if pData.Name == "kraken" {
@@ -703,6 +720,7 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 		return
 	}
 
+	// [ ... The rest of the take-profit, trailing stop, and safety order logic remains exactly the same ... ]
 	// Check for a specific "emergency" exit signal.
 	stratInstance := strategy.NewStrategy(state.logger)
 	exitSignal, shouldExit := stratInstance.GenerateExitSignal(ctx, *consolidatedData, *state.config)
@@ -848,7 +866,6 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 		}
 	}
 }
-
 func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair string, signals []strategy.StrategySignal, consolidatedData *strategy.ConsolidatedMarketPicture) {
 	for _, sig := range signals {
 		if strings.Contains(strings.ToLower(sig.Direction), "buy") {
@@ -1000,7 +1017,6 @@ func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair 
 
 	return consolidatedData, nil
 }
-
 func liquidateAllPositions(ctx context.Context, state *TradingState, reason string) {
 	state.stateMutex.Lock()
 	defer state.stateMutex.Unlock()
