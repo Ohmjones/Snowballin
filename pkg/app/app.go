@@ -292,11 +292,28 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 			continue
 		}
 
-		// 4. If we have a balance for a configured pair but no position in our DB, reconstruct it.
+		// 4. If we have a balance for a configured pair but no position in our DB, check if it's dust before reconstructing.
 		_, hasPositionInDB := loadedPositions[assetPair]
 		if !hasPositionInDB {
+			// --- ADDED: Dust check before reconstruction ---
+			// Fetch the current price to evaluate if the balance is dust.
+			ticker, tickerErr := krakenAdapter.GetTicker(ctx, assetPair)
+			if tickerErr != nil {
+				// If we can't get a price, we have to proceed with the reconstruction attempt as a fallback.
+				logger.LogWarn("Reconciliation: Could not fetch ticker for %s to check for dust, proceeding with reconstruction attempt: %v", assetPair, tickerErr)
+			} else {
+				balanceInUSD := balance.Total * ticker.LastPrice
+				if balanceInUSD < cfg.Trading.DustThresholdUSD {
+					logger.LogInfo("Reconciliation: Ignoring orphaned dust balance of %f for %s (value: $%.4f).", balance.Total, assetPair, balanceInUSD)
+					continue // Skip to the next balance
+				}
+			}
+			// --- END ADDED ---
+
+			// If it's not dust, proceed with reconstruction.
 			reconstructedPos, reconErr := ReconstructOrphanedPosition(ctx, tempStateForRecon, assetPair, balance.Total)
 			if reconErr != nil {
+				// A failure here is now critical because we've confirmed it's a significant, non-dust balance.
 				logger.LogFatal("ORPHANED POSITION DETECTED for %s, but reconstruction failed: %v. Manual intervention required.", assetPair, reconErr)
 			}
 
