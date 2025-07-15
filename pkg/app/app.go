@@ -384,7 +384,7 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, assetPair string, actualBalance float64) (*utilities.Position, error) {
 	state.logger.LogWarn("Reconstruction: Attempting to reconstruct orphaned position for %s. Target balance: %f", assetPair, actualBalance)
 
-	since := time.Time{} // Fetch all historical trades
+	since := time.Now().Add(-30 * 24 * time.Hour) // Limit to last 30 days to avoid rate limits on new accounts
 	tradeHistory, err := state.broker.GetTrades(ctx, assetPair, since)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get trade history for %s: %w", assetPair, err)
