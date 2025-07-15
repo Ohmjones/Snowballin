@@ -887,7 +887,7 @@ func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair st
 				continue
 			}
 
-			// --- CORRECTED SIZING LOGIC ---
+			// --- CORRECTED SIZING AND PRICING LOGIC ---
 			if strings.EqualFold(sig.Direction, "buy") {
 				// This is a high-conviction CONSENSUS buy.
 				orderPrice = sig.RecommendedPrice
@@ -899,14 +899,14 @@ func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair st
 					state.logger.LogInfo("SeekEntry [%s]: Applying x%.2f multiplier to consensus buy. New size: %.4f", assetPair, state.config.Trading.ConsensusBuyMultiplier, orderSizeInBase)
 				}
 			} else { // This is a "predictive_buy"
-				// For predictive buys, place the order at a discount to the current price.
-				deviation := state.config.Trading.PredictiveBuyDeviationPercent / 100.0
-				orderPrice = currentPrice * (1 - deviation)
-				// Use the standard Martingale base order size, ignoring any multipliers.
+				// For predictive buys, trust the price from the order book analysis in the signal.
+				orderPrice = sig.RecommendedPrice
+				// Use the standard Martingale base order size for the predictive entry.
 				orderSizeInBase = state.config.Trading.BaseOrderSize / orderPrice
-				state.logger.LogInfo("SeekEntry [%s]: Predictive buy will be placed at %.2f (%.2f%% below current price).", assetPair, orderPrice, state.config.Trading.PredictiveBuyDeviationPercent)
+				// CORRECTED LOG MESSAGE: Reflects that the price comes from the signal, not a static deviation.
+				state.logger.LogInfo("SeekEntry [%s]: Predictive buy placing order at %.2f based on detected support level from strategy signal.", assetPair, orderPrice)
 			}
-			// --- END OF CORRECTED SIZING LOGIC ---
+			// --- END OF CORRECTED SIZING AND PRICING LOGIC ---
 
 			if orderSizeInBase <= 0 || orderPrice <= 0 {
 				state.logger.LogError("SeekEntry [%s]: Invalid order parameters (size=%.4f, price=%.2f). Aborting.", assetPair, orderSizeInBase, orderPrice)
