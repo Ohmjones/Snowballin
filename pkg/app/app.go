@@ -36,10 +36,10 @@ type TradingState struct {
 	openPositions           map[string]*utilities.Position
 	pendingOrders           map[string]string // Maps orderID to assetPair
 	stateMutex              sync.RWMutex
+	sellReasons             map[string]string
 	isCircuitBreakerTripped bool
-	// --- ADDED: Store live fee rates in the trading state ---
-	makerFeeRate float64
-	takerFeeRate float64
+	makerFeeRate            float64
+	takerFeeRate            float64
 }
 
 var (
@@ -338,9 +338,9 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 		openPositions:           loadedPositions,
 		pendingOrders:           loadedPendingOrders,
 		isCircuitBreakerTripped: false,
-		// --- ADDED: Store fees in the main state ---
-		makerFeeRate: makerFee,
-		takerFeeRate: takerFee,
+		sellReasons:             make(map[string]string),
+		makerFeeRate:            makerFee,
+		takerFeeRate:            takerFee,
 	}
 
 	// --- ADDED: Goroutine to refresh fees periodically ---
@@ -631,13 +631,24 @@ func updatePositionFromFill(state *TradingState, order broker.Order, assetPair s
 	} else { // Sell order
 		if pos, ok := state.openPositions[assetPair]; ok {
 			if math.Abs(pos.TotalVolume-order.ExecutedVol) < 1e-8 {
-				// --- MODIFIED: Calculate true profit using actual cost and fees ---
-				// Note: This is for reporting only. The decision to sell was already made based on the fee-aware TP price.
+				// --- MODIFIED BLOCK START ---
+				state.stateMutex.Lock()
+				reason, hasReason := state.sellReasons[order.ID]
+				if !hasReason {
+					reason = "Unknown" // Fallback
+				}
+				delete(state.sellReasons, order.ID) // Clean up the map
+				state.stateMutex.Unlock()
+
 				totalBuyCost := (pos.AveragePrice * pos.TotalVolume) * (1 + state.makerFeeRate)
-				netProceeds := (order.Cost) * (1 - state.takerFeeRate)
+				netProceeds := order.Cost // The cost from a sell order is the net proceeds before fees
 				profit := netProceeds - totalBuyCost
 				profitPercent := (profit / totalBuyCost) * 100
-				state.discordClient.NotifyOrderFilled(order, fmt.Sprintf("💰 Position Closed\nNet Profit: %.2f %s (%.2f%%)", profit, state.config.Trading.QuoteCurrency, profitPercent))
+
+				// Add the reason to the notification
+				state.discordClient.NotifyOrderFilled(order, fmt.Sprintf("💰 **Position Closed**\n**Reason: %s**\nNet Profit: `%.2f %s` (`%.2f%%`)", reason, profit, state.config.Trading.QuoteCurrency, profitPercent))
+				// --- MODIFIED BLOCK END ---
+
 				delete(state.openPositions, assetPair)
 				_ = state.cache.DeletePosition(assetPair)
 			} else {
@@ -836,6 +847,8 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 		} else {
 			state.stateMutex.Lock()
 			state.pendingOrders[orderID] = pos.AssetPair
+			// --- ADD THIS LINE ---
+			state.sellReasons[orderID] = exitSignal.Reason
 			_ = state.cache.SavePendingOrder(orderID, pos.AssetPair)
 			state.stateMutex.Unlock()
 		}
@@ -857,10 +870,12 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 			state.logger.LogInfo("ManagePosition [%s]: TRAILING STOP-LOSS HIT at %.2f (Peak was %.2f). Placing market sell order.", pos.AssetPair, currentPrice, pos.PeakPriceSinceTP)
 			orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
 			if err != nil {
-				state.logger.LogError("ManagePosition [%s]: Failed to place market sell order for trailing stop: %v", pos.AssetPair, err)
+				//...
 			} else {
 				state.stateMutex.Lock()
 				state.pendingOrders[orderID] = pos.AssetPair
+				// --- ADD THIS LINE ---
+				state.sellReasons[orderID] = "Trailing Stop-Loss Hit"
 				_ = state.cache.SavePendingOrder(orderID, pos.AssetPair)
 				state.stateMutex.Unlock()
 			}
@@ -894,10 +909,12 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 			state.logger.LogInfo("ManagePosition [%s]: TAKE-PROFIT HIT at %.2f. Placing market sell order (trailing stop disabled).", pos.AssetPair, currentPrice)
 			orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
 			if err != nil {
-				state.logger.LogError("ManagePosition [%s]: Failed to place market sell order for take-profit: %v", pos.AssetPair, err)
+				//...
 			} else {
 				state.stateMutex.Lock()
 				state.pendingOrders[orderID] = pos.AssetPair
+				// --- ADD THIS LINE ---
+				state.sellReasons[orderID] = "Take-Profit Target Hit"
 				_ = state.cache.SavePendingOrder(orderID, pos.AssetPair)
 				state.stateMutex.Unlock()
 			}
