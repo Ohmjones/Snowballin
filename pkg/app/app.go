@@ -386,7 +386,7 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 	lookbackDuration := 90 * 24 * time.Hour
 	startTime := time.Now().Add(-lookbackDuration)
 
-	tradeHistory, err := state.broker.GetTrades(ctx, assetPair, startTime) // Use startTime instead of zeroTime
+	tradeHistory, err := state.broker.GetTrades(ctx, assetPair, startTime)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get trade history for %s: %w", assetPair, err)
 	}
@@ -395,7 +395,6 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 		return nil, fmt.Errorf("no trade history found for this asset, cannot reconstruct")
 	}
 
-	// Sort descending (latest first)
 	sort.Slice(tradeHistory, func(i, j int) bool {
 		return tradeHistory[i].Timestamp.After(tradeHistory[j].Timestamp)
 	})
@@ -408,7 +407,6 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 		if accumulatedVolume >= actualBalance-tolerance {
 			break
 		}
-
 		if trade.Side == "buy" {
 			positionTrades = append([]broker.Trade{trade}, positionTrades...)
 			accumulatedVolume += trade.Volume
@@ -421,7 +419,39 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 		return nil, fmt.Errorf("found trade history for %s, but could not isolate a sequence of buys for the current balance of %f", assetPair, actualBalance)
 	}
 
-	// Fetch current price to evaluate mismatch in USD terms
+	// --- FIX STARTS HERE: Handle volume overshoot by scaling the oldest trade ---
+	if accumulatedVolume > actualBalance+tolerance {
+		state.logger.LogWarn("Reconstruction [%s]: Accumulated volume (%.8f) overshot actual balance (%.8f). Adjusting oldest trade.", assetPair, accumulatedVolume, actualBalance)
+
+		// The oldest trade is at the start of the slice because we prepended trades (FILO).
+		oldestTrade := &positionTrades[0]
+		overshootVolume := accumulatedVolume - actualBalance
+		neededVolumeFromOldest := oldestTrade.Volume - overshootVolume
+
+		// This is a sanity check. If this is negative, our history is too complex to reconstruct this way.
+		if neededVolumeFromOldest < 0 {
+			return nil, fmt.Errorf("reconstruction logic failed: needed volume from oldest trade is negative, indicating a complex history beyond this function's scope")
+		}
+
+		// Calculate the scaling factor for cost and fee.
+		scaleFactor := neededVolumeFromOldest / oldestTrade.Volume
+		state.logger.LogInfo("Reconstruction [%s]: Scaling oldest trade (Vol: %.8f) by factor %.4f to match balance.", assetPair, oldestTrade.Volume, scaleFactor)
+
+		// Apply the scaling factor to the oldest trade's financial details.
+		oldestTrade.Cost *= scaleFactor
+		oldestTrade.Fee *= scaleFactor
+		oldestTrade.Volume = neededVolumeFromOldest // Set the volume to the exact amount needed.
+
+		// Recalculate the total accumulated volume to ensure it matches perfectly now.
+		var newAccumulatedVolume float64
+		for _, t := range positionTrades {
+			newAccumulatedVolume += t.Volume
+		}
+		accumulatedVolume = newAccumulatedVolume
+	}
+	// --- FIX ENDS HERE ---
+
+	// Fetch current price to evaluate any remaining tiny mismatch in USD terms
 	ticker, tickerErr := state.broker.GetTicker(ctx, assetPair)
 	if tickerErr != nil {
 		return nil, fmt.Errorf("failed to get ticker for %s during reconstruction: %w", assetPair, tickerErr)
@@ -435,16 +465,12 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 	valueDiff := diff * currentPrice
 
 	if diff > tolerance {
+		// With the new logic, we should only hit this for true dust amounts.
 		if valueDiff < state.config.Trading.DustThresholdUSD {
-			state.logger.LogWarn("Reconstruction [%s]: Small volume mismatch (diff: %.8f, value: $%.4f < dust threshold $%.2f). Adjusting costs to match actual balance.", assetPair, diff, valueDiff, state.config.Trading.DustThresholdUSD)
-			scale := actualBalance / accumulatedVolume
+			state.logger.LogWarn("Reconstruction [%s]: Adjusting for minor dust difference (%.8f, value: $%.4f)", assetPair, diff, valueDiff)
 			accumulatedVolume = actualBalance
-			// Scale costs and fees proportionally (approximation for tiny diffs)
-			for i := range positionTrades {
-				positionTrades[i].Cost *= scale
-				positionTrades[i].Fee *= scale
-			}
 		} else {
+			// This error should no longer occur with the new logic, but it's kept as a safeguard.
 			return nil, fmt.Errorf("reconstructed volume %.8f does not match actual balance %.8f for %s (difference %.8f exceeds tolerance; value $%.4f)", accumulatedVolume, actualBalance, assetPair, diff, valueDiff)
 		}
 	}
@@ -471,7 +497,7 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 		AveragePrice:       totalCost / accumulatedVolume,
 		TotalVolume:        finalVolume,
 		BaseOrderPrice:     baseOrderTrade.Price,
-		BaseOrderSize:      baseOrderTrade.Cost,
+		BaseOrderSize:      baseOrderTrade.Cost, // This now reflects the scaled cost if adjusted
 		FilledSafetyOrders: filledSafetyOrders,
 		IsDcaActive:        true,
 		BrokerOrderID:      baseOrderTrade.OrderID,
