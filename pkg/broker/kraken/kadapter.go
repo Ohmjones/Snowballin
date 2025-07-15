@@ -197,11 +197,11 @@ func (a *Adapter) GetLastNOHLCVBars(ctx context.Context, pair string, intervalMi
 }
 
 func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) ([]broker.Trade, error) {
+	var allTrades []broker.Trade
 	params := url.Values{}
 	if !since.IsZero() {
 		params.Set("start", strconv.FormatInt(since.Unix(), 10))
 	}
-
 	if pair != "" {
 		krakenPair, err := a.client.GetPrimaryKrakenPairName(ctx, pair)
 		if err != nil {
@@ -210,47 +210,58 @@ func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) (
 		params.Set("pair", krakenPair)
 	}
 
-	tradesMap, _, err := a.client.QueryTradesAPI(ctx, params)
-	if err != nil {
-		return nil, err
-	}
-
-	var trades []broker.Trade
-	for tradeID, trade := range tradesMap {
-		commonPair, commonPairErr := a.client.GetCommonPairName(ctx, trade.Pair)
-		if commonPairErr != nil {
-			a.logger.LogWarn("GetTrades: could not get common pair name for %s, skipping trade. Error: %v", trade.Pair, commonPairErr)
-			continue
+	ofs := int64(0)
+	for {
+		params.Set("ofs", strconv.FormatInt(ofs, 10))
+		tradesMap, _, err := a.client.QueryTradesAPI(ctx, params)
+		if err != nil {
+			return nil, err
 		}
 
-		if pair != "" && commonPair != pair {
-			continue
+		var pageTrades []broker.Trade
+		for tradeID, trade := range tradesMap {
+			commonPair, commonPairErr := a.client.GetCommonPairName(ctx, trade.Pair)
+			if commonPairErr != nil {
+				a.logger.LogWarn("GetTrades: could not get common pair name for %s, skipping trade. Error: %v", trade.Pair, commonPairErr)
+				continue
+			}
+
+			if pair != "" && commonPair != pair {
+				continue
+			}
+
+			price, _ := strconv.ParseFloat(trade.Price, 64)
+			volume, _ := strconv.ParseFloat(trade.Vol, 64)
+			fee, _ := strconv.ParseFloat(trade.Fee, 64)
+			cost, _ := strconv.ParseFloat(trade.Cost, 64)
+
+			pageTrades = append(pageTrades, broker.Trade{
+				ID:          tradeID,
+				OrderID:     trade.Ordtxid,
+				Pair:        commonPair,
+				Side:        trade.Type,
+				Price:       price,
+				Volume:      volume,
+				Cost:        cost,
+				Fee:         fee,
+				FeeCurrency: strings.Split(commonPair, "/")[1],
+				Timestamp:   time.Unix(int64(trade.Time), 0),
+			})
 		}
 
-		price, _ := strconv.ParseFloat(trade.Price, 64)
-		volume, _ := strconv.ParseFloat(trade.Vol, 64)
-		fee, _ := strconv.ParseFloat(trade.Fee, 64)
-		cost, _ := strconv.ParseFloat(trade.Cost, 64)
+		allTrades = append(allTrades, pageTrades...)
 
-		trades = append(trades, broker.Trade{
-			ID:          tradeID,
-			OrderID:     trade.Ordtxid,
-			Pair:        commonPair,
-			Side:        trade.Type,
-			Price:       price,
-			Volume:      volume,
-			Cost:        cost,
-			Fee:         fee,
-			FeeCurrency: strings.Split(commonPair, "/")[1],
-			Timestamp:   time.Unix(int64(trade.Time), 0),
-		})
+		if len(tradesMap) < 50 {
+			break
+		}
+		ofs += 50
 	}
 
-	sort.Slice(trades, func(i, j int) bool {
-		return trades[i].Timestamp.Before(trades[j].Timestamp)
+	sort.Slice(allTrades, func(i, j int) bool {
+		return allTrades[i].Timestamp.Before(allTrades[j].Timestamp)
 	})
 
-	return trades, nil
+	return allTrades, nil
 }
 
 func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (float64, error) {

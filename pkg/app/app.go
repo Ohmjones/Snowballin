@@ -384,22 +384,23 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, assetPair string, actualBalance float64) (*utilities.Position, error) {
 	state.logger.LogWarn("Reconstruction: Attempting to reconstruct orphaned position for %s. Target balance: %f", assetPair, actualBalance)
 
-	ninetyDaysAgo := time.Now().Add(-90 * 24 * time.Hour)
-	tradeHistory, err := state.broker.GetTrades(ctx, assetPair, ninetyDaysAgo)
+	since := time.Time{} // Fetch all historical trades
+	tradeHistory, err := state.broker.GetTrades(ctx, assetPair, since)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get trade history for %s: %w", err)
+		return nil, fmt.Errorf("failed to get trade history for %s: %w", assetPair, err)
 	}
 
 	if len(tradeHistory) == 0 {
-		return nil, fmt.Errorf("no trade history found for this asset in the last 90 days, cannot reconstruct")
+		return nil, fmt.Errorf("no trade history found for this asset, cannot reconstruct")
 	}
 
+	// Sort descending (latest first)
 	sort.Slice(tradeHistory, func(i, j int) bool {
 		return tradeHistory[i].Timestamp.After(tradeHistory[j].Timestamp)
 	})
 
 	var positionTrades []broker.Trade
-	accumulatedVolume := 0.0
+	var accumulatedVolume float64
 	const tolerance = 1e-8
 
 	for _, trade := range tradeHistory {
@@ -419,7 +420,11 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 		return nil, fmt.Errorf("found trade history for %s, but could not isolate a sequence of buys for the current balance of %f", assetPair, actualBalance)
 	}
 
-	// --- MODIFIED: Track total cost and fees separately for perfect accuracy ---
+	// Check if reconstructed volume matches actual balance
+	if math.Abs(accumulatedVolume-actualBalance) > tolerance {
+		return nil, fmt.Errorf("reconstructed volume %.8f does not match actual balance %.8f for %s (difference exceeds tolerance %.8f)", accumulatedVolume, actualBalance, assetPair, tolerance)
+	}
+
 	var totalCost, totalFees float64
 	baseOrderTrade := positionTrades[0]
 
@@ -427,10 +432,9 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 		totalCost += trade.Cost
 		totalFees += trade.Fee
 	}
-	// --- ADDED: Calculate the true total cost including fees ---
 	totalTrueBuyCost := totalCost + totalFees
 
-	finalVolume := actualBalance
+	finalVolume := accumulatedVolume
 	if finalVolume <= tolerance {
 		return nil, errors.New("reconstructed trades have zero or negative total volume, cannot reconstruct")
 	}
@@ -440,7 +444,7 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 	reconstructedPosition := &utilities.Position{
 		AssetPair:          assetPair,
 		EntryTimestamp:     baseOrderTrade.Timestamp,
-		AveragePrice:       totalCost / accumulatedVolume, // Average price remains fee-exclusive
+		AveragePrice:       totalCost / accumulatedVolume,
 		TotalVolume:        finalVolume,
 		BaseOrderPrice:     baseOrderTrade.Price,
 		BaseOrderSize:      baseOrderTrade.Cost,
@@ -448,10 +452,8 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 		IsDcaActive:        true,
 		BrokerOrderID:      baseOrderTrade.OrderID,
 	}
-	// --- MODIFIED: Use the new fee-aware calculator with the exact historical cost ---
 	reconstructedPosition.CurrentTakeProfit = calculateFeeAwareTakeProfitPrice(reconstructedPosition, state, totalTrueBuyCost)
 
-	// --- MODIFIED: Improved log message for clarity ---
 	state.logger.LogInfo("Reconstruction SUCCESS for %s. Avg Price: %.2f, Vol: %.8f, SOs: %d, Fee-Aware TP: %.2f",
 		assetPair, reconstructedPosition.AveragePrice, reconstructedPosition.TotalVolume, reconstructedPosition.FilledSafetyOrders, reconstructedPosition.CurrentTakeProfit)
 
