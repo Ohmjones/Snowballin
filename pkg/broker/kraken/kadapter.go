@@ -200,14 +200,19 @@ func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) (
 	var allTrades []broker.Trade
 	params := url.Values{}
 	if !since.IsZero() {
-		params.Set("start", strconv.FormatInt(since.Unix(), 10))
+		params.Set("start", strconv.FormatInt(since.UnixNano()/1e9, 10)) // Use UnixNano for more precision if needed by API
 	}
+
+	// This variable will hold the Kraken-specific pair name, e.g., "XETHZUSD"
+	var krakenPair string
 	if pair != "" {
-		krakenPair, err := a.client.GetPrimaryKrakenPairName(ctx, pair)
+		var err error
+		krakenPair, err = a.client.GetPrimaryKrakenPairName(ctx, pair)
 		if err != nil {
 			return nil, fmt.Errorf("GetTrades: could not resolve pair name for %s: %w", pair, err)
 		}
-		params.Set("pair", krakenPair)
+		// Note: The original code set params for "pair", which Kraken's TradesHistory
+		// endpoint actually ignores. Filtering must be done client-side.
 	}
 
 	ofs := int64(0)
@@ -220,15 +225,26 @@ func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) (
 
 		var pageTrades []broker.Trade
 		for tradeID, trade := range tradesMap {
-			commonPair, commonPairErr := a.client.GetCommonPairName(ctx, trade.Pair)
-			if commonPairErr != nil {
-				a.logger.LogWarn("GetTrades: could not get common pair name for %s, skipping trade. Error: %v", trade.Pair, commonPairErr)
+			// ---- OPTIMIZATION START ----
+			// If we are filtering for a specific pair, check if the trade's pair matches
+			// the Kraken-specific pair name we resolved earlier. This avoids an API call.
+			if krakenPair != "" && trade.Pair != krakenPair {
 				continue
 			}
 
-			if pair != "" && commonPair != pair {
-				continue
+			// Since we already have the common pair name ("pair"), we can use it directly.
+			// This avoids the GetCommonPairName call.
+			commonPair := pair
+			// If we didn't start with a pair filter, we still need to look it up.
+			if commonPair == "" {
+				var commonPairErr error
+				commonPair, commonPairErr = a.client.GetCommonPairName(ctx, trade.Pair)
+				if commonPairErr != nil {
+					a.logger.LogWarn("GetTrades: could not get common pair name for %s, skipping trade. Error: %v", trade.Pair, commonPairErr)
+					continue
+				}
 			}
+			// ---- OPTIMIZATION END ----
 
 			price, _ := strconv.ParseFloat(trade.Price, 64)
 			volume, _ := strconv.ParseFloat(trade.Vol, 64)
@@ -238,7 +254,7 @@ func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) (
 			pageTrades = append(pageTrades, broker.Trade{
 				ID:          tradeID,
 				OrderID:     trade.Ordtxid,
-				Pair:        commonPair,
+				Pair:        commonPair, // Use the common pair name
 				Side:        trade.Type,
 				Price:       price,
 				Volume:      volume,

@@ -383,8 +383,10 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 }
 func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, assetPair string, actualBalance float64) (*utilities.Position, error) {
 	state.logger.LogWarn("Reconstruction: Attempting to reconstruct orphaned position for %s. Target balance: %f", assetPair, actualBalance)
-	zeroTime := time.Time{} // represents Unix epoch 0
-	tradeHistory, err := state.broker.GetTrades(ctx, assetPair, zeroTime)
+	lookbackDuration := 90 * 24 * time.Hour
+	startTime := time.Now().Add(-lookbackDuration)
+
+	tradeHistory, err := state.broker.GetTrades(ctx, assetPair, startTime) // Use startTime instead of zeroTime
 	if err != nil {
 		return nil, fmt.Errorf("failed to get trade history for %s: %w", assetPair, err)
 	}
