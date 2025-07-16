@@ -197,9 +197,7 @@ func (a *Adapter) GetLastNOHLCVBars(ctx context.Context, pair string, intervalMi
 }
 
 func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) ([]broker.Trade, error) {
-	if pair == "" {
-		return nil, errors.New("GetTrades: pair cannot be empty")
-	}
+	// Removed: if pair == "" { return nil, errors.New("GetTrades: pair cannot be empty") } – Allows all trades when empty.
 
 	// Check cache first
 	cachedTrades, fresh, cacheErr := a.cache.GetCachedTrades(pair)
@@ -231,6 +229,11 @@ func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) (
 	if err != nil {
 		return nil, fmt.Errorf("GetTrades: could not resolve pair name for %s: %w", pair, err)
 	}
+
+	// Optimization: If pair is specified, let the server filter by setting 'pair' param (Kraken supports comma-delimited, but here it's single).
+	if pair != "" {
+		params.Set("pair", krakenPair)
+	} // If pair == "", omit to fetch all (default behavior).
 
 	ofs := int64(0)
 	maxRetries := 3
