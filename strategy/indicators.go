@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"Snowballin/utilities"
+	"math"
 )
 
 // CalculateRSI calculates the Relative Strength Index (RSI).
@@ -266,6 +267,89 @@ func IsBearishReversalAfterHuntDetected(bars []utilities.OHLCVBar, minWickPercen
 	return wickyVolSpike || reversalVolSpike
 }
 
+// CalculateBollingerBands calculates the upper and lower Bollinger Bands for the last bar.
+func CalculateBollingerBands(bars []utilities.OHLCVBar, period int, stdDev float64) (upperBand, lowerBand float64) {
+	if len(bars) < period {
+		return 0, 0
+	}
+
+	closes := extractClosesForIndicators(bars)
+	segment := closes[len(closes)-period:]
+
+	// Calculate SMA (middle band)
+	sum := 0.0
+	for _, close := range segment {
+		sum += close
+	}
+	sma := sum / float64(period)
+
+	// Calculate standard deviation
+	variance := 0.0
+	for _, close := range segment {
+		variance += math.Pow(close-sma, 2)
+	}
+	std := math.Sqrt(variance / float64(period))
+
+	upperBand = sma + (std * stdDev)
+	lowerBand = sma - (std * stdDev)
+
+	return upperBand, lowerBand
+}
+
+// CalculateStochastic calculates the Stochastic Oscillator (%K and %D) for the last bar.
+func CalculateStochastic(bars []utilities.OHLCVBar, kPeriod, dPeriod int) (percentK, percentD float64) {
+	if len(bars) < kPeriod {
+		return 0, 0
+	}
+
+	// For %K
+	segment := bars[len(bars)-kPeriod:]
+	lowestLow := segment[0].Low
+	highestHigh := segment[0].High
+	for _, bar := range segment {
+		if bar.Low < lowestLow {
+			lowestLow = bar.Low
+		}
+		if bar.High > highestHigh {
+			highestHigh = bar.High
+		}
+	}
+	currentClose := segment[len(segment)-1].Close
+	percentK = ((currentClose - lowestLow) / (highestHigh - lowestLow)) * 100
+
+	// For %D: SMA of %K over dPeriod (need historical %K if dPeriod >1)
+	// Simplified: If dPeriod==1, %D = %K; else compute full series if needed
+	// For now, assume simple %D as SMA of last dPeriod closes as proxy (expand for accuracy)
+	if dPeriod > 1 {
+		kSeries := make([]float64, 0, len(bars)-kPeriod+1)
+		for i := kPeriod - 1; i < len(bars); i++ {
+			subSegment := bars[i-kPeriod+1 : i+1]
+			subLow := subSegment[0].Low
+			subHigh := subSegment[0].High
+			for _, b := range subSegment {
+				if b.Low < subLow {
+					subLow = b.Low
+				}
+				if b.High > subHigh {
+					subHigh = b.High
+				}
+			}
+			k := ((bars[i].Close - subLow) / (subHigh - subLow)) * 100
+			kSeries = append(kSeries, k)
+		}
+		dSegment := kSeries[len(kSeries)-dPeriod:]
+		sumD := 0.0
+		for _, k := range dSegment {
+			sumD += k
+		}
+		percentD = sumD / float64(dPeriod)
+	} else {
+		percentD = percentK
+	}
+
+	return percentK, percentD
+}
+
 // CalculateIndicators aggregates all primary indicators.
 func CalculateIndicators(bars []utilities.OHLCVBar, cfg utilities.AppConfig) (
 	rsi float64,
@@ -274,6 +358,10 @@ func CalculateIndicators(bars []utilities.OHLCVBar, cfg utilities.AppConfig) (
 	obv float64,
 	volumeSpike bool,
 	liquidityHunt bool,
+	upperBB float64,
+	lowerBB float64,
+	stochK float64,
+	stochD float64,
 ) {
 	indicatorCfg := cfg.Indicators
 	closePrices := extractClosesForIndicators(bars)
@@ -291,6 +379,13 @@ func CalculateIndicators(bars []utilities.OHLCVBar, cfg utilities.AppConfig) (
 		indicatorCfg.LiquidityHunt.VolSpikeMultiplier,
 		indicatorCfg.LiquidityHunt.VolMAPeriod,
 	)
+
+	// New: Bollinger Bands (using defaults or add config if needed)
+	upperBB, lowerBB = CalculateBollingerBands(bars, 20, 2.0) // Standard 20-period, 2 stdDev
+
+	// New: Stochastic Oscillator (using config periods; assume added to IndicatorsConfig)
+	stochK, stochD = CalculateStochastic(bars, indicatorCfg.StochasticK, indicatorCfg.StochasticD) // e.g., 14,3
+
 	// Explicitly return all named variables to resolve the "unused variable" error.
-	return rsi, stochRSI, macdHist, obv, volumeSpike, bearishHuntReversal
+	return rsi, stochRSI, macdHist, obv, volumeSpike, bearishHuntReversal, upperBB, lowerBB, stochK, stochD
 }

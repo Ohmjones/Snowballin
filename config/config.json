@@ -84,8 +84,8 @@
     "trailing_stop_deviation": 1.5,
     "quote_currency": "USD",
     "portfolio_risk_per_trade": 0.5,
-    "base_order_size": 10.0,
-    "safety_order_size": 10.0,
+    "base_order_size": 15.0,
+    "safety_order_size": 15.0,
     "max_safety_orders": 8,
     "price_deviation_to_open_safety_orders": 1.5,
     "safety_order_step_scale": 1.5,
@@ -99,7 +99,10 @@
     "dust_threshold_usd": 1.0,
     "use_martingale_for_predictive": true,
     "predictive_buy_deviation_percent": 0.5,
-    "consensus_buy_multiplier": 2.0
+    "consensus_buy_multiplier": 2.0,
+    "predictive_rsi_threshold": 50,
+    "consensus_rsi_threshold": 45,
+    "rsi_adjust_factor": 10.0
   },
   "indicators": {
     "rsi_period": 14,
@@ -112,6 +115,8 @@
     "atr_period": 14,
     "volume_spike_factor": 2.0,
     "volume_lookback_period": 10,
+    "stochastic_k_period": 14,
+    "stochastic_d_period": 3,
     "liquidity_hunt": {
       "min_wick_percent": 60.0,
       "vol_spike_multiplier": 1.8,
@@ -121,15 +126,17 @@
   "consensus": {
     "use_multi_timeframe_consensus": true,
     "multi_timeframe": {
-      "base_timeframe": "1h",
+      "base_timeframe": "30m",
       "additional_timeframes": [
         "5m",
         "15m",
+        "1h",
         "4h",
         "1d",
         "1w"
       ],
       "tf_lookback_lengths": [
+        100,
         100,
         100,
         100,

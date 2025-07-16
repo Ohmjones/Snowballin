@@ -169,6 +169,8 @@ type IndicatorsConfig struct {
 	OBVNegativeThreshold  float64             `mapstructure:"obv_negative_threshold"`
 	OBVMAPeriod           int                 `mapstructure:"obv_ma_period"`
 	LiquidityHunt         LiquidityHuntConfig `mapstructure:"liquidity_hunt"`
+	StochasticK           int                 `mapstructure:"stochastic_k_period"` // e.g., 14
+	StochasticD           int                 `mapstructure:"stochastic_d_period"` // e.g., 3
 }
 
 // InMemoryNonceCounter provides a simple in-memory nonce generator.
@@ -393,6 +395,9 @@ type TradingConfig struct {
 	UseMartingaleForPredictive       bool     `mapstructure:"use_martingale_for_predictive"`
 	PredictiveBuyDeviationPercent    float64  `mapstructure:"predictive_buy_deviation_percent"`
 	ConsensusBuyMultiplier           float64  `mapstructure:"consensus_buy_multiplier"`
+	PredictiveRsiThreshold           float64  `mapstructure:"predictive_rsi_threshold"`
+	ConsensusRsiThreshold            float64  `mapstructure:"consensus_rsi_threshold"`
+	RsiAdjustFactor                  float64  `mapstructure:"rsi_adjust_factor"`
 }
 
 // WithdrawalConfig holds settings for automated withdrawal of funds.

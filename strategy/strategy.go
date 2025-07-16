@@ -4,6 +4,7 @@ import (
 	"Snowballin/utilities"
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 )
@@ -151,8 +152,25 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 
 			// Fix: Calculate RSI from primary bars to ensure dip
 			rsi := CalculateRSI(primaryBars, cfg.Indicators.RSIPeriod)
-			if rsi >= 50 {
-				s.logger.LogInfo("GenerateSignals [%s]: Skipping predictive buy—RSI (%.2f) not oversold.", data.AssetPair, rsi)
+
+			// Compute dynamic threshold using ATR for volatility adjustment
+			atr, err := CalculateATR(primaryBars, cfg.Indicators.ATRPeriod)
+			if err != nil {
+				s.logger.LogError("GenerateSignals [%s]: Could not calculate ATR for adaptive RSI: %v", data.AssetPair, err)
+				return nil, err
+			}
+
+			// Simple avgATR approximation: Use ATR of previous period or fallback to current (improve with historical if needed)
+			avgATR := atr // For now, use current as proxy; in production, average last N ATRs
+			if avgATR == 0 {
+				avgATR = 1.0 // Avoid div-zero
+			}
+			volRatio := atr / avgATR
+			dynamicRsiThreshold := cfg.Trading.PredictiveRsiThreshold - (volRatio * cfg.Trading.RsiAdjustFactor)
+			dynamicRsiThreshold = math.Max(30, math.Min(60, dynamicRsiThreshold)) // Clamp to prevent extremes (e.g., 30-60)
+
+			if rsi >= dynamicRsiThreshold {
+				s.logger.LogInfo("GenerateSignals [%s]: Skipping predictive buy—RSI (%.2f) not oversold (dynamic threshold: %.2f, vol ratio: %.2f).", data.AssetPair, rsi, dynamicRsiThreshold, volRatio)
 				return nil, nil
 			}
 
@@ -192,7 +210,7 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 	}
 	s.logger.LogInfo("GenerateSignals [%s]: MTF Consensus PASSED. Reason: %s. Performing final confirmation...", data.AssetPair, reason)
 
-	rsi, stochRSI, macdHist, obv, volumeSpike, liquidityHunt := CalculateIndicators(primaryBars, cfg)
+	rsi, stochRSI, macdHist, obv, volumeSpike, liquidityHunt, _, _, _, _ := CalculateIndicators(primaryBars, cfg) // Discard unused
 	isConfirmed, confirmationReason := CheckMultiIndicatorConfirmation(
 		rsi, stochRSI, macdHist, obv, volumeSpike, liquidityHunt, primaryBars, cfg.Indicators,
 	)
@@ -246,7 +264,7 @@ func (s *strategyImpl) GenerateExitSignal(ctx context.Context, data Consolidated
 	// [FIX] Call the updated CalculateIndicators function to get all signals at once.
 	// We use '_' to ignore the indicator values we don't need for this specific exit logic.
 	// The important variable is the final boolean we named 'bearishHuntReversal'.
-	_, _, _, _, _, bearishHuntReversal := CalculateIndicators(primaryBars, cfg)
+	_, _, _, _, _, bearishHuntReversal, _, _, _, _ := CalculateIndicators(primaryBars, cfg)
 
 	// [FIX] Use the new 'bearishHuntReversal' boolean for the check.
 	if bearishHuntReversal {
@@ -280,11 +298,18 @@ func checkBearishConfluence(bars []utilities.OHLCVBar, cfg utilities.AppConfig) 
 		return false, "Insufficient data for bearish confluence"
 	}
 
-	rsi, stochRSI, macdHist, _, _, _ := CalculateIndicators(bars, cfg)
+	rsi, stochRSI, macdHist, _, _, _, upperBB, _, stochK, stochD := CalculateIndicators(bars, cfg) // Discard unused
 
 	isMacdBearish := macdHist < 0
 	isRsiOverbought := rsi > 70
 	isStochRsiOverbought := stochRSI > cfg.Indicators.StochRSISellThreshold
+
+	// New: Bollinger Bands check (e.g., price touching upper band for overbought)
+	currentClose := bars[len(bars)-1].Close
+	isBollingerOverbought := currentClose >= upperBB
+
+	// New: Stochastic check (overbought >80 and bearish crossover: K crosses below D)
+	isStochOverbought := stochK > 80 && stochK < stochD // Bearish crossover
 
 	score := 0
 	var reasons []string
@@ -300,8 +325,16 @@ func checkBearishConfluence(bars []utilities.OHLCVBar, cfg utilities.AppConfig) 
 		score++
 		reasons = append(reasons, "StochRSI>80")
 	}
+	if isBollingerOverbought {
+		score++
+		reasons = append(reasons, "Price >= Upper Bollinger")
+	}
+	if isStochOverbought {
+		score++
+		reasons = append(reasons, "Stochastic >80 with bearish crossover")
+	}
 
-	if score >= 2 {
+	if score >= 3 { // Require at least 3 for confluence
 		return true, fmt.Sprintf("Bearish Confluence: %s", strings.Join(reasons, " & "))
 	}
 
