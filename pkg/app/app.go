@@ -262,7 +262,6 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 	}
 	logger.LogInfo("AppRun: Loaded %d open position(s) and %d pending order(s) from database.", len(loadedPositions), len(loadedPendingOrders))
 
-	// --- [THE FIX] This entire reconciliation block is rewritten for robustness. ---
 	logger.LogInfo("Reconciliation: Verifying consistency between database state and exchange balances...")
 	// --- MODIFIED: Pass the fetched fees into the temporary state for reconstruction ---
 	tempStateForRecon := &TradingState{broker: krakenAdapter, logger: logger, config: cfg, makerFeeRate: makerFee, takerFeeRate: takerFee}
@@ -279,27 +278,24 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 		configuredPairs[p] = true
 	}
 
-	// 2. Iterate over the REAL balances from the exchange.
+	// 2. Identify all potential orphaned pairs (configured pairs with significant balance but no DB position).
+	var orphanedPairs []string
 	for _, balance := range allBalances {
 		if balance.Total < 1e-8 { // Skip zero or dust balances
 			continue
 		}
 
-		// 3. Construct the pair name (e.g., "ETH/USD") and check if we are configured to trade it.
 		assetPair := fmt.Sprintf("%s/%s", balance.Currency, cfg.Trading.QuoteCurrency)
 		if !configuredPairs[assetPair] {
 			logger.LogDebug("Reconciliation: Skipping balance for %s as it is not a configured trading pair.", balance.Currency)
 			continue
 		}
 
-		// 4. If we have a balance for a configured pair but no position in our DB, check if it's dust before reconstructing.
 		_, hasPositionInDB := loadedPositions[assetPair]
 		if !hasPositionInDB {
-			// --- ADDED: Dust check before reconstruction ---
 			// Fetch the current price to evaluate if the balance is dust.
 			ticker, tickerErr := krakenAdapter.GetTicker(ctx, assetPair)
 			if tickerErr != nil {
-				// If we can't get a price, we have to proceed with the reconstruction attempt as a fallback.
 				logger.LogWarn("Reconciliation: Could not fetch ticker for %s to check for dust, proceeding with reconstruction attempt: %v", assetPair, tickerErr)
 			} else {
 				balanceInUSD := balance.Total * ticker.LastPrice
@@ -308,23 +304,55 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 					continue // Skip to the next balance
 				}
 			}
-			// --- END ADDED ---
-
-			// If it's not dust, proceed with reconstruction.
-			reconstructedPos, reconErr := ReconstructOrphanedPosition(ctx, tempStateForRecon, assetPair, balance.Total)
-			if reconErr != nil {
-				// A failure here is now critical because we've confirmed it's a significant, non-dust balance.
-				logger.LogFatal("ORPHANED POSITION DETECTED for %s, but reconstruction failed: %v. Manual intervention required.", assetPair, reconErr)
-			}
-
-			if err := sqliteCache.SavePosition(reconstructedPos); err != nil {
-				logger.LogFatal("Failed to save reconstructed position for %s to database: %v. Halting.", assetPair, err)
-			}
-			loadedPositions[assetPair] = reconstructedPos
+			orphanedPairs = append(orphanedPairs, assetPair)
 		}
 	}
+
+	// 3. If there are any orphaned pairs, fetch ALL trade history ONCE (with pair="") for the lookback period.
+	var allTrades []broker.Trade
+	if len(orphanedPairs) > 0 {
+		lookbackDuration := 90 * 24 * time.Hour // Consider lowering to 30*24*time.Hour if positions aren't old.
+		startTime := time.Now().Add(-lookbackDuration)
+		var err error
+		allTrades, err = krakenAdapter.GetTrades(ctx, "", startTime) // Fetch ALL trades across pairs.
+		if err != nil {
+			return fmt.Errorf("reconciliation failed: could not get all trade history from broker: %w", err)
+		}
+		logger.LogInfo("Reconciliation: Fetched %d trades across all pairs for reconstruction.", len(allTrades))
+	}
+
+	// 4. For each orphaned pair, filter the trades and reconstruct.
+	for _, assetPair := range orphanedPairs {
+		// Find the balance for this pair (from allBalances).
+		var actualBalance float64
+		baseCurrency := strings.Split(assetPair, "/")[0]
+		for _, bal := range allBalances {
+			if bal.Currency == baseCurrency {
+				actualBalance = bal.Total
+				break
+			}
+		}
+
+		// Filter allTrades for this specific assetPair.
+		var pairTrades []broker.Trade
+		for _, t := range allTrades {
+			if t.Pair == assetPair {
+				pairTrades = append(pairTrades, t)
+			}
+		}
+
+		// Reconstruct using the filtered trades (modified ReconstructOrphanedPosition below).
+		reconstructedPos, reconErr := ReconstructOrphanedPosition(ctx, tempStateForRecon, assetPair, actualBalance, pairTrades)
+		if reconErr != nil {
+			logger.LogFatal("ORPHANED POSITION DETECTED for %s, but reconstruction failed: %v. Manual intervention required.", assetPair, reconErr)
+		}
+
+		if err := sqliteCache.SavePosition(reconstructedPos); err != nil {
+			logger.LogFatal("Failed to save reconstructed position for %s to database: %v. Halting.", assetPair, err)
+		}
+		loadedPositions[assetPair] = reconstructedPos
+	}
 	logger.LogInfo("Reconciliation: State verification complete.")
-	// --- End of Fix ---
 
 	state := &TradingState{
 		broker:                  krakenAdapter,
@@ -381,15 +409,8 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 		}
 	}
 }
-func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, assetPair string, actualBalance float64) (*utilities.Position, error) {
+func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, assetPair string, actualBalance float64, tradeHistory []broker.Trade) (*utilities.Position, error) {
 	state.logger.LogWarn("Reconstruction: Attempting to reconstruct orphaned position for %s. Target balance: %f", assetPair, actualBalance)
-	lookbackDuration := 90 * 24 * time.Hour
-	startTime := time.Now().Add(-lookbackDuration)
-
-	tradeHistory, err := state.broker.GetTrades(ctx, assetPair, startTime)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get trade history for %s: %w", assetPair, err)
-	}
 
 	if len(tradeHistory) == 0 {
 		return nil, fmt.Errorf("no trade history found for this asset, cannot reconstruct")
@@ -419,37 +440,31 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 		return nil, fmt.Errorf("found trade history for %s, but could not isolate a sequence of buys for the current balance of %f", assetPair, actualBalance)
 	}
 
-	// --- FIX STARTS HERE: Handle volume overshoot by scaling the oldest trade ---
+	// --- FIX: Handle volume overshoot by scaling the oldest trade ---
 	if accumulatedVolume > actualBalance+tolerance {
 		state.logger.LogWarn("Reconstruction [%s]: Accumulated volume (%.8f) overshot actual balance (%.8f). Adjusting oldest trade.", assetPair, accumulatedVolume, actualBalance)
 
-		// The oldest trade is at the start of the slice because we prepended trades (FILO).
 		oldestTrade := &positionTrades[0]
 		overshootVolume := accumulatedVolume - actualBalance
 		neededVolumeFromOldest := oldestTrade.Volume - overshootVolume
 
-		// This is a sanity check. If this is negative, our history is too complex to reconstruct this way.
 		if neededVolumeFromOldest < 0 {
 			return nil, fmt.Errorf("reconstruction logic failed: needed volume from oldest trade is negative, indicating a complex history beyond this function's scope")
 		}
 
-		// Calculate the scaling factor for cost and fee.
 		scaleFactor := neededVolumeFromOldest / oldestTrade.Volume
 		state.logger.LogInfo("Reconstruction [%s]: Scaling oldest trade (Vol: %.8f) by factor %.4f to match balance.", assetPair, oldestTrade.Volume, scaleFactor)
 
-		// Apply the scaling factor to the oldest trade's financial details.
 		oldestTrade.Cost *= scaleFactor
 		oldestTrade.Fee *= scaleFactor
-		oldestTrade.Volume = neededVolumeFromOldest // Set the volume to the exact amount needed.
+		oldestTrade.Volume = neededVolumeFromOldest
 
-		// Recalculate the total accumulated volume to ensure it matches perfectly now.
 		var newAccumulatedVolume float64
 		for _, t := range positionTrades {
 			newAccumulatedVolume += t.Volume
 		}
 		accumulatedVolume = newAccumulatedVolume
 	}
-	// --- FIX ENDS HERE ---
 
 	// Fetch current price to evaluate any remaining tiny mismatch in USD terms
 	ticker, tickerErr := state.broker.GetTicker(ctx, assetPair)
@@ -465,12 +480,10 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 	valueDiff := diff * currentPrice
 
 	if diff > tolerance {
-		// With the new logic, we should only hit this for true dust amounts.
 		if valueDiff < state.config.Trading.DustThresholdUSD {
 			state.logger.LogWarn("Reconstruction [%s]: Adjusting for minor dust difference (%.8f, value: $%.4f)", assetPair, diff, valueDiff)
 			accumulatedVolume = actualBalance
 		} else {
-			// This error should no longer occur with the new logic, but it's kept as a safeguard.
 			return nil, fmt.Errorf("reconstructed volume %.8f does not match actual balance %.8f for %s (difference %.8f exceeds tolerance; value $%.4f)", accumulatedVolume, actualBalance, assetPair, diff, valueDiff)
 		}
 	}
@@ -497,7 +510,7 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 		AveragePrice:       totalCost / accumulatedVolume,
 		TotalVolume:        finalVolume,
 		BaseOrderPrice:     baseOrderTrade.Price,
-		BaseOrderSize:      baseOrderTrade.Cost, // This now reflects the scaled cost if adjusted
+		BaseOrderSize:      baseOrderTrade.Cost,
 		FilledSafetyOrders: filledSafetyOrders,
 		IsDcaActive:        true,
 		BrokerOrderID:      baseOrderTrade.OrderID,
@@ -1252,9 +1265,6 @@ func liquidateAllPositions(ctx context.Context, state *TradingState, reason stri
 		}
 	}
 }
-
-// --- NEW FUNCTION: Calculates the take-profit price including all fees ---
-// It uses the actual historical total cost for reconstructed positions, or estimates for live fills.
 func calculateFeeAwareTakeProfitPrice(pos *utilities.Position, state *TradingState, totalBuyCostWithFees float64) float64 {
 	targetProfitRate := state.config.Trading.TakeProfitPercentage / 100.0
 

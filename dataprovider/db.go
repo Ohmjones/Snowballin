@@ -1,8 +1,10 @@
 package dataprovider
 
 import (
+	"Snowballin/pkg/broker"
 	"Snowballin/utilities"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -64,6 +66,13 @@ func (s *SQLiteCache) InitSchema() error {
 		volume REAL NOT NULL,
 		UNIQUE(provider, coin_id, timestamp)
 	);
+
+	CREATE TABLE IF NOT EXISTS cached_trades (
+        asset_pair TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        data BLOB NOT NULL, -- JSON array of Trade structs
+        PRIMARY KEY (asset_pair)
+    );
 	CREATE INDEX IF NOT EXISTS idx_provider_coin_timestamp ON ohlcv_bars (provider, coin_id, timestamp);
 
 	CREATE TABLE IF NOT EXISTS open_positions (
@@ -85,7 +94,19 @@ func (s *SQLiteCache) InitSchema() error {
 		broker_order_id TEXT PRIMARY KEY,
 		asset_pair TEXT NOT NULL
 	);
-	`
+
+	CREATE TABLE IF NOT EXISTS cached_fees (
+		pair TEXT PRIMARY KEY,
+		maker_fee REAL NOT NULL,
+		taker_fee REAL NOT NULL,
+		timestamp INTEGER NOT NULL
+	);
+	
+	CREATE TABLE IF NOT EXISTS cached_tickers (
+		pair TEXT PRIMARY KEY,
+		data BLOB NOT NULL, -- JSON blob of TickerInfo
+		timestamp INTEGER NOT NULL
+);`
 	if _, err := s.db.Exec(schema); err != nil {
 		s.logger.LogError("Failed to execute database schema: %v", err)
 		return fmt.Errorf("failed to execute database schema: %w", err)
@@ -253,4 +274,72 @@ func (s *SQLiteCache) StartScheduledCleanup(interval time.Duration, provider str
 			}
 		}
 	}()
+}
+func (s *SQLiteCache) GetCachedFees(pair string) (maker, taker float64, fresh bool, err error) {
+	var ts int64
+	err = s.db.QueryRow(`SELECT maker_fee, taker_fee, timestamp FROM cached_fees WHERE pair = ?`, pair).Scan(&maker, &taker, &ts)
+	if err == sql.ErrNoRows {
+		return 0, 0, false, nil
+	} else if err != nil {
+		return 0, 0, false, err
+	}
+	fresh = time.Since(time.Unix(ts, 0)) < 24*time.Hour
+	return maker, taker, fresh, nil
+}
+
+func (s *SQLiteCache) SaveFees(pair string, maker, taker float64) error {
+	_, err := s.db.Exec(`INSERT OR REPLACE INTO cached_fees (pair, maker_fee, taker_fee, timestamp) VALUES (?, ?, ?, ?)`,
+		pair, maker, taker, time.Now().Unix())
+	return err
+}
+
+func (s *SQLiteCache) GetCachedTicker(pair string) (broker.TickerData, bool, error) {
+	var data []byte
+	var ts int64
+	err := s.db.QueryRow(`SELECT data, timestamp FROM cached_tickers WHERE pair = ?`, pair).Scan(&data, &ts)
+	if err == sql.ErrNoRows {
+		return broker.TickerData{}, false, nil
+	} else if err != nil {
+		return broker.TickerData{}, false, err
+	}
+	var ticker broker.TickerData
+	if jsonErr := json.Unmarshal(data, &ticker); jsonErr != nil {
+		return broker.TickerData{}, false, jsonErr
+	}
+	fresh := time.Since(time.Unix(ts, 0)) < time.Minute
+	return ticker, fresh, nil
+}
+func (s *SQLiteCache) GetCachedTrades(assetPair string) ([]broker.Trade, bool, error) {
+	var data []byte
+	var ts int64
+	err := s.db.QueryRow(`SELECT data, timestamp FROM cached_trades WHERE asset_pair = ?`, assetPair).Scan(&data, &ts)
+	if err == sql.ErrNoRows {
+		return nil, false, nil
+	} else if err != nil {
+		return nil, false, err
+	}
+	var trades []broker.Trade
+	if jsonErr := json.Unmarshal(data, &trades); jsonErr != nil {
+		return nil, false, jsonErr
+	}
+	fresh := time.Since(time.Unix(ts, 0)) < 24*time.Hour // Adjust TTL as needed (e.g., 1h for active trading)
+	return trades, fresh, nil
+}
+func (s *SQLiteCache) SaveTicker(pair string, ticker broker.TickerData) error {
+	data, err := json.Marshal(ticker)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`INSERT OR REPLACE INTO cached_tickers (pair, data, timestamp) VALUES (?, ?, ?)`,
+		pair, data, time.Now().Unix())
+	return err
+}
+func (s *SQLiteCache) SaveTrades(assetPair string, trades []broker.Trade) error {
+	data, err := json.Marshal(trades)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`INSERT OR REPLACE INTO cached_trades (asset_pair, data, timestamp) VALUES (?, ?, ?)`,
+		assetPair, data, time.Now().Unix())
+	return err
 }

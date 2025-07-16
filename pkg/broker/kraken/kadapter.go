@@ -197,45 +197,73 @@ func (a *Adapter) GetLastNOHLCVBars(ctx context.Context, pair string, intervalMi
 }
 
 func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) ([]broker.Trade, error) {
+	if pair == "" {
+		return nil, errors.New("GetTrades: pair cannot be empty")
+	}
+
+	// Check cache first
+	cachedTrades, fresh, cacheErr := a.cache.GetCachedTrades(pair)
+	if cacheErr == nil && fresh && len(cachedTrades) > 0 {
+		a.logger.LogDebug("GetTrades [%s]: Cache hit (fresh). Returning %d trades.", pair, len(cachedTrades))
+		// Filter by since if needed (cache has all, but we can filter client-side)
+		if !since.IsZero() {
+			var filtered []broker.Trade
+			for _, t := range cachedTrades {
+				if t.Timestamp.After(since) {
+					filtered = append(filtered, t)
+				}
+			}
+			return filtered, nil
+		}
+		return cachedTrades, nil
+	}
+
+	// Cache miss or stale: Fetch from API
 	var allTrades []broker.Trade
 	params := url.Values{}
 	if !since.IsZero() {
-		params.Set("start", strconv.FormatInt(since.UnixNano()/1e9, 10)) // Use UnixNano for more precision if needed by API
+		params.Set("start", strconv.FormatInt(since.UnixNano()/1e9, 10))
 	}
 
-	// This variable will hold the Kraken-specific pair name, e.g., "XETHZUSD"
 	var krakenPair string
-	if pair != "" {
-		var err error
-		krakenPair, err = a.client.GetPrimaryKrakenPairName(ctx, pair)
-		if err != nil {
-			return nil, fmt.Errorf("GetTrades: could not resolve pair name for %s: %w", pair, err)
-		}
-		// Note: The original code set params for "pair", which Kraken's TradesHistory
-		// endpoint actually ignores. Filtering must be done client-side.
+	var err error
+	krakenPair, err = a.client.GetPrimaryKrakenPairName(ctx, pair)
+	if err != nil {
+		return nil, fmt.Errorf("GetTrades: could not resolve pair name for %s: %w", pair, err)
 	}
 
 	ofs := int64(0)
+	maxRetries := 3
+	backoff := time.Second
+
 	for {
 		params.Set("ofs", strconv.FormatInt(ofs, 10))
-		tradesMap, _, err := a.client.QueryTradesAPI(ctx, params)
-		if err != nil {
-			return nil, err
+
+		var tradesMap map[string]KrakenTradeInfo
+		var lastErr error
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			tradesMap, _, lastErr = a.client.QueryTradesAPI(ctx, params)
+			if lastErr == nil {
+				break
+			}
+			if strings.Contains(lastErr.Error(), "EAPI:Rate limit exceeded") {
+				a.logger.LogWarn("GetTrades [%s]: Rate limit hit. Waiting %v before retry %d/%d", pair, backoff, attempt+1, maxRetries)
+				time.Sleep(backoff)
+				backoff *= 2
+			} else {
+				return nil, lastErr
+			}
+		}
+		if lastErr != nil {
+			return nil, fmt.Errorf("GetTrades [%s]: Failed after retries: %w", pair, lastErr)
 		}
 
 		var pageTrades []broker.Trade
 		for tradeID, trade := range tradesMap {
-			// ---- OPTIMIZATION START ----
-			// If we are filtering for a specific pair, check if the trade's pair matches
-			// the Kraken-specific pair name we resolved earlier. This avoids an API call.
 			if krakenPair != "" && trade.Pair != krakenPair {
 				continue
 			}
-
-			// Since we already have the common pair name ("pair"), we can use it directly.
-			// This avoids the GetCommonPairName call.
 			commonPair := pair
-			// If we didn't start with a pair filter, we still need to look it up.
 			if commonPair == "" {
 				var commonPairErr error
 				commonPair, commonPairErr = a.client.GetCommonPairName(ctx, trade.Pair)
@@ -244,7 +272,6 @@ func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) (
 					continue
 				}
 			}
-			// ---- OPTIMIZATION END ----
 
 			price, _ := strconv.ParseFloat(trade.Price, 64)
 			volume, _ := strconv.ParseFloat(trade.Vol, 64)
@@ -254,7 +281,7 @@ func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) (
 			pageTrades = append(pageTrades, broker.Trade{
 				ID:          tradeID,
 				OrderID:     trade.Ordtxid,
-				Pair:        commonPair, // Use the common pair name
+				Pair:        commonPair,
 				Side:        trade.Type,
 				Price:       price,
 				Volume:      volume,
@@ -271,11 +298,20 @@ func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) (
 			break
 		}
 		ofs += 50
+		time.Sleep(time.Second)
+		backoff = time.Second
 	}
 
 	sort.Slice(allTrades, func(i, j int) bool {
 		return allTrades[i].Timestamp.Before(allTrades[j].Timestamp)
 	})
+
+	// Save to cache
+	if saveErr := a.cache.SaveTrades(pair, allTrades); saveErr != nil {
+		a.logger.LogWarn("GetTrades [%s]: Failed to cache trades: %v", pair, saveErr)
+	} else {
+		a.logger.LogDebug("GetTrades [%s]: Cached %d trades.", pair, len(allTrades))
+	}
 
 	return allTrades, nil
 }
@@ -448,23 +484,31 @@ func (a *Adapter) GetTicker(ctx context.Context, pair string) (broker.TickerData
 		return broker.TickerData{}, err
 	}
 
-	// GetTickerAPI now returns a map, so we handle it as such.
+	// Check cache first
+	cachedTicker, fresh, cacheErr := a.cache.GetCachedTicker(krakenPair)
+	if cacheErr == nil && fresh {
+		a.logger.LogDebug("GetTicker [%s]: Cache hit (fresh).", pair)
+		return cachedTicker, nil
+	}
+
 	tickerInfoMap, err := a.client.GetTickerAPI(ctx, krakenPair)
 	if err != nil {
 		return broker.TickerData{}, err
 	}
 
-	// --- FIX STARTS HERE ---
-	// Extract the specific ticker info for our pair from the map.
 	singleTickerInfo, ok := tickerInfoMap[krakenPair]
 	if !ok {
-		// This would be unusual since we requested this specific pair, but it's good practice to handle.
 		return broker.TickerData{}, fmt.Errorf("ticker for pair %s (%s) not found in API response", pair, krakenPair)
 	}
-	// --- FIX ENDS HERE ---
 
-	// Now pass the single TickerInfo struct to the parser, which resolves the compiler error.
-	return a.client.ParseTicker(singleTickerInfo, pair), nil
+	parsedTicker := a.client.ParseTicker(singleTickerInfo, pair)
+
+	// Save to cache
+	if saveErr := a.cache.SaveTicker(krakenPair, parsedTicker); saveErr != nil {
+		a.logger.LogWarn("GetTicker [%s]: Failed to cache ticker: %v", pair, saveErr)
+	}
+
+	return parsedTicker, nil
 }
 
 // GetTradeFees fetches the user's current maker and taker fee percentages for a given asset pair.
@@ -475,15 +519,21 @@ func (a *Adapter) GetTradeFees(ctx context.Context, commonPair string) (makerFee
 		return 0, 0, fmt.Errorf("GetTradeFees: failed to get Kraken pair name for %s: %w", commonPair, err)
 	}
 
+	// Check cache first
+	makerFee, takerFee, fresh, cacheErr := a.cache.GetCachedFees(krakenPair)
+	if cacheErr == nil && fresh {
+		a.logger.LogDebug("GetTradeFees [%s]: Cache hit (fresh). Maker: %.4f, Taker: %.4f", commonPair, makerFee, takerFee)
+		return makerFee, takerFee, nil
+	}
+
 	params := url.Values{
 		"pair":     {krakenPair},
 		"fee-info": {"true"},
 	}
 
-	// This calls the specific client method that queries the TradeVolume endpoint.
-	tradeVolumeResult, err := a.client.QueryTradeVolumeAPI(ctx, params)
-	if err != nil {
-		return 0, 0, fmt.Errorf("GetTradeFees: client API call failed: %w", err)
+	tradeVolumeResult, apiErr := a.client.QueryTradeVolumeAPI(ctx, params)
+	if apiErr != nil {
+		return 0, 0, fmt.Errorf("GetTradeFees: client API call failed: %w", apiErr)
 	}
 
 	// Correctly parse TAKER fees from the "fees" object.
@@ -508,6 +558,9 @@ func (a *Adapter) GetTradeFees(ctx context.Context, commonPair string) (makerFee
 		// Fallback for older accounts that might not have a separate fees_maker tier.
 		a.logger.LogWarn("GetTradeFees: no maker-specific fee info for %s, falling back to using taker fee for both.", krakenPair)
 		makerFee = takerFee
+	}
+	if saveErr := a.cache.SaveFees(krakenPair, makerFee, takerFee); saveErr != nil {
+		a.logger.LogWarn("GetTradeFees [%s]: Failed to cache fees: %v", commonPair, saveErr)
 	}
 
 	return makerFee, takerFee, nil
