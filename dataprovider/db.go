@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3" // SQLite driver
@@ -17,6 +18,7 @@ import (
 type SQLiteCache struct {
 	db     *sql.DB
 	logger *utilities.Logger
+	mu     sync.Mutex // Added for write serialization
 }
 
 // NewSQLiteCache now accepts a logger and uses it for all output.
@@ -48,7 +50,7 @@ func NewSQLiteCache(cfg utilities.DatabaseConfig, logger *utilities.Logger) (*SQ
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
-	return &SQLiteCache{db: db, logger: logger}, nil
+	return &SQLiteCache{db: db, logger: logger, mu: sync.Mutex{}}, nil
 }
 
 // InitSchema creates the database tables if they do not already exist.
@@ -116,6 +118,8 @@ func (s *SQLiteCache) InitSchema() error {
 }
 
 func (s *SQLiteCache) SaveBar(provider, coinID string, bar utilities.OHLCVBar) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT OR REPLACE INTO ohlcv_bars (provider, coin_id, timestamp, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		provider, coinID, bar.Timestamp, bar.Open, bar.High, bar.Low, bar.Close, bar.Volume)
 	return err
@@ -180,6 +184,8 @@ func (s *SQLiteCache) LoadPositions() (map[string]*utilities.Position, error) {
 }
 
 func (s *SQLiteCache) SavePosition(pos *utilities.Position) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	query := `INSERT OR REPLACE INTO open_positions (asset_pair, entry_timestamp, average_price, total_volume, base_order_price, filled_safety_orders, is_dca_active, base_order_size, current_take_profit, broker_order_id, is_trailing_active, peak_price_since_tp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	isDcaActiveInt := 0
@@ -212,6 +218,8 @@ func (s *SQLiteCache) SavePosition(pos *utilities.Position) error {
 }
 
 func (s *SQLiteCache) DeletePosition(assetPair string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, err := s.db.Exec(`DELETE FROM open_positions WHERE asset_pair = ?`, assetPair)
 	return err
 }
@@ -235,16 +243,22 @@ func (s *SQLiteCache) LoadPendingOrders() (map[string]string, error) {
 }
 
 func (s *SQLiteCache) SavePendingOrder(orderID, assetPair string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT OR REPLACE INTO pending_orders (broker_order_id, asset_pair) VALUES (?, ?)`, orderID, assetPair)
 	return err
 }
 
 func (s *SQLiteCache) DeletePendingOrder(orderID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, err := s.db.Exec(`DELETE FROM pending_orders WHERE broker_order_id = ?`, orderID)
 	return err
 }
 
 func (s *SQLiteCache) CleanupOldBars(provider string, olderThan time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	cutoff := olderThan.UnixMilli()
 	_, err := s.db.Exec(`DELETE FROM ohlcv_bars WHERE provider=? AND timestamp < ?`, provider, cutoff)
 	return err
@@ -288,6 +302,8 @@ func (s *SQLiteCache) GetCachedFees(pair string) (maker, taker float64, fresh bo
 }
 
 func (s *SQLiteCache) SaveFees(pair string, maker, taker float64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT OR REPLACE INTO cached_fees (pair, maker_fee, taker_fee, timestamp) VALUES (?, ?, ?, ?)`,
 		pair, maker, taker, time.Now().Unix())
 	return err
@@ -326,6 +342,8 @@ func (s *SQLiteCache) GetCachedTrades(assetPair string) ([]broker.Trade, bool, e
 	return trades, fresh, nil
 }
 func (s *SQLiteCache) SaveTicker(pair string, ticker broker.TickerData) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	data, err := json.Marshal(ticker)
 	if err != nil {
 		return err
@@ -335,6 +353,8 @@ func (s *SQLiteCache) SaveTicker(pair string, ticker broker.TickerData) error {
 	return err
 }
 func (s *SQLiteCache) SaveTrades(assetPair string, trades []broker.Trade) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	data, err := json.Marshal(trades)
 	if err != nil {
 		return err
