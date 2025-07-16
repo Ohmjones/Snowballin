@@ -18,7 +18,7 @@ import (
 type SQLiteCache struct {
 	db     *sql.DB
 	logger *utilities.Logger
-	mu     sync.Mutex // Added for write serialization
+	mu     sync.RWMutex // Upgraded for concurrent reads
 }
 
 // NewSQLiteCache now accepts a logger and uses it for all output.
@@ -50,7 +50,13 @@ func NewSQLiteCache(cfg utilities.DatabaseConfig, logger *utilities.Logger) (*SQ
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
-	return &SQLiteCache{db: db, logger: logger, mu: sync.Mutex{}}, nil
+	// Set busy_timeout to prevent indefinite hangs on locks
+	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+		logger.LogError("Failed to set SQLite busy_timeout: %v", err)
+		return nil, fmt.Errorf("failed to set busy_timeout: %w", err)
+	}
+
+	return &SQLiteCache{db: db, logger: logger}, nil
 }
 
 // InitSchema creates the database tables if they do not already exist.
@@ -126,6 +132,8 @@ func (s *SQLiteCache) SaveBar(provider, coinID string, bar utilities.OHLCVBar) e
 }
 
 func (s *SQLiteCache) GetBars(provider, coinID string, start, end int64) ([]utilities.OHLCVBar, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	rows, err := s.db.Query(`SELECT timestamp, open, high, low, close, volume FROM ohlcv_bars WHERE provider=? AND coin_id=? AND timestamp BETWEEN ? AND ? ORDER BY timestamp ASC`,
 		provider, coinID, start, end)
 	if err != nil {
@@ -144,6 +152,8 @@ func (s *SQLiteCache) GetBars(provider, coinID string, start, end int64) ([]util
 }
 
 func (s *SQLiteCache) LoadPositions() (map[string]*utilities.Position, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	query := `SELECT asset_pair, entry_timestamp, average_price, total_volume, base_order_price, filled_safety_orders, is_dca_active, base_order_size, current_take_profit, broker_order_id, is_trailing_active, peak_price_since_tp FROM open_positions`
 	rows, err := s.db.Query(query)
 	if err != nil {
@@ -225,6 +235,8 @@ func (s *SQLiteCache) DeletePosition(assetPair string) error {
 }
 
 func (s *SQLiteCache) LoadPendingOrders() (map[string]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	rows, err := s.db.Query(`SELECT broker_order_id, asset_pair FROM pending_orders`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query pending orders: %w", err)
@@ -290,6 +302,8 @@ func (s *SQLiteCache) StartScheduledCleanup(interval time.Duration, provider str
 	}()
 }
 func (s *SQLiteCache) GetCachedFees(pair string) (maker, taker float64, fresh bool, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var ts int64
 	err = s.db.QueryRow(`SELECT maker_fee, taker_fee, timestamp FROM cached_fees WHERE pair = ?`, pair).Scan(&maker, &taker, &ts)
 	if err == sql.ErrNoRows {
@@ -310,6 +324,8 @@ func (s *SQLiteCache) SaveFees(pair string, maker, taker float64) error {
 }
 
 func (s *SQLiteCache) GetCachedTicker(pair string) (broker.TickerData, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var data []byte
 	var ts int64
 	err := s.db.QueryRow(`SELECT data, timestamp FROM cached_tickers WHERE pair = ?`, pair).Scan(&data, &ts)
@@ -326,6 +342,8 @@ func (s *SQLiteCache) GetCachedTicker(pair string) (broker.TickerData, bool, err
 	return ticker, fresh, nil
 }
 func (s *SQLiteCache) GetCachedTrades(assetPair string) ([]broker.Trade, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var data []byte
 	var ts int64
 	err := s.db.QueryRow(`SELECT data, timestamp FROM cached_trades WHERE asset_pair = ?`, assetPair).Scan(&data, &ts)
