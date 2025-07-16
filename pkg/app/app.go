@@ -416,9 +416,9 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 		return nil, fmt.Errorf("no trade history found for this asset, cannot reconstruct")
 	}
 
-	// Sort ascending: oldest first for FIFO
+	// Sort descending: most recent first for LIFO
 	sort.Slice(tradeHistory, func(i, j int) bool {
-		return tradeHistory[i].Timestamp.Before(tradeHistory[j].Timestamp)
+		return tradeHistory[i].Timestamp.After(tradeHistory[j].Timestamp)
 	})
 
 	type buyEntry struct {
@@ -430,47 +430,42 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 		orderID   string
 	}
 
-	buyQueue := []buyEntry{}
+	buyStack := []buyEntry{} // Stack: last in (recent) first out
 	runningVolume := 0.0
 
 	for _, trade := range tradeHistory {
+		vol := trade.Volume
 		if trade.Side == "buy" {
-			buyQueue = append(buyQueue, buyEntry{
-				volume:    trade.Volume,
+			buyStack = append(buyStack, buyEntry{ // Push recent buy
+				volume:    vol,
 				price:     trade.Price,
 				cost:      trade.Cost,
 				fee:       trade.Fee,
 				timestamp: trade.Timestamp,
 				orderID:   trade.OrderID,
 			})
-			runningVolume += trade.Volume
+			runningVolume += vol
 		} else if trade.Side == "sell" {
-			sellVol := trade.Volume
-			for sellVol > 0 && len(buyQueue) > 0 {
-				oldest := &buyQueue[0]
-				if oldest.volume <= sellVol {
-					// Fully consume oldest
-					sellVol -= oldest.volume
-					runningVolume -= oldest.volume
-					buyQueue = buyQueue[1:]
+			sellVol := vol
+			for sellVol > 0 && len(buyStack) > 0 {
+				recent := &buyStack[len(buyStack)-1] // Peek/pop recent
+				if recent.volume <= sellVol {
+					// Fully consume recent
+					sellVol -= recent.volume
+					runningVolume -= recent.volume
+					buyStack = buyStack[:len(buyStack)-1]
 				} else {
 					// Partially consume
 					consumeVol := sellVol
-					scaleFactor := consumeVol / oldest.volume
-					oldest.cost -= oldest.cost * scaleFactor
-					oldest.fee -= oldest.fee * scaleFactor
-					oldest.volume -= consumeVol
+					scaleFactor := consumeVol / recent.volume
+					recent.cost -= recent.cost * scaleFactor
+					recent.fee -= recent.fee * scaleFactor
+					recent.volume -= consumeVol
 					runningVolume -= consumeVol
 					sellVol = 0
 				}
 			}
 		}
-	}
-
-	// Verify reconstructed volume
-	reconstructedVol := 0.0
-	for _, b := range buyQueue {
-		reconstructedVol += b.volume
 	}
 
 	// Fetch current price for dust check
@@ -484,42 +479,42 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 	}
 
 	const tolerance = 1e-8
-	diff := math.Abs(reconstructedVol - actualBalance)
+	diff := math.Abs(runningVolume - actualBalance)
 	valueDiff := diff * currentPrice
 
 	if diff > tolerance {
 		if valueDiff < state.config.Trading.DustThresholdUSD {
 			state.logger.LogWarn("Reconstruction [%s]: Adjusting for minor dust difference (%.8f, value: $%.4f)", assetPair, diff, valueDiff)
-			reconstructedVol = actualBalance
+			runningVolume = actualBalance
 		} else {
-			return nil, fmt.Errorf("reconstructed volume %.8f does not match actual balance %.8f for %s (difference %.8f exceeds tolerance; value $%.4f)", reconstructedVol, actualBalance, assetPair, diff, valueDiff)
+			return nil, fmt.Errorf("reconstructed volume %.8f does not match actual balance %.8f for %s (difference %.8f exceeds tolerance; value $%.4f)", runningVolume, actualBalance, assetPair, diff, valueDiff)
 		}
 	}
 
-	if len(buyQueue) == 0 || reconstructedVol <= tolerance {
+	if len(buyStack) == 0 || runningVolume <= tolerance {
 		return nil, errors.New("reconstructed trades have zero or negative total volume, cannot reconstruct")
 	}
 
-	// Calculate totals from remaining buys
+	// Calculate totals from remaining buys (recent on top)
 	var totalCost, totalFees float64
-	for _, b := range buyQueue {
+	for _, b := range buyStack {
 		totalCost += b.cost
 		totalFees += b.fee
 	}
 	totalTrueBuyCost := totalCost + totalFees
 
-	// Base order is the oldest remaining buy
-	baseOrder := buyQueue[0]
+	// Base order is the oldest remaining (bottom of stack)
+	baseOrder := buyStack[0]
 
-	filledSafetyOrders := len(buyQueue) - 1
+	filledSafetyOrders := len(buyStack) - 1
 
 	reconstructedPosition := &utilities.Position{
 		AssetPair:          assetPair,
 		EntryTimestamp:     baseOrder.timestamp,
-		AveragePrice:       totalCost / reconstructedVol,
-		TotalVolume:        reconstructedVol,
+		AveragePrice:       totalCost / runningVolume,
+		TotalVolume:        runningVolume,
 		BaseOrderPrice:     baseOrder.price,
-		BaseOrderSize:      baseOrder.cost, // Scaled if partial
+		BaseOrderSize:      baseOrder.cost,
 		FilledSafetyOrders: filledSafetyOrders,
 		IsDcaActive:        true,
 		BrokerOrderID:      baseOrder.orderID,
