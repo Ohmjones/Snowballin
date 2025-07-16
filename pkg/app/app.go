@@ -416,59 +416,59 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 		return nil, fmt.Errorf("no trade history found for this asset, cannot reconstruct")
 	}
 
-	// Sort descending: most recent first for LIFO
+	// Sort descending: most recent first
 	sort.Slice(tradeHistory, func(i, j int) bool {
 		return tradeHistory[i].Timestamp.After(tradeHistory[j].Timestamp)
 	})
 
-	type buyEntry struct {
-		volume    float64
-		price     float64
-		cost      float64
-		fee       float64
-		timestamp time.Time
-		orderID   string
-	}
+	var accumulatedVolume float64
+	var positionTrades []broker.Trade
 
-	buyStack := []buyEntry{} // Stack: last in (recent) first out
-	runningVolume := 0.0
+	const tolerance = 1e-8
 
 	for _, trade := range tradeHistory {
-		vol := trade.Volume
-		if trade.Side == "buy" {
-			buyStack = append(buyStack, buyEntry{ // Push recent buy
-				volume:    vol,
-				price:     trade.Price,
-				cost:      trade.Cost,
-				fee:       trade.Fee,
-				timestamp: trade.Timestamp,
-				orderID:   trade.OrderID,
-			})
-			runningVolume += vol
-		} else if trade.Side == "sell" {
-			sellVol := vol
-			for sellVol > 0 && len(buyStack) > 0 {
-				recent := &buyStack[len(buyStack)-1] // Peek/pop recent
-				if recent.volume <= sellVol {
-					// Fully consume recent
-					sellVol -= recent.volume
-					runningVolume -= recent.volume
-					buyStack = buyStack[:len(buyStack)-1]
-				} else {
-					// Partially consume
-					consumeVol := sellVol
-					scaleFactor := consumeVol / recent.volume
-					recent.cost -= recent.cost * scaleFactor
-					recent.fee -= recent.fee * scaleFactor
-					recent.volume -= consumeVol
-					runningVolume -= consumeVol
-					sellVol = 0
-				}
-			}
+		if trade.Side == "sell" {
+			continue // Ignore sells, as per observation they may not appear or reset history
 		}
+		if trade.Side != "buy" {
+			continue // Skip non-buy/sell
+		}
+
+		if accumulatedVolume >= actualBalance-tolerance {
+			break // Stop once we have enough
+		}
+
+		positionTrades = append([]broker.Trade{trade}, positionTrades...) // Prepend recent
+		accumulatedVolume += trade.Volume
 	}
 
-	// Fetch current price for dust check
+	if len(positionTrades) == 0 {
+		return nil, fmt.Errorf("found trade history for %s, but could not isolate a sequence of buys for the current balance of %f", assetPair, actualBalance)
+	}
+
+	// Handle overshoot by scaling the oldest (least recent, now at index 0)
+	if accumulatedVolume > actualBalance+tolerance {
+		state.logger.LogWarn("Reconstruction [%s]: Accumulated volume (%.8f) overshot actual balance (%.8f). Adjusting oldest trade.", assetPair, accumulatedVolume, actualBalance)
+
+		oldestTrade := &positionTrades[0]
+		overshootVolume := accumulatedVolume - actualBalance
+		neededVolumeFromOldest := oldestTrade.Volume - overshootVolume
+
+		if neededVolumeFromOldest < 0 {
+			return nil, fmt.Errorf("reconstruction logic failed: needed volume from oldest trade is negative")
+		}
+
+		scaleFactor := neededVolumeFromOldest / oldestTrade.Volume
+		state.logger.LogInfo("Reconstruction [%s]: Scaling oldest trade (Vol: %.8f) by factor %.4f to match balance.", assetPair, oldestTrade.Volume, scaleFactor)
+
+		oldestTrade.Cost *= scaleFactor
+		oldestTrade.Fee *= scaleFactor
+		oldestTrade.Volume = neededVolumeFromOldest
+
+		accumulatedVolume = actualBalance // Exact now
+	}
+
+	// Fetch current price for final dust check (though scaling should prevent need)
 	ticker, tickerErr := state.broker.GetTicker(ctx, assetPair)
 	if tickerErr != nil {
 		return nil, fmt.Errorf("failed to get ticker for %s during reconstruction: %w", assetPair, tickerErr)
@@ -478,46 +478,44 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 		return nil, fmt.Errorf("invalid current price (%.2f) for %s during reconstruction", currentPrice, assetPair)
 	}
 
-	const tolerance = 1e-8
-	diff := math.Abs(runningVolume - actualBalance)
+	diff := math.Abs(accumulatedVolume - actualBalance)
 	valueDiff := diff * currentPrice
 
 	if diff > tolerance {
 		if valueDiff < state.config.Trading.DustThresholdUSD {
 			state.logger.LogWarn("Reconstruction [%s]: Adjusting for minor dust difference (%.8f, value: $%.4f)", assetPair, diff, valueDiff)
-			runningVolume = actualBalance
+			accumulatedVolume = actualBalance
 		} else {
-			return nil, fmt.Errorf("reconstructed volume %.8f does not match actual balance %.8f for %s (difference %.8f exceeds tolerance; value $%.4f)", runningVolume, actualBalance, assetPair, diff, valueDiff)
+			return nil, fmt.Errorf("reconstructed volume %.8f does not match actual balance %.8f for %s (difference %.8f exceeds tolerance; value $%.4f)", accumulatedVolume, actualBalance, assetPair, diff, valueDiff)
 		}
 	}
 
-	if len(buyStack) == 0 || runningVolume <= tolerance {
-		return nil, errors.New("reconstructed trades have zero or negative total volume, cannot reconstruct")
-	}
-
-	// Calculate totals from remaining buys (recent on top)
 	var totalCost, totalFees float64
-	for _, b := range buyStack {
-		totalCost += b.cost
-		totalFees += b.fee
+	baseOrderTrade := positionTrades[len(positionTrades)-1] // Oldest is now last after prepend
+
+	for _, trade := range positionTrades {
+		totalCost += trade.Cost
+		totalFees += trade.Fee
 	}
 	totalTrueBuyCost := totalCost + totalFees
 
-	// Base order is the oldest remaining (bottom of stack)
-	baseOrder := buyStack[0]
+	finalVolume := accumulatedVolume
+	if finalVolume <= tolerance {
+		return nil, errors.New("reconstructed trades have zero or negative total volume, cannot reconstruct")
+	}
 
-	filledSafetyOrders := len(buyStack) - 1
+	filledSafetyOrders := len(positionTrades) - 1
 
 	reconstructedPosition := &utilities.Position{
 		AssetPair:          assetPair,
-		EntryTimestamp:     baseOrder.timestamp,
-		AveragePrice:       totalCost / runningVolume,
-		TotalVolume:        runningVolume,
-		BaseOrderPrice:     baseOrder.price,
-		BaseOrderSize:      baseOrder.cost,
+		EntryTimestamp:     baseOrderTrade.Timestamp,
+		AveragePrice:       totalCost / accumulatedVolume,
+		TotalVolume:        finalVolume,
+		BaseOrderPrice:     baseOrderTrade.Price,
+		BaseOrderSize:      baseOrderTrade.Cost,
 		FilledSafetyOrders: filledSafetyOrders,
 		IsDcaActive:        true,
-		BrokerOrderID:      baseOrder.orderID,
+		BrokerOrderID:      baseOrderTrade.OrderID,
 	}
 	reconstructedPosition.CurrentTakeProfit = calculateFeeAwareTakeProfitPrice(reconstructedPosition, state, totalTrueBuyCost)
 
