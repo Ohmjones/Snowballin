@@ -197,8 +197,6 @@ func (a *Adapter) GetLastNOHLCVBars(ctx context.Context, pair string, intervalMi
 }
 
 func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) ([]broker.Trade, error) {
-	// Removed: if pair == "" { return nil, errors.New("GetTrades: pair cannot be empty") } – Allows all trades when empty.
-
 	// Check cache first
 	cachedTrades, fresh, cacheErr := a.cache.GetCachedTrades(pair)
 	if cacheErr == nil && fresh && len(cachedTrades) > 0 {
@@ -223,17 +221,15 @@ func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) (
 		params.Set("start", strconv.FormatInt(since.UnixNano()/1e9, 10))
 	}
 
-	var krakenPair string
-	var err error
-	krakenPair, err = a.client.GetPrimaryKrakenPairName(ctx, pair)
-	if err != nil {
-		return nil, fmt.Errorf("GetTrades: could not resolve pair name for %s: %w", pair, err)
-	}
-
-	// Optimization: If pair is specified, let the server filter by setting 'pair' param (Kraken supports comma-delimited, but here it's single).
+	krakenPair := ""
 	if pair != "" {
-		params.Set("pair", krakenPair)
-	} // If pair == "", omit to fetch all (default behavior).
+		var err error
+		krakenPair, err = a.client.GetPrimaryKrakenPairName(ctx, pair)
+		if err != nil {
+			return nil, fmt.Errorf("GetTrades: could not resolve pair name for %s: %w", pair, err)
+		}
+		params.Set("pair", krakenPair) // Let server filter for specific pair
+	} // If pair == "", omit 'pair' param to fetch all trades
 
 	ofs := int64(0)
 	maxRetries := 3
@@ -309,11 +305,13 @@ func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) (
 		return allTrades[i].Timestamp.Before(allTrades[j].Timestamp)
 	})
 
-	// Save to cache
-	if saveErr := a.cache.SaveTrades(pair, allTrades); saveErr != nil {
-		a.logger.LogWarn("GetTrades [%s]: Failed to cache trades: %v", pair, saveErr)
-	} else {
-		a.logger.LogDebug("GetTrades [%s]: Cached %d trades.", pair, len(allTrades))
+	// Save to cache only if specific pair (skip for all-pairs fetch)
+	if pair != "" {
+		if saveErr := a.cache.SaveTrades(pair, allTrades); saveErr != nil {
+			a.logger.LogWarn("GetTrades [%s]: Failed to cache trades: %v", pair, saveErr)
+		} else {
+			a.logger.LogDebug("GetTrades [%s]: Cached %d trades.", pair, len(allTrades))
+		}
 	}
 
 	return allTrades, nil
