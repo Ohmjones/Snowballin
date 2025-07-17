@@ -47,6 +47,7 @@ type Client struct {
 	idMapRefreshInterval   time.Duration
 	isRefreshingIDMap      bool
 	refreshMapMu           sync.Mutex
+	sourceBarsCache        sync.Map
 }
 
 // --- CMC API Response Structs ---
@@ -375,7 +376,6 @@ func (c *Client) GetMarketData(ctx context.Context, numericalIDs []string, vsCur
 	return marketData, nil
 }
 
-// GetOHLCVHistorical is the core function with the adaptive fetch logic.
 func (c *Client) GetOHLCVHistorical(ctx context.Context, id, vsCurrency, userInterval string) ([]utils.OHLCVBar, error) {
 	c.logger.LogDebug("CMC GetOHLCVHistorical: Fetching for ID=%s, VS=%s, Interval=%s", id, vsCurrency, userInterval)
 
@@ -387,22 +387,39 @@ func (c *Client) GetOHLCVHistorical(ctx context.Context, id, vsCurrency, userInt
 		c.logger.LogWarn("[ADAPTIVE FETCH] CMC: Unsupported interval '%s'. Will fetch '%s' and resample.", userInterval, sourceInterval)
 	}
 
-	// Fetch data using the determined source interval (e.g., "1h")
-	bars, err := c.fetchBarsFromAPI(ctx, id, vsCurrency, sourceInterval)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch source bars for ID %s (%s): %w", id, sourceInterval, err)
+	// For unsupported, use shared source fetch to avoid multiple API calls
+	var sourceBars []utils.OHLCVBar
+	var fetchErr error
+	if !isSupported {
+		cacheKey := fmt.Sprintf("%s-%s", id, vsCurrency)
+		if cached, ok := c.sourceBarsCache.Load(cacheKey); ok {
+			sourceBars = cached.([]utils.OHLCVBar)
+			c.logger.LogInfo("CMC GetOHLCVHistorical: Reusing shared '1h' source bars from session cache for %s.", cacheKey)
+		} else {
+			sourceBars, fetchErr = c.fetchBarsFromAPI(ctx, id, vsCurrency, sourceInterval)
+			if fetchErr != nil {
+				return nil, fmt.Errorf("failed to fetch shared source bars for ID %s (%s): %w", id, sourceInterval, fetchErr)
+			}
+			c.sourceBarsCache.Store(cacheKey, sourceBars)
+		}
+	} else {
+		// For supported intervals, fetch normally
+		sourceBars, fetchErr = c.fetchBarsFromAPI(ctx, id, vsCurrency, sourceInterval)
+		if fetchErr != nil {
+			return nil, fmt.Errorf("failed to fetch bars for ID %s (%s): %w", id, sourceInterval, fetchErr)
+		}
 	}
 
 	// If the requested interval was not supported, resample the fetched data.
 	if !isSupported {
-		resampledBars, resampleErr := resampleBars(bars, userInterval, c.logger)
+		resampledBars, resampleErr := resampleBars(sourceBars, userInterval, c.logger)
 		if resampleErr != nil {
 			return nil, fmt.Errorf("failed to resample bars for ID %s from %s to %s: %w", id, sourceInterval, userInterval, resampleErr)
 		}
 		return resampledBars, nil
 	}
 
-	return bars, nil
+	return sourceBars, nil
 }
 
 // fetchBarsFromAPI handles the actual API call and caching logic.

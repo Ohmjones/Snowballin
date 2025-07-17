@@ -44,7 +44,7 @@
     "quote_currency": "USD",
     "request_timeout_sec": 10,
     "max_retries": 3,
-    "retry_delay_sec": 5,
+    "retry_delay_sec": 10,
     "ohlcv_days_default": 90,
     "id_map_refresh_interval_hours": 24,
     "rate_limit_per_sec": 0.5,
