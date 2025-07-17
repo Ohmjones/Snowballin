@@ -90,7 +90,7 @@
     "price_deviation_to_open_safety_orders": 1.5,
     "safety_order_step_scale": 1.5,
     "safety_order_volume_scale": 1.5,
-    "take_profit_percentage": 0.025,
+    "take_profit_percentage": 2,
     "stop_loss_enabled": false,
     "recalculate_after_dca_fill": true,
     "use_order_book_for_predictive": true,
