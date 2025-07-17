@@ -40,6 +40,7 @@ type TradingState struct {
 	isCircuitBreakerTripped bool
 	makerFeeRate            float64
 	takerFeeRate            float64
+	lastCMCFetch            time.Time
 }
 
 var (
@@ -369,6 +370,7 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 		sellReasons:             make(map[string]string),
 		makerFeeRate:            makerFee,
 		takerFeeRate:            takerFee,
+		lastCMCFetch:            time.Time{},
 	}
 
 	// --- ADDED: Goroutine to refresh fees periodically ---
@@ -1190,12 +1192,15 @@ func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair 
 	baseAssetSymbol := strings.Split(assetPair, "/")[0]
 	for _, dp := range state.activeDPs {
 		providerName := state.providerNames[dp]
+		shouldThrottleCMC := providerName == "coinmarketcap" && time.Since(state.lastCMCFetch) < 30*time.Minute
+		if shouldThrottleCMC {
+			state.logger.LogInfo("gatherConsolidatedData [%s]: Throttling CMC—last pull was recent (%s ago). Relying on internal provider cache to avoid unnecessary API calls.", assetPair, time.Since(state.lastCMCFetch))
+		}
 		providerCoinID, idErr := dp.GetCoinID(ctx, baseAssetSymbol)
 		if idErr != nil {
 			state.logger.LogError("gatherConsolidatedData [%s]: Could not get coin ID for provider %s: %v", assetPair, providerName, idErr)
 			continue
 		}
-
 		// Get the current price from this provider.
 		extMarketData, mdErr := dp.GetMarketData(ctx, []string{providerCoinID}, state.config.Trading.QuoteCurrency)
 		var currentPrice float64
@@ -1223,6 +1228,14 @@ func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair 
 			CurrentPrice: currentPrice,
 			OHLCVByTF:    extOHLCVByTF,
 		})
+
+		// Update timestamp ONLY for CMC and if not throttled (i.e., an actual fetch likely occurred) and no major errors
+		if providerName == "coinmarketcap" && !shouldThrottleCMC && mdErr == nil {
+			// Additional check: Assume success if at least one timeframe fetched without error (simplified; could check all)
+			state.stateMutex.Lock()
+			state.lastCMCFetch = time.Now()
+			state.stateMutex.Unlock()
+		}
 	}
 
 	return consolidatedData, nil

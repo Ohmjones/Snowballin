@@ -152,7 +152,7 @@
   },
   "orders": {
     "enable_watcher": true,
-    "watcher_interval_sec": 60,
+    "watcher_interval_sec": 300,
     "reaper_interval_sec": 300,
     "max_order_age_minutes_for_grid_base": 1440.0,
     "min_order_age_minutes_dynamic_cap": 5.0,
