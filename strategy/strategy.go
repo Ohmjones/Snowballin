@@ -112,6 +112,41 @@ func (s *strategyImpl) checkMultiTimeframeConsensus(data ConsolidatedMarketPictu
 	finalReason := fmt.Sprintf("Daily Trend OK | 4H MACD Bullish | 1H RSI Low (%.2f)", consensusRSI)
 	return true, finalReason
 }
+func getConsensusBars(data ConsolidatedMarketPicture, timeframe string, minBars int) ([]utilities.OHLCVBar, bool) {
+	var allBars [][]utilities.OHLCVBar
+	for _, provider := range data.ProvidersData {
+		bars, hasBars := provider.OHLCVByTF[timeframe]
+		if hasBars && len(bars) >= minBars {
+			allBars = append(allBars, bars)
+		}
+	}
+	if len(allBars) == 0 {
+		return nil, false
+	}
+
+	// Align by timestamp (assume sorted and same timestamps; in prod, interpolate if needed)
+	consensusBars := make([]utilities.OHLCVBar, len(allBars[0]))
+	for i := range consensusBars {
+		var o, h, l, c, v float64
+		count := float64(len(allBars))
+		for _, bars := range allBars {
+			o += bars[i].Open / count
+			h += bars[i].High / count
+			l += bars[i].Low / count
+			c += bars[i].Close / count
+			v += bars[i].Volume / count
+		}
+		consensusBars[i] = utilities.OHLCVBar{
+			Timestamp: allBars[0][i].Timestamp,
+			Open:      o,
+			High:      h,
+			Low:       l,
+			Close:     c,
+			Volume:    v,
+		}
+	}
+	return consensusBars, true
+}
 
 // GenerateSignals produces intelligent entry signals with calculated price, size, and stop-loss.
 func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMarketPicture, cfg utilities.AppConfig) ([]StrategySignal, error) {
@@ -124,8 +159,15 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 	// For final confirmation and ATR, we use the primary (broker) bars for simplicity and direct execution context.
 	primaryBars, ok := data.PrimaryOHLCVByTF[cfg.Consensus.MultiTimeframe.BaseTimeframe]
 	if !ok || len(primaryBars) < cfg.Indicators.MACDSlowPeriod {
-		s.logger.LogWarn("GenerateSignals [%s]: Not enough primary bars for analysis.", data.AssetPair)
-		return nil, nil
+		s.logger.LogWarn("GenerateSignals [%s]: Insufficient primary (broker) bars (%d). Falling back to provider consensus for indicators.", data.AssetPair, len(primaryBars))
+
+		// Fallback: Build consensus primary bars from providers (daily for trend)
+		fallbackBars, fallbackOk := getConsensusBars(data, cfg.Consensus.MultiTimeframe.BaseTimeframe, cfg.Indicators.MACDSlowPeriod)
+		if !fallbackOk {
+			s.logger.LogWarn("GenerateSignals [%s]: Fallback failed—insufficient provider bars for consensus.", data.AssetPair)
+			return nil, nil
+		}
+		primaryBars = fallbackBars // Override with fallback
 	}
 	atr, err := CalculateATR(primaryBars, cfg.Indicators.ATRPeriod)
 	if err != nil {

@@ -518,6 +518,9 @@ func (c *Client) GetOHLCVHistorical(ctx context.Context, id, vsCurrency, interva
 	ohlcParams := url.Values{}
 	ohlcParams.Add("vs_currency", strings.ToLower(vsCurrency))
 	ohlcParams.Add("days", strconv.Itoa(days))
+	if strings.ToLower(interval) == "daily" || strings.ToLower(interval) == "1d" {
+		ohlcParams.Add("interval", "daily") // Force daily for Analyst plan
+	}
 
 	ohlcEndpoint := fmt.Sprintf("/coins/%s/ohlc", id)
 	err = c.request(ctx, ohlcEndpoint, ohlcParams, &ohlcData)
@@ -710,7 +713,9 @@ func (c *Client) PrimeHistoricalData(ctx context.Context, id, vsCurrency, interv
 	ohlcParams := url.Values{}
 	ohlcParams.Add("vs_currency", strings.ToLower(vsCurrency))
 	ohlcParams.Add("days", strconv.Itoa(days))
-
+	if strings.ToLower(interval) == "daily" || strings.ToLower(interval) == "1d" {
+		ohlcParams.Add("interval", "daily") // Force daily for Analyst plan
+	}
 	ohlcEndpoint := fmt.Sprintf("/coins/%s/ohlc", id)
 
 	// --- MODIFIED: Corrected the target variable from &err to &ohlcData ---

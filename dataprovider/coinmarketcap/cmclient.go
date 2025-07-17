@@ -415,6 +415,11 @@ func (c *Client) fetchBarsFromAPI(ctx context.Context, numericalCoinID, vsCurren
 		assetSymbol = "unknown"
 	}
 
+	// --- START OF FIX ---
+	// Create a unique cache key that includes the interval, just like the coingecko client.
+	cacheKey := fmt.Sprintf("%s-%s-%s", assetSymbol, vsCurrency, interval)
+	// --- END OF FIX ---
+
 	var lookbackPeriodDays int
 	var countForAPI string
 	var expectedIntervalDuration time.Duration
@@ -440,11 +445,13 @@ func (c *Client) fetchBarsFromAPI(ctx context.Context, numericalCoinID, vsCurren
 	cacheStartTime := now.AddDate(0, 0, -lookbackPeriodDays)
 
 	if c.cache != nil {
-		cachedBars, errCache := c.cache.GetBars(providerName, assetSymbol, cacheStartTime.UnixMilli(), now.UnixMilli())
+		// --- MODIFIED LINE: Use the new cacheKey ---
+		cachedBars, errCache := c.cache.GetBars(providerName, cacheKey, cacheStartTime.UnixMilli(), now.UnixMilli())
 		if errCache == nil && len(cachedBars) > 0 {
 			latestCachedBarTime := time.UnixMilli(cachedBars[len(cachedBars)-1].Timestamp).UTC()
 			if now.Sub(latestCachedBarTime) < 2*expectedIntervalDuration {
-				c.logger.LogInfo("CMC fetchBarsFromAPI: Using %d bars from cache for %s (%s).", len(cachedBars), assetSymbol, interval)
+				// --- MODIFIED LINE: Use the new cacheKey in the log message for clarity ---
+				c.logger.LogInfo("CMC fetchBarsFromAPI: Using %d bars from cache for %s.", len(cachedBars), cacheKey)
 				utils.SortBarsByTimestamp(cachedBars)
 				return cachedBars, nil
 			}
@@ -466,19 +473,14 @@ func (c *Client) fetchBarsFromAPI(ctx context.Context, numericalCoinID, vsCurren
 		return nil, fmt.Errorf("CMC API error: %s", response.Status.ErrorMessage)
 	}
 
-	// --- FINAL FIX ---
-	// The API returns a direct object, not a map, when one ID is requested.
-	// We decode the raw 'Data' message directly into the final struct.
 	var apiData cmcOHLCData
 	if err := json.Unmarshal(response.Data, &apiData); err != nil {
 		return nil, fmt.Errorf("failed to decode OHLCV data object: %w", err)
 	}
 
-	// Check if the response is empty *after* decoding.
 	if len(apiData.Quotes) == 0 {
 		return nil, fmt.Errorf("no OHLCV data for ID %s in response", numericalCoinID)
 	}
-	// --- END OF FINAL FIX ---
 
 	fetchedBars := make([]utils.OHLCVBar, 0, len(apiData.Quotes))
 	for _, qData := range apiData.Quotes {
@@ -494,7 +496,8 @@ func (c *Client) fetchBarsFromAPI(ctx context.Context, numericalCoinID, vsCurren
 		bar := utils.OHLCVBar{Timestamp: ts.UnixMilli(), Open: quoteSet.Open, High: quoteSet.High, Low: quoteSet.Low, Close: quoteSet.Close, Volume: quoteSet.Volume}
 		fetchedBars = append(fetchedBars, bar)
 		if c.cache != nil {
-			_ = c.cache.SaveBar(providerName, assetSymbol, bar)
+			// --- MODIFIED LINE: Use the new cacheKey when saving ---
+			_ = c.cache.SaveBar(providerName, cacheKey, bar)
 		}
 	}
 	utils.SortBarsByTimestamp(fetchedBars)
@@ -650,11 +653,22 @@ func resampleBars(sourceBars []utils.OHLCVBar, targetIntervalStr string, logger 
 
 	// For CoinMarketCap, we assume the smallest reliable source interval is 1 hour.
 	sourceDuration := time.Hour
-
+	sourceInterval := "1h"
 	// If the user wants a smaller interval than our source can provide,
 	// return no data to prevent using artificial prices.
 	if targetDuration < sourceDuration {
-		return []utils.OHLCVBar{}, nil
+		// Basic: Duplicate source bar for finer intervals (not ideal, but better than empty)
+		resampled := []utils.OHLCVBar{}
+		ratio := int(sourceDuration / targetDuration)
+		for _, bar := range sourceBars {
+			for i := 0; i < ratio; i++ {
+				newBar := bar
+				newBar.Timestamp -= int64(i) * int64(targetDuration.Milliseconds()) // Approximate timestamps
+				resampled = append(resampled, newBar)
+			}
+		}
+		logger.LogWarn("Resampled finer interval %s from %s by duplication (approx).", targetIntervalStr, sourceInterval)
+		return resampled, nil
 	}
 
 	// If the target is larger or equal, we can just return the source bars.
