@@ -95,14 +95,16 @@
     "recalculate_after_dca_fill": true,
     "use_order_book_for_predictive": true,
     "predictive_order_size_percent": 0.2,
-    "min_book_confidence_for_predictive": 0.6,
+    "min_book_confidence_for_predictive": 0.7,
     "dust_threshold_usd": 1.0,
     "use_martingale_for_predictive": true,
-    "predictive_buy_deviation_percent": 0.5,
+    "predictive_buy_deviation_percent": 2,
     "consensus_buy_multiplier": 2.0,
     "predictive_rsi_threshold": 50,
     "consensus_rsi_threshold": 45,
-    "rsi_adjust_factor": 10.0
+    "rsi_adjust_factor": 5.0,
+    "volume_spike_factor": 2.5,
+    "volume_lookback_period": 5
   },
   "indicators": {
     "rsi_period": 14,
@@ -113,8 +115,8 @@
     "macd_slow_period": 26,
     "macd_signal_period": 9,
     "atr_period": 14,
-    "volume_spike_factor": 2.0,
-    "volume_lookback_period": 10,
+    "volume_spike_factor": 2.5,
+    "volume_lookback_period": 5,
     "stochastic_k_period": 14,
     "stochastic_d_period": 3,
     "liquidity_hunt": {
@@ -126,21 +128,12 @@
   "consensus": {
     "use_multi_timeframe_consensus": true,
     "multi_timeframe": {
-      "base_timeframe": "30m",
+      "base_timeframe": "1h",
       "additional_timeframes": [
-        "5m",
-        "15m",
-        "1h",
         "4h",
-        "1d",
-        "1w"
+        "1d"
       ],
       "tf_lookback_lengths": [
-        100,
-        100,
-        100,
-        100,
-        100,
         100,
         100
       ]

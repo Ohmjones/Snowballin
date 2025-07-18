@@ -192,10 +192,17 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 				return nil, nil
 			}
 
-			// Fix: Calculate RSI from primary bars to ensure dip
+			// Fetch primary (Kraken/broker) bars explicitly for predictive calculations to avoid skew
+			primaryBars, hasPrimaryBars := data.PrimaryOHLCVByTF[cfg.Consensus.MultiTimeframe.BaseTimeframe]
+			if !hasPrimaryBars || len(primaryBars) < cfg.Indicators.RSIPeriod {
+				s.logger.LogWarn("GenerateSignals [%s]: Insufficient broker (Kraken) bars for predictive buy indicators. Skipping to avoid skew.", data.AssetPair)
+				return nil, nil
+			}
+
+			// Calculate RSI from primary (Kraken) bars to ensure dip
 			rsi := CalculateRSI(primaryBars, cfg.Indicators.RSIPeriod)
 
-			// Compute dynamic threshold using ATR for volatility adjustment
+			// Compute dynamic threshold using ATR for volatility adjustment, from primary bars
 			atr, err := CalculateATR(primaryBars, cfg.Indicators.ATRPeriod)
 			if err != nil {
 				s.logger.LogError("GenerateSignals [%s]: Could not calculate ATR for adaptive RSI: %v", data.AssetPair, err)
@@ -209,21 +216,21 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 			}
 			volRatio := atr / avgATR
 			dynamicRsiThreshold := cfg.Trading.PredictiveRsiThreshold - (volRatio * cfg.Trading.RsiAdjustFactor)
-			dynamicRsiThreshold = math.Max(30, math.Min(60, dynamicRsiThreshold)) // Clamp to prevent extremes (e.g., 30-60)
+			dynamicRsiThreshold = math.Max(20, math.Min(60, dynamicRsiThreshold)) // Clamp to prevent extremes (e.g., 30-60)
 
 			if rsi >= dynamicRsiThreshold {
 				s.logger.LogInfo("GenerateSignals [%s]: Skipping predictive buy—RSI (%.2f) not oversold (dynamic threshold: %.2f, vol ratio: %.2f).", data.AssetPair, rsi, dynamicRsiThreshold, volRatio)
 				return nil, nil
 			}
 
-			// Fix: Ensure no recent volume spike (avoid rips)
+			// Ensure no recent volume spike (avoid rips), from primary bars
 			volumeSpike := CheckVolumeSpike(primaryBars, cfg.Indicators.VolumeSpikeFactor, cfg.Indicators.VolumeLookbackPeriod)
 			if volumeSpike {
 				s.logger.LogInfo("GenerateSignals [%s]: Skipping predictive buy—Recent volume spike detected (rip likely).", data.AssetPair)
 				return nil, nil
 			}
 
-			// Fix: Ensure support price is below current by at least PredictiveBuyDeviationPercent
+			// Ensure support price is below current by at least PredictiveBuyDeviationPercent
 			supportPrice := bookAnalysis.SupportLevels[0].PriceLevel
 			minDipPrice := currentPrice * (1 - (cfg.Trading.PredictiveBuyDeviationPercent / 100.0))
 			if supportPrice >= minDipPrice {
@@ -332,6 +339,12 @@ func (s *strategyImpl) GenerateExitSignal(ctx context.Context, data Consolidated
 	}
 
 	return StrategySignal{}, false
+}
+
+func isHammerCandle(bar utilities.OHLCVBar) bool {
+	body := math.Abs(bar.Close - bar.Open)
+	lowerShadow := math.Min(bar.Open, bar.Close) - bar.Low
+	return lowerShadow > 2*body && (bar.High-math.Max(bar.Open, bar.Close)) < body // Long lower shadow for dip reversal
 }
 
 // checkBearishConfluence checks for a confluence of bearish signals for an exit.
