@@ -226,14 +226,14 @@ func CheckMultiIndicatorConfirmation(rsi, stochRSI, macdHist, obv float64, volum
 		return true, "Liquidity event with volume spike"
 	}
 
-	if rsi < 30 && stochRSI < cfg.StochRSIBuyThreshold && macdHist > 0 && isOBVBullish(obv, bars) {
+	if rsi < 40 && stochRSI < cfg.StochRSIBuyThreshold && macdHist > 0 && isOBVBullish(obv, bars) {
 		return true, "Bullish reversal confirmed by OBV trend"
 	}
 
 	if rsi > 70 && stochRSI > cfg.StochRSISellThreshold && macdHist < 0 && isOBVBearish(obv, bars) {
 		return true, "Bearish reversal confirmed by OBV trend"
 	}
-
+	fmt.Printf("FinalConf: RSI=%.2f, StochRSI=%.2f, MACDHist=%.4f, LiquidityHunt=%v, VolSpike=%v", rsi, stochRSI, macdHist, liquidityHunt, volumeSpike)
 	return false, "No strong multi-indicator confirmation"
 }
 
