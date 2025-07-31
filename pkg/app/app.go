@@ -7,7 +7,6 @@ import (
 	"Snowballin/notification/discord"
 	"Snowballin/pkg/broker"
 	krakenBroker "Snowballin/pkg/broker/kraken"
-	"Snowballin/pkg/optimizer"
 	"Snowballin/strategy"
 	"Snowballin/utilities"
 	"context"
@@ -244,14 +243,6 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 		fearGreedProvider = fgClient
 	}
 	startFNGUpdater(ctx, fearGreedProvider, logger, 4*time.Hour)
-
-	if len(activeDPs) > 0 {
-		logger.LogInfo("AppRun: Initializing and starting the parameter optimizer with '%s'.", providerNames[activeDPs[0]])
-		optimizer := optimizer.NewOptimizer(logger, sqliteCache, cfg, activeDPs[0])
-		go optimizer.StartScheduledOptimization(ctx)
-	} else {
-		logger.LogWarn("AppRun: No external data providers are active. The parameter optimizer will be disabled.")
-	}
 
 	loadedPositions, err := sqliteCache.LoadPositions()
 	if err != nil {

@@ -1,15 +1,7 @@
 {
-  "app_name": "Snowballin'",
-  "version": "3.1.0",
-  "environment": "production",
+  "version": "3.2.0",
   "logging": {
-    "level": "info",
-    "log_to_file": true,
-    "log_file_path": "logs/snowballin.log",
-    "max_size_mb": 5,
-    "max_backups": 3,
-    "max_age_days": 7,
-    "compress_backups": true
+    "level": "info"
   },
   "discord": {
     "webhook_url": "YOUR_DISCORD_WEBHOOK_URL_HERE"
@@ -52,26 +44,17 @@
     "cache_base_path": "cache/cmc_ohlcv"
   },
   "FearGreed": {
-    "baseURL": "https://api.alternative.me",
-    "refreshIntervalHours": 4
+    "baseURL": "https://api.alternative.me"
   },
   "kraken": {
     "quote_currency": "usd",
     "api_key": "YOUR_KRAKEN_API_KEY",
     "api_secret": "YOUR_KRAKEN_API_SECRET",
     "request_timeout_sec": 20,
-    "order_placement_delay_ms": 500,
     "base_url": "https://api.kraken.com",
     "max_retries": 3,
     "retry_delay_sec": 5,
-    "refresh_interval_hours": 12,
-    "use_otp": false,
-    "otp_secret": ""
-  },
-  "data_discrepancy": {
-    "threshold_percent": 3.0,
-    "consecutive_cycles_trigger": 3,
-    "action": "log_warning"
+    "refresh_interval_hours": 12
   },
   "trading": {
     "asset_pairs": [
@@ -91,20 +74,13 @@
     "safety_order_step_scale": 1.5,
     "safety_order_volume_scale": 1.5,
     "take_profit_percentage": 2,
-    "stop_loss_enabled": false,
-    "recalculate_after_dca_fill": true,
-    "use_order_book_for_predictive": true,
-    "predictive_order_size_percent": 0.2,
     "min_book_confidence_for_predictive": 0.7,
     "dust_threshold_usd": 1.0,
     "use_martingale_for_predictive": true,
     "predictive_buy_deviation_percent": 2,
     "consensus_buy_multiplier": 2.0,
     "predictive_rsi_threshold": 50,
-    "consensus_rsi_threshold": 45,
-    "rsi_adjust_factor": 5.0,
-    "volume_spike_factor": 2.5,
-    "volume_lookback_period": 5
+    "rsi_adjust_factor": 5.0
   },
   "indicators": {
     "rsi_period": 14,
@@ -140,40 +116,12 @@
       ]
     }
   },
-  "exit_strategy": {
-    "flush_threshold_atr": 3.0,
-    "max_profit_exit_percentage": 75
-  },
   "orders": {
-    "enable_watcher": true,
     "watcher_interval_sec": 300,
-    "reaper_interval_sec": 300,
-    "max_order_age_minutes_for_grid_base": 1440.0,
-    "min_order_age_minutes_dynamic_cap": 5.0,
-    "max_order_age_minutes_dynamic_cap": 120.0
-  },
-  "withdrawal": {
-    "enabled": false,
-    "withdraw_usd": 1000.0,
-    "withdraw_keys": {
-      "BTC": "your_btc_withdrawal_address_here",
-      "ETH": "your_eth_withdrawal_address_here",
-      "SOL": "your_sol_withdrawal_address_here"
-    },
-    "check_interval_sec": 3600,
-    "cooldown_minutes": 1440
+    "max_order_age_minutes_for_grid_base": 1440.0
   },
   "database": {
     "database_path": "data/snowballin.db"
-  },
-  "data_completeness": {
-    "substitution_sources": [
-      "coingecko",
-      "coinmarketcap"
-    ],
-    "discrepancy_threshold_percent": 3.0,
-    "log_level_on_substitution": "INFO",
-    "log_level_on_discrepancy": "WARNING"
   },
   "preflight": {
     "prime_historical_data": true,
@@ -181,7 +129,6 @@
   },
   "circuit_breaker": {
     "enabled": true,
-    "drawdown_threshold_percent": 10,
-    "atr_volatility_threshold": 5.0
+    "drawdown_threshold_percent": 10
   }
 }
