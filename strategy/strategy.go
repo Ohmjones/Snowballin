@@ -59,7 +59,8 @@ func getConsensusIndicatorValue(
 
 // checkMultiTimeframeConsensus applies a hierarchical filter using a weighted consensus from all data providers.
 func (s *strategyImpl) checkMultiTimeframeConsensus(data ConsolidatedMarketPicture, cfg utilities.AppConfig) (bool, string) {
-	// --- Filter 1: Daily Trend (EMA) ---
+	// --- Gate 1: Daily Trend (EMA) ---
+	// This is our primary safety rail. We MUST be in a long-term uptrend.
 	consensusLastClose, priceOk := getConsensusIndicatorValue(data, "1d", 50, func(bars []utilities.OHLCVBar) (float64, bool) {
 		return bars[len(bars)-1].Close, true
 	})
@@ -73,54 +74,66 @@ func (s *strategyImpl) checkMultiTimeframeConsensus(data ConsolidatedMarketPictu
 	})
 
 	if !priceOk || !emaOk {
-		return false, "Hold: Insufficient daily data from providers for trend analysis."
+		return false, "Hold: Insufficient daily data for trend analysis."
 	}
 	if consensusLastClose < consensusEMA50 {
-		return false, fmt.Sprintf("Hold: Consensus Price (%.2f) below Consensus Daily EMA(50) (%.2f)", consensusLastClose, consensusEMA50)
+		return false, fmt.Sprintf("Hold: Daily trend is bearish. Price (%.2f) is below Daily EMA(50) (%.2f)", consensusLastClose, consensusEMA50)
 	}
-	s.logger.LogInfo("MTF Consensus [1/3 PASSED]: Daily trend is bullish (Consensus Price > Consensus EMA50).")
+	s.logger.LogInfo("MTF Consensus [GATE 1 PASSED]: Daily trend is bullish.")
 
-	// --- Filter 2: 4-Hour Momentum (MACD) ---
-	// Get the full histogram series to check for a momentum shift.
+	// --- Gate 2: 4-Hour Momentum (MACD) ---
+	// We check if the downward momentum is starting to ease up.
+	var isMomentumShifting bool
+	var momentumReason string
 	consensusMacdHistSeries, macdOk := getConsensusIndicatorValue(data, "4h", cfg.Indicators.MACDSlowPeriod+cfg.Indicators.MACDSignalPeriod, func(bars []utilities.OHLCVBar) (float64, bool) {
 		closes := extractCloses(bars)
 		_, _, macdHist := CalculateMACDSeries(closes, cfg.Indicators.MACDFastPeriod, cfg.Indicators.MACDSlowPeriod, cfg.Indicators.MACDSignalPeriod)
 		if len(macdHist) < 2 {
 			return 0, false // Not enough data for comparison
 		}
-		// Return a value indicating the shift: 1.0 for bullish shift, -1.0 for bearish.
 		if macdHist[len(macdHist)-1] > macdHist[len(macdHist)-2] {
 			return 1.0, true // Momentum is shifting up
 		}
 		return -1.0, true
 	})
-
-	if !macdOk {
-		return false, "Hold: Insufficient 4H data for momentum analysis."
+	if macdOk && consensusMacdHistSeries > 0 {
+		isMomentumShifting = true
+		momentumReason = "4H Momentum Shift"
 	}
-	// The new check: we want the momentum shift value to be positive.
-	if consensusMacdHistSeries < 0 {
-		return false, fmt.Sprintf("Hold: 4H Consensus MACD momentum is not shifting bullishly (Value: %.2f)", consensusMacdHistSeries)
-	}
-	s.logger.LogInfo("MTF Consensus [2/3 PASSED]: 4H momentum is shifting bullishly.")
 
-	// --- Filter 3: 1-Hour Entry Trigger (RSI) ---
+	// --- Gate 3: 1-Hour Entry Trigger (RSI) ---
+	// We check if the asset is currently in a short-term dip.
+	var isRsiLow bool
+	var rsiReason string
 	consensusRSI, rsiOk := getConsensusIndicatorValue(data, "1h", cfg.Indicators.RSIPeriod, func(bars []utilities.OHLCVBar) (float64, bool) {
 		rsi := CalculateRSI(bars, cfg.Indicators.RSIPeriod)
 		return rsi, true
 	})
-
-	if !rsiOk {
-		return false, "Hold: Insufficient 1H data from providers for entry trigger."
+	if rsiOk && consensusRSI <= 45 {
+		isRsiLow = true
+		rsiReason = fmt.Sprintf("1H RSI Low (%.2f)", consensusRSI)
 	}
-	if consensusRSI > 45 {
-		return false, fmt.Sprintf("Hold: 1H Consensus RSI (%.2f) not low enough for entry", consensusRSI)
-	}
-	s.logger.LogInfo("MTF Consensus [3/3 PASSED]: 1H Consensus RSI is low (%.2f), indicating a dip.", consensusRSI)
 
-	finalReason := fmt.Sprintf("Daily Trend OK | 4H MACD Bullish | 1H RSI Low (%.2f)", consensusRSI)
-	return true, finalReason
+	// --- FINAL LOGIC: Gate 1 AND (Gate 2 OR Gate 3) ---
+	// This is the new, more aggressive logic. As long as the daily trend is bullish,
+	// we only need ONE of the other conditions to be true to generate a buy signal.
+	if isMomentumShifting || isRsiLow {
+		var finalReason string
+		if isMomentumShifting && isRsiLow {
+			finalReason = fmt.Sprintf("%s & %s", momentumReason, rsiReason)
+		} else if isMomentumShifting {
+			finalReason = momentumReason
+		} else {
+			finalReason = rsiReason
+		}
+		s.logger.LogInfo("MTF Consensus [GATES 2/3 PASSED]: %s", finalReason)
+		return true, finalReason
+	}
+
+	// If we reach here, neither of the secondary conditions were met.
+	return false, "Hold: Neither 4H momentum shift nor 1H low RSI conditions were met."
 }
+
 func getConsensusBars(data ConsolidatedMarketPicture, timeframe string, minBars int) ([]utilities.OHLCVBar, bool) {
 	var allBars [][]utilities.OHLCVBar
 	for _, provider := range data.ProvidersData {
