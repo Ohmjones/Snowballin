@@ -149,6 +149,69 @@ func CalculateMACD(data []float64, fastPeriod, slowPeriod, signalPeriod int) (ma
 	return finalMacdLine, finalSignalLine, finalMacdHist
 }
 
+// CalculateMACDSeries calculates and returns the full series for MACD line, signal line, and histogram.
+func CalculateMACDSeries(data []float64, fastPeriod, slowPeriod, signalPeriod int) ([]float64, []float64, []float64) {
+	if len(data) < slowPeriod+signalPeriod {
+		return nil, nil, nil
+	}
+
+	// ema is a local helper function for this calculation.
+	ema := func(series []float64, period int) []float64 {
+		if len(series) < period {
+			return nil
+		}
+		res := make([]float64, len(series))
+		multiplier := 2.0 / float64(period+1)
+
+		// Calculate initial SMA for the first EMA value
+		sum := 0.0
+		for i := 0; i < period; i++ {
+			sum += series[i]
+		}
+		res[period-1] = sum / float64(period)
+
+		// Calculate the rest of the EMA series
+		for i := period; i < len(series); i++ {
+			res[i] = (series[i]-res[i-1])*multiplier + res[i-1]
+		}
+		return res
+	}
+
+	fastEMA := ema(data, fastPeriod)
+	slowEMA := ema(data, slowPeriod)
+
+	if fastEMA == nil || slowEMA == nil {
+		return nil, nil, nil
+	}
+
+	// Calculate the MACD line series
+	macdSeries := make([]float64, len(data))
+	for i := slowPeriod - 1; i < len(data); i++ {
+		macdSeries[i] = fastEMA[i] - slowEMA[i]
+	}
+	macdSeries = macdSeries[slowPeriod-1:] // Trim leading empty values
+
+	if len(macdSeries) < signalPeriod {
+		return nil, nil, nil
+	}
+
+	// Calculate the signal line series
+	signalSeries := ema(macdSeries, signalPeriod)
+	if signalSeries == nil {
+		return nil, nil, nil
+	}
+	signalSeries = signalSeries[signalPeriod-1:] // Trim leading empty values
+	macdSeries = macdSeries[signalPeriod-1:]     // Align MACD series with signal series
+
+	// Calculate the histogram series
+	histSeries := make([]float64, len(signalSeries))
+	for i := range signalSeries {
+		histSeries[i] = macdSeries[i] - signalSeries[i]
+	}
+
+	return macdSeries, signalSeries, histSeries
+}
+
 // CalculateOBV calculates the On-Balance Volume for a series of bars.
 func CalculateOBV(bars []utilities.OHLCVBar) float64 {
 	var obv float64

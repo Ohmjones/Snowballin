@@ -398,6 +398,8 @@ type TradingConfig struct {
 	PredictiveRsiThreshold           float64  `mapstructure:"predictive_rsi_threshold"`
 	ConsensusRsiThreshold            float64  `mapstructure:"consensus_rsi_threshold"`
 	RsiAdjustFactor                  float64  `mapstructure:"rsi_adjust_factor"`
+	PredictiveAtrMultiplier          float64  `mapstructure:"predictive_atr_multiplier"`
+	PredictiveSearchWindowPercent    float64  `mapstructure:"predictive_search_window_percent"`
 }
 
 // WithdrawalConfig holds settings for automated withdrawal of funds.

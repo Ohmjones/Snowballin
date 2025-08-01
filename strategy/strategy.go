@@ -81,19 +81,28 @@ func (s *strategyImpl) checkMultiTimeframeConsensus(data ConsolidatedMarketPictu
 	s.logger.LogInfo("MTF Consensus [1/3 PASSED]: Daily trend is bullish (Consensus Price > Consensus EMA50).")
 
 	// --- Filter 2: 4-Hour Momentum (MACD) ---
-	consensusMacdHist, macdOk := getConsensusIndicatorValue(data, "4h", cfg.Indicators.MACDSlowPeriod, func(bars []utilities.OHLCVBar) (float64, bool) {
+	// Get the full histogram series to check for a momentum shift.
+	consensusMacdHistSeries, macdOk := getConsensusIndicatorValue(data, "4h", cfg.Indicators.MACDSlowPeriod+cfg.Indicators.MACDSignalPeriod, func(bars []utilities.OHLCVBar) (float64, bool) {
 		closes := extractCloses(bars)
-		_, _, macdHist := CalculateMACD(closes, cfg.Indicators.MACDFastPeriod, cfg.Indicators.MACDSlowPeriod, cfg.Indicators.MACDSignalPeriod)
-		return macdHist, true
+		_, _, macdHist := CalculateMACDSeries(closes, cfg.Indicators.MACDFastPeriod, cfg.Indicators.MACDSlowPeriod, cfg.Indicators.MACDSignalPeriod)
+		if len(macdHist) < 2 {
+			return 0, false // Not enough data for comparison
+		}
+		// Return a value indicating the shift: 1.0 for bullish shift, -1.0 for bearish.
+		if macdHist[len(macdHist)-1] > macdHist[len(macdHist)-2] {
+			return 1.0, true // Momentum is shifting up
+		}
+		return -1.0, true
 	})
 
 	if !macdOk {
-		return false, "Hold: Insufficient 4H data from providers for momentum analysis."
+		return false, "Hold: Insufficient 4H data for momentum analysis."
 	}
-	if consensusMacdHist <= 0 {
-		return false, fmt.Sprintf("Hold: 4H Consensus MACD Hist (%.4f) not positive", consensusMacdHist)
+	// The new check: we want the momentum shift value to be positive.
+	if consensusMacdHistSeries < 0 {
+		return false, fmt.Sprintf("Hold: 4H Consensus MACD momentum is not shifting bullishly (Value: %.2f)", consensusMacdHistSeries)
 	}
-	s.logger.LogInfo("MTF Consensus [2/3 PASSED]: 4H momentum is bullish (Consensus MACD Hist > 0).")
+	s.logger.LogInfo("MTF Consensus [2/3 PASSED]: 4H momentum is shifting bullishly.")
 
 	// --- Filter 3: 1-Hour Entry Trigger (RSI) ---
 	consensusRSI, rsiOk := getConsensusIndicatorValue(data, "1h", cfg.Indicators.RSIPeriod, func(bars []utilities.OHLCVBar) (float64, bool) {
@@ -181,71 +190,53 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 	// Extract currentPrice early for use in predictive logic
 	currentPrice := data.ProvidersData[0].CurrentPrice
 
-	// --- PREDICTIVE BUY LOGIC WITH PANIC FIX ---
+	// --- PREDICTIVE BUY LOGIC V2 ---
+	// This logic attempts to "snipe" a whipsaw by placing a limit order at a deep,
+	// volatility-defined support level, bypassing the standard MTF consensus.
 	bookAnalysis := PerformOrderBookAnalysis(data.BrokerOrderBook, 1.0, 10, 1.5)
 	if !isBuy && bookAnalysis.DepthScore > cfg.Trading.MinBookConfidenceForPredictive {
-		if cfg.Trading.UseMartingaleForPredictive {
-			s.logger.LogInfo("GenerateSignals [%s]: Consensus failed, but strong book (%f). Checking for dip conditions...", data.AssetPair, bookAnalysis.DepthScore)
+		s.logger.LogInfo("GenerateSignals [%s]: MTF Consensus failed, but strong book (%.2f). Checking for predictive snipe...", data.AssetPair, bookAnalysis.DepthScore)
 
-			if bookAnalysis.SupportLevels == nil || len(bookAnalysis.SupportLevels) == 0 {
-				s.logger.LogWarn("GenerateSignals [%s]: Predictive buy triggered, but no concrete support levels were found in the order book.", data.AssetPair)
-				return nil, nil
-			}
-
-			// Fetch primary (Kraken/broker) bars explicitly for predictive calculations to avoid skew
-			primaryBars, hasPrimaryBars := data.PrimaryOHLCVByTF[cfg.Consensus.MultiTimeframe.BaseTimeframe]
-			if !hasPrimaryBars || len(primaryBars) < cfg.Indicators.RSIPeriod {
-				s.logger.LogWarn("GenerateSignals [%s]: Insufficient broker (Kraken) bars for predictive buy indicators. Skipping to avoid skew.", data.AssetPair)
-				return nil, nil
-			}
-
-			// Calculate RSI from primary (Kraken) bars to ensure dip
-			rsi := CalculateRSI(primaryBars, cfg.Indicators.RSIPeriod)
-
-			// Compute dynamic threshold using ATR for volatility adjustment, from primary bars
-			atr, err := CalculateATR(primaryBars, cfg.Indicators.ATRPeriod)
-			if err != nil {
-				s.logger.LogError("GenerateSignals [%s]: Could not calculate ATR for adaptive RSI: %v", data.AssetPair, err)
-				return nil, err
-			}
-
-			// Simple avgATR approximation: Use ATR of previous period or fallback to current (improve with historical if needed)
-			avgATR := atr // For now, use current as proxy; in production, average last N ATRs
-			if avgATR == 0 {
-				avgATR = 1.0 // Avoid div-zero
-			}
-			volRatio := atr / avgATR
-			dynamicRsiThreshold := cfg.Trading.PredictiveRsiThreshold - (volRatio * cfg.Trading.RsiAdjustFactor)
-			dynamicRsiThreshold = math.Max(20, math.Min(60, dynamicRsiThreshold)) // Clamp to prevent extremes (e.g., 30-60)
-
-			if rsi >= dynamicRsiThreshold {
-				s.logger.LogInfo("GenerateSignals [%s]: Skipping predictive buy—RSI (%.2f) not oversold (dynamic threshold: %.2f, vol ratio: %.2f).", data.AssetPair, rsi, dynamicRsiThreshold, volRatio)
-				return nil, nil
-			}
-
-			// Ensure no recent volume spike (avoid rips), from primary bars
-			volumeSpike := CheckVolumeSpike(primaryBars, cfg.Indicators.VolumeSpikeFactor, cfg.Indicators.VolumeLookbackPeriod)
-			if volumeSpike {
-				s.logger.LogInfo("GenerateSignals [%s]: Skipping predictive buy—Recent volume spike detected (rip likely).", data.AssetPair)
-				return nil, nil
-			}
-
-			// Ensure support price is below current by at least PredictiveBuyDeviationPercent
-			supportPrice := bookAnalysis.SupportLevels[0].PriceLevel
-			minDipPrice := currentPrice * (1 - (cfg.Trading.PredictiveBuyDeviationPercent / 100.0))
-			if supportPrice >= minDipPrice {
-				s.logger.LogInfo("GenerateSignals [%s]: Skipping predictive buy—Support (%.2f) not deep enough below current (%.2f).", data.AssetPair, supportPrice, currentPrice)
-				return nil, nil
-			}
-
-			predictiveSignal := StrategySignal{
-				Direction:        "predictive_buy",
-				Reason:           fmt.Sprintf("Predictive: Strong book support (Confidence: %.2f) on dip (RSI: %.2f)", bookAnalysis.DepthScore, rsi),
-				RecommendedPrice: supportPrice,
-				CalculatedSize:   0, // Defer size calculation.
-			}
-			return []StrategySignal{predictiveSignal}, nil
+		// Fetch primary bars for ATR and RSI calculation to ensure data integrity.
+		primaryBars, hasPrimaryBars := data.PrimaryOHLCVByTF[cfg.Consensus.MultiTimeframe.BaseTimeframe]
+		if !hasPrimaryBars || len(primaryBars) < cfg.Indicators.ATRPeriod {
+			s.logger.LogWarn("GenerateSignals [%s]: Insufficient broker bars for predictive buy. Skipping.", data.AssetPair)
+			return nil, nil
 		}
+
+		// 1. Calculate ATR to determine a dynamic "snipe" distance based on current volatility.
+		atr, err := CalculateATR(primaryBars, cfg.Indicators.ATRPeriod)
+		if err != nil || atr == 0 {
+			s.logger.LogError("GenerateSignals [%s]: Could not calculate ATR for predictive buy: %v", data.AssetPair, err)
+			return nil, nil
+		}
+
+		// 2. Define the ideal target price for the snipe. This is a deep level.
+		targetSnipePrice := currentPrice - (atr * cfg.Trading.PredictiveAtrMultiplier)
+
+		// 3. Search for the strongest buy wall (support) *around* that ideal target price.
+		snipePrice, foundSupport := FindSupportNearPrice(data.BrokerOrderBook, targetSnipePrice, cfg.Trading.PredictiveSearchWindowPercent)
+		if !foundSupport {
+			s.logger.LogInfo("GenerateSignals [%s]: Predictive snipe skipped. No significant support wall found near the target price of %.2f.", data.AssetPair, targetSnipePrice)
+			return nil, nil
+		}
+
+		// 4. Final check: Ensure we are not trying to catch a rip on high volume.
+		volumeSpike := CheckVolumeSpike(primaryBars, cfg.Indicators.VolumeSpikeFactor, cfg.Indicators.VolumeLookbackPeriod)
+		if volumeSpike {
+			s.logger.LogInfo("GenerateSignals [%s]: Predictive snipe skipped due to recent volume spike.", data.AssetPair)
+			return nil, nil
+		}
+
+		// 5. Generate the signal.
+		s.logger.LogWarn("GenerateSignals [%s]: PREDICTIVE BUY SIGNAL TRIGGERED!", data.AssetPair)
+		predictiveSignal := StrategySignal{
+			Direction:        "predictive_buy",
+			Reason:           fmt.Sprintf("Predictive Snipe: Strong book (Conf: %.2f) at volatility-defined support. Target: %.2f", bookAnalysis.DepthScore, snipePrice),
+			RecommendedPrice: snipePrice,
+			CalculatedSize:   0, // Size will be calculated in the app layer based on Martingale logic.
+		}
+		return []StrategySignal{predictiveSignal}, nil
 	}
 	// --- END OF PREDICTIVE BUY LOGIC ---
 

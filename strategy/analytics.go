@@ -100,6 +100,44 @@ func PerformOrderBookAnalysis(orderBook broker.OrderBookData, depthPercent float
 	}
 }
 
+// FindSupportNearPrice analyzes the order book to find a strategic price for a limit buy order
+// within a specific window around a target price.
+// `targetPrice`: The ideal price to snipe, calculated from ATR.
+// `searchWindowPercent`: How far around the targetPrice to look for a volume wall (e.g., 0.5%).
+func FindSupportNearPrice(orderBook broker.OrderBookData, targetPrice float64, searchWindowPercent float64) (float64, bool) {
+	if len(orderBook.Bids) == 0 {
+		return 0, false // Cannot find a price if the book is empty.
+	}
+
+	// Define the absolute search window around the target price.
+	window := targetPrice * (searchWindowPercent / 100.0)
+	upperBound := targetPrice + window
+	lowerBound := targetPrice - window
+
+	var bestPrice float64
+	maxVolume := 0.0
+	foundSupport := false
+
+	// Iterate through bids to find the one with the highest volume within our search window.
+	for _, bid := range orderBook.Bids {
+		// If we've gone past our lower bound, we can stop.
+		if bid.Price < lowerBound {
+			break
+		}
+
+		// Check if the current bid is within our search window.
+		if bid.Price <= upperBound && bid.Price >= lowerBound {
+			if bid.Volume > maxVolume {
+				maxVolume = bid.Volume
+				bestPrice = bid.Price
+				foundSupport = true
+			}
+		}
+	}
+
+	return bestPrice, foundSupport
+}
+
 // --- NEW: Finds significant volume clusters (buy/sell walls) in the order book. ---
 // It identifies levels where the volume is significantly higher than its neighbors.
 // `windowSize`: Number of neighboring levels to average for comparison.
