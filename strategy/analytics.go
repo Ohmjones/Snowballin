@@ -100,44 +100,6 @@ func PerformOrderBookAnalysis(orderBook broker.OrderBookData, depthPercent float
 	}
 }
 
-// FindSupportNearPrice analyzes the order book to find a strategic price for a limit buy order
-// within a specific window around a target price.
-// `targetPrice`: The ideal price to snipe, calculated from ATR.
-// `searchWindowPercent`: How far around the targetPrice to look for a volume wall (e.g., 0.5%).
-func FindSupportNearPrice(orderBook broker.OrderBookData, targetPrice float64, searchWindowPercent float64) (float64, bool) {
-	if len(orderBook.Bids) == 0 {
-		return 0, false // Cannot find a price if the book is empty.
-	}
-
-	// Define the absolute search window around the target price.
-	window := targetPrice * (searchWindowPercent / 100.0)
-	upperBound := targetPrice + window
-	lowerBound := targetPrice - window
-
-	var bestPrice float64
-	maxVolume := 0.0
-	foundSupport := false
-
-	// Iterate through bids to find the one with the highest volume within our search window.
-	for _, bid := range orderBook.Bids {
-		// If we've gone past our lower bound, we can stop.
-		if bid.Price < lowerBound {
-			break
-		}
-
-		// Check if the current bid is within our search window.
-		if bid.Price <= upperBound && bid.Price >= lowerBound {
-			if bid.Volume > maxVolume {
-				maxVolume = bid.Volume
-				bestPrice = bid.Price
-				foundSupport = true
-			}
-		}
-	}
-
-	return bestPrice, foundSupport
-}
-
 // --- NEW: Finds significant volume clusters (buy/sell walls) in the order book. ---
 // It identifies levels where the volume is significantly higher than its neighbors.
 // `windowSize`: Number of neighboring levels to average for comparison.
@@ -259,28 +221,51 @@ func VolatilityAdjustedOrderPrice(lastPrice, atr, multiplier float64, buy bool) 
 	return lastPrice + atr*multiplier
 }
 
+// CheckMultiIndicatorConfirmation provides a final, detailed check after the main consensus passes.
 func CheckMultiIndicatorConfirmation(rsi, stochRSI, macdHist, obv float64, volumeSpike, liquidityHunt bool, bars []utilities.OHLCVBar, cfg utilities.IndicatorsConfig) (bool, string) {
+	// Condition 1: A liquidity hunt event is always a strong signal.
 	if liquidityHunt && volumeSpike {
 		return true, "Liquidity event with volume spike"
 	}
 
-	if rsi < 40 && stochRSI < cfg.StochRSIBuyThreshold && macdHist > 0 && isOBVBullish(obv, bars) {
-		return true, "Bullish reversal confirmed by OBV trend"
+	// --- MODIFIED LOGIC ---
+	// Condition 2: A classic dip-buying signal. We're looking for oversold conditions
+	// on multiple momentum oscillators, which is a high-confidence signal that a
+	// bounce is imminent. We REMOVED the `macdHist > 0` check as it was
+	// contradicting our main "Momentum Shift" entry logic.
+	isRsiOversold := rsi < 40
+	isStochRsiOversold := stochRSI < cfg.StochRSIBuyThreshold // e.g., < 20
+
+	if isRsiOversold && isStochRsiOversold {
+		return true, fmt.Sprintf("Bullish Confirmation: RSI (%.2f) and StochRSI (%.2f) are both oversold.", rsi, stochRSI)
+	}
+	// --- END MODIFIED LOGIC ---
+
+	// This is a bearish (sell) condition and is not relevant for a buy confirmation.
+	// It can be kept for future use or removed if this function is only for buys.
+	if rsi > 70 && stochRSI > cfg.StochRSISellThreshold && macdHist < 0 && isOBVBearish(obv, bars) {
+		// This part of the logic would not be hit for a buy signal anyway.
+		return false, "Bearish conditions met, not bullish."
 	}
 
-	if rsi > 70 && stochRSI > cfg.StochRSISellThreshold && macdHist < 0 && isOBVBearish(obv, bars) {
-		return true, "Bearish reversal confirmed by OBV trend"
-	}
-	fmt.Printf("FinalConf: RSI=%.2f, StochRSI=%.2f, MACDHist=%.4f, LiquidityHunt=%v, VolSpike=%v", rsi, stochRSI, macdHist, liquidityHunt, volumeSpike)
+	// This is the debug print that helped us find the issue. It can be removed or kept.
+	fmt.Printf("FinalConf: RSI=%.2f, StochRSI=%.2f, MACDHist=%.4f, LiquidityHunt=%v, VolSpike=%v\n", rsi, stochRSI, macdHist, liquidityHunt, volumeSpike)
+
 	return false, "No strong multi-indicator confirmation"
 }
 
 func isOBVBullish(currentOBV float64, bars []utilities.OHLCVBar) bool {
+	if len(bars) < 2 {
+		return false
+	}
 	historicalOBV := CalculateOBV(bars[:len(bars)-1])
 	return currentOBV > historicalOBV
 }
 
 func isOBVBearish(currentOBV float64, bars []utilities.OHLCVBar) bool {
+	if len(bars) < 2 {
+		return false
+	}
 	historicalOBV := CalculateOBV(bars[:len(bars)-1])
 	return currentOBV < historicalOBV
 }
@@ -393,4 +378,42 @@ func FindBestLimitPrice(orderBook broker.OrderBookData, targetPrice float64, sea
 
 	// Return the price with the highest volume found, or the original target if no better price was identified.
 	return bestPrice
+}
+
+// FindSupportNearPrice analyzes the order book to find a strategic price for a limit buy order
+// within a specific window around a target price.
+// `targetPrice`: The ideal price to snipe, calculated from ATR.
+// `searchWindowPercent`: How far around the targetPrice to look for a volume wall (e.g., 0.5%).
+func FindSupportNearPrice(orderBook broker.OrderBookData, targetPrice float64, searchWindowPercent float64) (float64, bool) {
+	if len(orderBook.Bids) == 0 {
+		return 0, false // Cannot find a price if the book is empty.
+	}
+
+	// Define the absolute search window around the target price.
+	window := targetPrice * (searchWindowPercent / 100.0)
+	upperBound := targetPrice + window
+	lowerBound := targetPrice - window
+
+	var bestPrice float64
+	maxVolume := 0.0
+	foundSupport := false
+
+	// Iterate through bids to find the one with the highest volume within our search window.
+	for _, bid := range orderBook.Bids {
+		// If we've gone past our lower bound, we can stop.
+		if bid.Price < lowerBound {
+			break
+		}
+
+		// Check if the current bid is within our search window.
+		if bid.Price <= upperBound && bid.Price >= lowerBound {
+			if bid.Volume > maxVolume {
+				maxVolume = bid.Volume
+				bestPrice = bid.Price
+				foundSupport = true
+			}
+		}
+	}
+
+	return bestPrice, foundSupport
 }
