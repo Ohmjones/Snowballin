@@ -865,6 +865,21 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 				return
 			}
 
+			// --- ADDED: Balance Check for Add-on Buy ---
+			orderTotalValue := orderSizeInBase * orderPrice
+			quoteCurrency := cfg.Trading.QuoteCurrency
+			balance, balanceErr := state.broker.GetBalance(ctx, quoteCurrency)
+			if balanceErr != nil {
+				state.logger.LogError("ManagePosition [%s]: Could not verify account balance before placing add-on order: %v. Aborting.", pos.AssetPair, balanceErr)
+				return
+			}
+			if orderTotalValue > balance.Total {
+				state.logger.LogWarn("ManagePosition [%s]: Insufficient funds to place add-on order. Required: ~%.2f %s, Available: %.2f %s. Skipping.",
+					pos.AssetPair, orderTotalValue, quoteCurrency, balance.Total, quoteCurrency)
+				return
+			}
+			// --- END: Balance Check ---
+
 			orderID, placeErr := state.broker.PlaceOrder(ctx, pos.AssetPair, "buy", "limit", orderSizeInBase, orderPrice, 0, "")
 			if placeErr != nil {
 				state.logger.LogError("ManagePosition [%s]: Failed to place add-on buy order: %v", pos.AssetPair, placeErr)
@@ -872,7 +887,7 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 				state.logger.LogInfo("ManagePosition [%s]: Placed add-on order ID %s at %.2f.", pos.AssetPair, orderID, orderPrice)
 				baseAsset := strings.Split(pos.AssetPair, "/")[0]
 				quoteAsset := strings.Split(pos.AssetPair, "/")[1]
-				message := fmt.Sprintf("🧠 **Placing Limit Buy Order**\n**Pair:** %s\n**Size:** `%.4f %s`\n**Price:** `%.2f %s`\n**Reason:** %s\n",
+				message := fmt.Sprintf("➕ **Adding to Position**\n**Pair:** %s\n**Size:** `%.4f %s`\n**Price:** `%.2f %s`\n**Reason:** %s\n",
 					pos.AssetPair, orderSizeInBase, baseAsset, orderPrice, quoteAsset, sig.Reason)
 				state.discordClient.SendMessage(message)
 				state.stateMutex.Lock()
@@ -1033,6 +1048,22 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 			nextSONumber := pos.FilledSafetyOrders + 1
 			orderSizeInQuote := pos.BaseOrderSize * math.Pow(cfg.Trading.SafetyOrderVolumeScale, float64(nextSONumber))
 			orderSizeInBase := orderSizeInQuote / strategicSafetyPrice
+
+			// --- ADDED: Balance Check for Safety Order ---
+			orderTotalValue := orderSizeInBase * strategicSafetyPrice
+			quoteCurrency := cfg.Trading.QuoteCurrency
+			balance, balanceErr := state.broker.GetBalance(ctx, quoteCurrency)
+			if balanceErr != nil {
+				state.logger.LogError("ManagePosition [%s]: Could not verify account balance before placing safety order: %v. Aborting.", pos.AssetPair, balanceErr)
+				return
+			}
+			if orderTotalValue > balance.Total {
+				state.logger.LogWarn("ManagePosition [%s]: Insufficient funds to place Safety Order #%d. Required: ~%.2f %s, Available: %.2f %s. Skipping.",
+					pos.AssetPair, nextSONumber, orderTotalValue, quoteCurrency, balance.Total, quoteCurrency)
+				return
+			}
+			// --- END: Balance Check ---
+
 			state.logger.LogInfo("ManagePosition [%s]: Price condition met for Safety Order #%d. Placing limit buy.", pos.AssetPair, nextSONumber)
 			orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "buy", "limit", orderSizeInBase, strategicSafetyPrice, 0, "")
 			if err != nil {
