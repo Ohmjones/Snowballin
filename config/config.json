@@ -13,7 +13,7 @@
   },
   "coingecko": {
     "base_url": "https://pro-api.coingecko.com/api/v3",
-    "api_key": "YOUR_COINGECKO_API_KEY_OR_LEAVE_EMPTY_FOR_PUBLIC",
+    "api_key": "YOUR_COINGECKO_API_KEY",
     "request_timeout_sec": 10,
     "max_retries": 3,
     "retry_delay_sec": 5,
