@@ -1050,6 +1050,9 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 		}
 	}
 }
+
+// seekEntryOpportunity evaluates signals to open a new position.
+// This is the corrected version of the function.
 func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair string, signals []strategy.StrategySignal, consolidatedData *strategy.ConsolidatedMarketPicture, cfg *utilities.AppConfig) {
 	for _, sig := range signals {
 		if strings.EqualFold(sig.Direction, "buy") || strings.EqualFold(sig.Direction, "predictive_buy") {
@@ -1073,14 +1076,12 @@ func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair st
 			if strings.EqualFold(sig.Direction, "buy") {
 				orderPrice = sig.RecommendedPrice
 				orderSizeInBase = sig.CalculatedSize
-				// [MODIFIED] Use the passed-in, sentiment-adjusted config.
 				if cfg.Trading.ConsensusBuyMultiplier > 1.0 {
 					orderSizeInBase *= cfg.Trading.ConsensusBuyMultiplier
 					state.logger.LogInfo("SeekEntry [%s]: Applying x%.2f multiplier to consensus buy. New size: %.4f", assetPair, cfg.Trading.ConsensusBuyMultiplier, orderSizeInBase)
 				}
 			} else { // This is a "predictive_buy"
 				orderPrice = sig.RecommendedPrice
-				// [MODIFIED] Use the passed-in, sentiment-adjusted config.
 				orderSizeInBase = cfg.Trading.BaseOrderSize / orderPrice
 				state.logger.LogInfo("SeekEntry [%s]: Predictive buy placing order at %.2f based on detected support level from strategy signal.", assetPair, orderPrice)
 			}
@@ -1090,24 +1091,54 @@ func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair st
 				continue
 			}
 
+			// --- CORRECTED: Pre-flight balance check ---
+			orderTotalValue := orderSizeInBase * orderPrice
+			quoteCurrency := cfg.Trading.QuoteCurrency
+
+			// Use the specific GetBalance function for efficiency and correctness.
+			balance, balanceErr := state.broker.GetBalance(ctx, quoteCurrency)
+			if balanceErr != nil {
+				state.logger.LogError("SeekEntry [%s]: Could not verify account balance for '%s' before placing order: %v. Aborting.", assetPair, quoteCurrency, balanceErr)
+				continue // Skip to the next signal
+			}
+
+			// The 'balance' object has a 'Total' field. We assume Total is the available balance for trading.
+			availableQuoteBalance := balance.Total
+
+			if orderTotalValue > availableQuoteBalance {
+				state.logger.LogWarn("SeekEntry [%s]: Insufficient funds to place buy order. Required: ~%.2f %s, Available: %.2f %s. The order will be skipped.",
+					assetPair, orderTotalValue, quoteCurrency, availableQuoteBalance, quoteCurrency)
+				continue // Skip this signal and avoid the PlaceOrder call
+			}
+			// --- END: Pre-flight balance check ---
+
 			orderID, placeErr := state.broker.PlaceOrder(ctx, assetPair, "buy", "limit", orderSizeInBase, orderPrice, 0, "")
 			if placeErr != nil {
 				state.logger.LogError("SeekEntry [%s]: Place order failed: %v", assetPair, placeErr)
 			} else {
 				state.logger.LogInfo("SeekEntry [%s]: Placed order ID %s at %.2f. Now tracking.", assetPair, orderID, orderPrice)
+
+				// --- Unified Discord Notification ---
+				baseAsset := strings.Split(assetPair, "/")[0]
+				quoteAsset := strings.Split(assetPair, "/")[1]
+				var message string
+
 				if strings.EqualFold(sig.Direction, "predictive_buy") {
-					baseAsset := strings.Split(assetPair, "/")[0]
-					quoteAsset := strings.Split(assetPair, "/")[1]
-					message := fmt.Sprintf("🧠 **Predictive Buy Order Placed**\n**Pair:** %s\n**Size:** `%.4f %s`\n**Price:** `%.2f %s`\n**Reason:** %s",
-						assetPair, orderSizeInBase, baseAsset, orderPrice, quoteAsset, sig.Reason)
-					state.discordClient.SendMessage(message)
+					message = fmt.Sprintf("🧠 **Predictive Buy Order Placed**\n**Pair:** %s\n**Size:** `%.4f %s`\n**Price:** `%.2f %s`\n**Order ID:** `%s`\n**Reason:** %s",
+						assetPair, orderSizeInBase, baseAsset, orderPrice, quoteAsset, orderID, sig.Reason)
+				} else { // This handles the standard 'buy' signal
+					message = fmt.Sprintf("✅ **Buy Order Placed**\n**Pair:** %s\n**Size:** `%.4f %s`\n**Price:** `%.2f %s`\n**Order ID:** `%s`\n**Reason:** %s",
+						assetPair, orderSizeInBase, baseAsset, orderPrice, quoteAsset, orderID, sig.Reason)
 				}
+				state.discordClient.SendMessage(message)
+				// --- End Unified Discord Notification ---
+
 				state.stateMutex.Lock()
 				state.pendingOrders[orderID] = assetPair
 				_ = state.cache.SavePendingOrder(orderID, assetPair)
 				state.stateMutex.Unlock()
 			}
-			break
+			break // Exit after processing the first valid buy signal
 		}
 	}
 }

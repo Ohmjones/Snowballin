@@ -292,7 +292,8 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 	var signals []StrategySignal
 	recommendedPrice := FindBestLimitPrice(data.BrokerOrderBook, currentPrice-atr, 1.0)
 	// For a standard buy, we still calculate the size here based on portfolio risk.
-	calculatedSize := AdjustPositionSize(data.PortfolioValue, atr, cfg.Trading.PortfolioRiskPerTrade)
+	//calculatedSize := AdjustPositionSize(data.PortfolioValue, atr, cfg.Trading.PortfolioRiskPerTrade)
+	calculatedSize := cfg.Trading.BaseOrderSize / recommendedPrice
 	stopLossPrice := VolatilityAdjustedOrderPrice(recommendedPrice, atr, 2.0, true)
 	orderBookConfidence := AnalyzeOrderBookDepth(data.BrokerOrderBook, 1.0)
 
