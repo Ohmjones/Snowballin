@@ -60,7 +60,9 @@ func getConsensusIndicatorValue(
 // checkMultiTimeframeConsensus applies a hierarchical filter using a weighted consensus from all data providers.
 func (s *strategyImpl) checkMultiTimeframeConsensus(data ConsolidatedMarketPicture, cfg utilities.AppConfig) (bool, string) {
 	// --- Gate 1: Daily Trend (EMA) ---
-	// This is our primary safety rail. We MUST be in a long-term uptrend.
+	var isTrendBullish bool
+	var trendReason string
+
 	consensusLastClose, priceOk := getConsensusIndicatorValue(data, "1d", 50, func(bars []utilities.OHLCVBar) (float64, bool) {
 		return bars[len(bars)-1].Close, true
 	})
@@ -76,23 +78,39 @@ func (s *strategyImpl) checkMultiTimeframeConsensus(data ConsolidatedMarketPictu
 	if !priceOk || !emaOk {
 		return false, "Hold: Insufficient daily data for trend analysis."
 	}
-	if consensusLastClose < consensusEMA50 {
-		return false, fmt.Sprintf("Hold: Daily trend is bearish. Price (%.2f) is below Daily EMA(50) (%.2f)", consensusLastClose, consensusEMA50)
+
+	if consensusLastClose >= consensusEMA50 {
+		isTrendBullish = true
+		trendReason = "Daily trend is bullish."
+		s.logger.LogInfo("MTF Consensus [GATE 1 PASSED]: %s", trendReason)
+	} else {
+		// --- THE FEAR OVERRIDE LOGIC ---
+		if cfg.Trading.UseFearOverride && data.FearGreedIndex.Value <= cfg.Trading.FearOverrideThreshold {
+			isTrendBullish = true // Override the failed trend check.
+			trendReason = fmt.Sprintf("FEAR OVERRIDE ACTIVE (F&G: %d)", data.FearGreedIndex.Value)
+			s.logger.LogWarn("MTF Consensus [GATE 1 OVERRIDDEN]: %s", trendReason)
+		} else {
+			// If override is disabled or F&G is not low enough, fail the check.
+			return false, fmt.Sprintf("Hold: Daily trend is bearish. Price (%.2f) is below Daily EMA(50) (%.2f)", consensusLastClose, consensusEMA50)
+		}
 	}
-	s.logger.LogInfo("MTF Consensus [GATE 1 PASSED]: Daily trend is bullish.")
+
+	// If Gate 1 (or its override) did not pass, we can't proceed.
+	if !isTrendBullish {
+		return false, "Hold: Daily trend is bearish and Fear Override conditions not met."
+	}
 
 	// --- Gate 2: 4-Hour Momentum (MACD) ---
-	// We check if the downward momentum is starting to ease up.
 	var isMomentumShifting bool
 	var momentumReason string
 	consensusMacdHistSeries, macdOk := getConsensusIndicatorValue(data, "4h", cfg.Indicators.MACDSlowPeriod+cfg.Indicators.MACDSignalPeriod, func(bars []utilities.OHLCVBar) (float64, bool) {
 		closes := extractCloses(bars)
 		_, _, macdHist := CalculateMACDSeries(closes, cfg.Indicators.MACDFastPeriod, cfg.Indicators.MACDSlowPeriod, cfg.Indicators.MACDSignalPeriod)
 		if len(macdHist) < 2 {
-			return 0, false // Not enough data for comparison
+			return 0, false
 		}
 		if macdHist[len(macdHist)-1] > macdHist[len(macdHist)-2] {
-			return 1.0, true // Momentum is shifting up
+			return 1.0, true
 		}
 		return -1.0, true
 	})
@@ -102,7 +120,6 @@ func (s *strategyImpl) checkMultiTimeframeConsensus(data ConsolidatedMarketPictu
 	}
 
 	// --- Gate 3: 1-Hour Entry Trigger (RSI) ---
-	// We check if the asset is currently in a short-term dip.
 	var isRsiLow bool
 	var rsiReason string
 	consensusRSI, rsiOk := getConsensusIndicatorValue(data, "1h", cfg.Indicators.RSIPeriod, func(bars []utilities.OHLCVBar) (float64, bool) {
@@ -115,8 +132,6 @@ func (s *strategyImpl) checkMultiTimeframeConsensus(data ConsolidatedMarketPictu
 	}
 
 	// --- FINAL LOGIC: Gate 1 AND (Gate 2 OR Gate 3) ---
-	// This is the new, more aggressive logic. As long as the daily trend is bullish,
-	// we only need ONE of the other conditions to be true to generate a buy signal.
 	if isMomentumShifting || isRsiLow {
 		var finalReason string
 		if isMomentumShifting && isRsiLow {
@@ -127,10 +142,10 @@ func (s *strategyImpl) checkMultiTimeframeConsensus(data ConsolidatedMarketPictu
 			finalReason = rsiReason
 		}
 		s.logger.LogInfo("MTF Consensus [GATES 2/3 PASSED]: %s", finalReason)
-		return true, finalReason
+		// Prepend the trend reason (which could be the override reason)
+		return true, fmt.Sprintf("%s | %s", trendReason, finalReason)
 	}
 
-	// If we reach here, neither of the secondary conditions were met.
 	return false, "Hold: Neither 4H momentum shift nor 1H low RSI conditions were met."
 }
 

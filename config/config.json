@@ -82,7 +82,9 @@
     "predictive_buy_deviation_percent": 2,
     "consensus_buy_multiplier": 2.0,
     "predictive_rsi_threshold": 50,
-    "rsi_adjust_factor": 5.0
+    "rsi_adjust_factor": 5.0,
+    "use_fear_override": true,
+    "fear_override_threshold": 25
 },
   "indicators": {
     "rsi_period": 14,

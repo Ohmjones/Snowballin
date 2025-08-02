@@ -400,6 +400,8 @@ type TradingConfig struct {
 	RsiAdjustFactor                  float64  `mapstructure:"rsi_adjust_factor"`
 	PredictiveAtrMultiplier          float64  `mapstructure:"predictive_atr_multiplier"`
 	PredictiveSearchWindowPercent    float64  `mapstructure:"predictive_search_window_percent"`
+	UseFearOverride                  bool     `mapstructure:"use_fear_override"`
+	FearOverrideThreshold            int      `mapstructure:"fear_override_threshold"`
 }
 
 // WithdrawalConfig holds settings for automated withdrawal of funds.
