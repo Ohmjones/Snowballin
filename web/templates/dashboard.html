@@ -12,13 +12,13 @@
     <div class="item">
         <div class="content">
             <div class="header">Current Portfolio Value</div>
-            <div class="description" style="color: #21ba45; font-size: 1.2em;">{{printf "%.2f" .data.PortfolioValue}} {{.data.QuoteCurrency}}</div>
+            <div class="description" style="color: #21ba45; font-size: 1.2em;">{{printf "%.2f" .PortfolioValue}} {{.QuoteCurrency}}</div>
         </div>
     </div>
 </div>
 
-<h2 class="ui inverted header">Open Positions ({{len .data.ActivePositions}})</h2>
-{{if .data.ActivePositions}}
+<h2 class="ui inverted header">Open Positions ({{len .ActivePositions}})</h2>
+{{if .ActivePositions}}
 <table class="ui celled inverted table">
     <thead>
     <tr>
@@ -31,7 +31,7 @@
     </tr>
     </thead>
     <tbody>
-    {{range .data.ActivePositions}}
+    {{range .ActivePositions}}
     <tr>
         <td><i class="btc icon"></i> {{.AssetPair}}</td>
         <td>{{printf "%.4f" .AveragePrice}}</td>

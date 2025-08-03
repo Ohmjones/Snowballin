@@ -7,11 +7,11 @@
     </div>
 </h1>
 
-{{if .data.Message}}
+{{if .Message}}
 <div class="ui success message">
     <i class="close icon"></i>
     <div class="header">Update Successful</div>
-    <p>{{.data.Message}}</p>
+    <p>{{.Message}}</p>
 </div>
 {{end}}
 
@@ -22,44 +22,44 @@
         <div class="active content">
             <div class="field">
                 <label>Asset Pairs (comma-separated)</label>
-                <input type="text" name="trading.asset_pairs" value="{{join .data.Config.Trading.AssetPairs ","}}">
+                <input type="text" name="trading.asset_pairs" value="{{join .Config.Trading.AssetPairs ","}}">
             </div>
             <div class="two fields">
                 <div class="field">
                     <label>Base Order Size (in Quote Currency)</label>
-                    <input type="text" name="trading.base_order_size" value="{{.data.Config.Trading.BaseOrderSize}}">
+                    <input type="text" name="trading.base_order_size" value="{{.Config.Trading.BaseOrderSize}}">
                 </div>
                 <div class="field">
                     <label>Take Profit Percentage</label>
-                    <input type="text" name="trading.take_profit_percentage" value="{{.data.Config.Trading.TakeProfitPercentage}}">
+                    <input type="text" name="trading.take_profit_percentage" value="{{.Config.Trading.TakeProfitPercentage}}">
                 </div>
             </div>
             <div class="four fields">
                 <div class="field">
                     <label>Max Safety Orders</label>
-                    <input type="text" name="trading.max_safety_orders" value="{{.data.Config.Trading.MaxSafetyOrders}}">
+                    <input type="text" name="trading.max_safety_orders" value="{{.Config.Trading.MaxSafetyOrders}}">
                 </div>
                 <div class="field">
                     <label>Price Deviation for SO (%)</label>
-                    <input type="text" name="trading.price_deviation_to_open_safety_orders" value="{{.data.Config.Trading.PriceDeviationToOpenSafetyOrders}}">
+                    <input type="text" name="trading.price_deviation_to_open_safety_orders" value="{{.Config.Trading.PriceDeviationToOpenSafetyOrders}}">
                 </div>
                 <div class="field">
                     <label>Safety Order Step Scale</label>
-                    <input type="text" name="trading.safety_order_step_scale" value="{{.data.Config.Trading.SafetyOrderStepScale}}">
+                    <input type="text" name="trading.safety_order_step_scale" value="{{.Config.Trading.SafetyOrderStepScale}}">
                 </div>
                 <div class="field">
                     <label>Safety Order Volume Scale</label>
-                    <input type="text" name="trading.safety_order_volume_scale" value="{{.data.Config.Trading.SafetyOrderVolumeScale}}">
+                    <input type="text" name="trading.safety_order_volume_scale" value="{{.Config.Trading.SafetyOrderVolumeScale}}">
                 </div>
             </div>
             <div class="two fields">
                 <div class="field">
                     <label>Consensus Buy Multiplier</label>
-                    <input type="text" name="trading.consensus_buy_multiplier" value="{{.data.Config.Trading.ConsensusBuyMultiplier}}">
+                    <input type="text" name="trading.consensus_buy_multiplier" value="{{.Config.Trading.ConsensusBuyMultiplier}}">
                 </div>
                 <div class="inline field">
                     <div class="ui toggle checkbox" style="margin-top: 25px;">
-                        <input type="checkbox" name="trading.trailing_stop_enabled" {{if .data.Config.Trading.TrailingStopEnabled}}checked{{end}}>
+                        <input type="checkbox" name="trading.trailing_stop_enabled" value="on" {{if .Config.Trading.TrailingStopEnabled}}checked{{end}}>
                         <label>Enable Trailing Stop</label>
                     </div>
                 </div>
@@ -71,23 +71,23 @@
             <div class="four fields">
                 <div class="field">
                     <label>RSI Period</label>
-                    <input type="text" name="indicators.rsi_period" value="{{.data.Config.Indicators.RSIPeriod}}">
+                    <input type="text" name="indicators.rsi_period" value="{{.Config.Indicators.RSIPeriod}}">
                 </div>
                 <div class="field">
                     <label>ATR Period</label>
-                    <input type="text" name="indicators.atr_period" value="{{.data.Config.Indicators.ATRPeriod}}">
+                    <input type="text" name="indicators.atr_period" value="{{.Config.Indicators.ATRPeriod}}">
                 </div>
                 <div class="field">
                     <label>MACD Fast Period</label>
-                    <input type="text" name="indicators.macd_fast_period" value="{{.data.Config.Indicators.MACDFastPeriod}}">
+                    <input type="text" name="indicators.macd_fast_period" value="{{.Config.Indicators.MACDFastPeriod}}">
                 </div>
                 <div class="field">
                     <label>MACD Slow Period</label>
-                    <input type="text" name="indicators.macd_slow_period" value="{{.data.Config.Indicators.MACDSlowPeriod}}">
+                    <input type="text" name="indicators.macd_slow_period" value="{{.Config.Indicators.MACDSlowPeriod}}">
                 </div>
                 <div class="field">
                     <label>MACD Signal Period</label>
-                    <input type="text" name="indicators.macd_signal_period" value="{{.data.Config.Indicators.MACDSignalPeriod}}">
+                    <input type="text" name="indicators.macd_signal_period" value="{{.Config.Indicators.MACDSignalPeriod}}">
                 </div>
             </div>
         </div>
@@ -97,11 +97,11 @@
             <div class="two fields">
                 <div class="field">
                     <label>Circuit Breaker Max Drawdown (%)</label>
-                    <input type="text" name="circuitbreaker.drawdown_threshold_percent" value="{{.data.Config.CircuitBreaker.DrawdownThresholdPercent}}">
+                    <input type="text" name="circuitbreaker.drawdown_threshold_percent" value="{{.Config.CircuitBreaker.DrawdownThresholdPercent}}">
                 </div>
                 <div class="inline field">
                     <div class="ui toggle checkbox" style="margin-top: 25px;">
-                        <input type="checkbox" name="circuitbreaker.enabled" {{if .data.Config.CircuitBreaker.Enabled}}checked{{end}}>
+                        <input type="checkbox" name="circuitbreaker.enabled" value="on" {{if .Config.CircuitBreaker.Enabled}}checked{{end}}>
                         <label>Enable Circuit Breaker</label>
                     </div>
                 </div>
@@ -109,10 +109,10 @@
             <div class="field">
                 <label>Log Level</label>
                 <select name="logging.level" class="ui dropdown">
-                    <option value="debug" {{if eq .data.Config.Logging.Level "debug"}}selected{{end}}>Debug</option>
-                    <option value="info" {{if eq .data.Config.Logging.Level "info"}}selected{{end}}>Info</option>
-                    <option value="warn" {{if eq .data.Config.Logging.Level "warn"}}selected{{end}}>Warn</option>
-                    <option value="error" {{if eq .data.Config.Logging.Level "error"}}selected{{end}}>Error</option>
+                    <option value="debug" {{if eq .Config.Logging.Level "debug"}}selected{{end}}>Debug</option>
+                    <option value="info" {{if eq .Config.Logging.Level "info"}}selected{{end}}>Info</option>
+                    <option value="warn" {{if eq .Config.Logging.Level "warn"}}selected{{end}}>Warn</option>
+                    <option value="error" {{if eq .Config.Logging.Level "error"}}selected{{end}}>Error</option>
                 </select>
             </div>
         </div>
