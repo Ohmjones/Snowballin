@@ -16,110 +16,108 @@
 {{end}}
 
 <form class="ui inverted form" method="POST" action="/settings">
-    <div class="ui styled inverted accordion">
 
-        <div class="active title"><i class="dropdown icon"></i> Trading Parameters</div>
-        <div class="active content">
-            <div class="field">
-                <label>Asset Pairs (comma-separated)</label>
-                <input type="text" name="trading.asset_pairs" value="{{join .Config.Trading.AssetPairs ","}}">
-            </div>
-            <div class="two fields">
-                <div class="field">
-                    <label>Base Order Size (in Quote Currency)</label>
-                    <input type="text" name="trading.base_order_size" value="{{.Config.Trading.BaseOrderSize}}">
-                </div>
-                <div class="field">
-                    <label>Take Profit Percentage</label>
-                    <input type="text" name="trading.take_profit_percentage" value="{{.Config.Trading.TakeProfitPercentage}}">
-                </div>
-            </div>
-            <div class="four fields">
-                <div class="field">
-                    <label>Max Safety Orders</label>
-                    <input type="text" name="trading.max_safety_orders" value="{{.Config.Trading.MaxSafetyOrders}}">
-                </div>
-                <div class="field">
-                    <label>Price Deviation for SO (%)</label>
-                    <input type="text" name="trading.price_deviation_to_open_safety_orders" value="{{.Config.Trading.PriceDeviationToOpenSafetyOrders}}">
-                </div>
-                <div class="field">
-                    <label>Safety Order Step Scale</label>
-                    <input type="text" name="trading.safety_order_step_scale" value="{{.Config.Trading.SafetyOrderStepScale}}">
-                </div>
-                <div class="field">
-                    <label>Safety Order Volume Scale</label>
-                    <input type="text" name="trading.safety_order_volume_scale" value="{{.Config.Trading.SafetyOrderVolumeScale}}">
-                </div>
-            </div>
-            <div class="two fields">
-                <div class="field">
-                    <label>Consensus Buy Multiplier</label>
-                    <input type="text" name="trading.consensus_buy_multiplier" value="{{.Config.Trading.ConsensusBuyMultiplier}}">
-                </div>
-                <div class="inline field">
-                    <div class="ui toggle checkbox" style="margin-top: 25px;">
-                        <input type="checkbox" name="trading.trailing_stop_enabled" value="on" {{if .Config.Trading.TrailingStopEnabled}}checked{{end}}>
-                        <label>Enable Trailing Stop</label>
-                    </div>
-                </div>
-            </div>
-        </div>
+    <h4 class="ui dividing inverted header">Trading Parameters</h4>
 
-        <div class="title"><i class="dropdown icon"></i> Indicators</div>
-        <div class="content">
-            <div class="four fields">
-                <div class="field">
-                    <label>RSI Period</label>
-                    <input type="text" name="indicators.rsi_period" value="{{.Config.Indicators.RSIPeriod}}">
-                </div>
-                <div class="field">
-                    <label>ATR Period</label>
-                    <input type="text" name="indicators.atr_period" value="{{.Config.Indicators.ATRPeriod}}">
-                </div>
-                <div class="field">
-                    <label>MACD Fast Period</label>
-                    <input type="text" name="indicators.macd_fast_period" value="{{.Config.Indicators.MACDFastPeriod}}">
-                </div>
-                <div class="field">
-                    <label>MACD Slow Period</label>
-                    <input type="text" name="indicators.macd_slow_period" value="{{.Config.Indicators.MACDSlowPeriod}}">
-                </div>
-                <div class="field">
-                    <label>MACD Signal Period</label>
-                    <input type="text" name="indicators.macd_signal_period" value="{{.Config.Indicators.MACDSignalPeriod}}">
-                </div>
-            </div>
-        </div>
-
-        <div class="title"><i class="dropdown icon"></i> Safety & Logging</div>
-        <div class="content">
-            <div class="two fields">
-                <div class="field">
-                    <label>Circuit Breaker Max Drawdown (%)</label>
-                    <input type="text" name="circuitbreaker.drawdown_threshold_percent" value="{{.Config.CircuitBreaker.DrawdownThresholdPercent}}">
-                </div>
-                <div class="inline field">
-                    <div class="ui toggle checkbox" style="margin-top: 25px;">
-                        <input type="checkbox" name="circuitbreaker.enabled" value="on" {{if .Config.CircuitBreaker.Enabled}}checked{{end}}>
-                        <label>Enable Circuit Breaker</label>
-                    </div>
-                </div>
-            </div>
-            <div class="field">
-                <label>Log Level</label>
-                <select name="logging.level" class="ui dropdown">
-                    <option value="debug" {{if eq .Config.Logging.Level "debug"}}selected{{end}}>Debug</option>
-                    <option value="info" {{if eq .Config.Logging.Level "info"}}selected{{end}}>Info</option>
-                    <option value="warn" {{if eq .Config.Logging.Level "warn"}}selected{{end}}>Warn</option>
-                    <option value="error" {{if eq .Config.Logging.Level "error"}}selected{{end}}>Error</option>
-                </select>
-            </div>
-        </div>
-
+    <div class="field">
+        <label>Asset Pairs (comma-separated, no spaces)</label>
+        <input type="text" name="trading.asset_pairs" value="{{join .Config.Trading.AssetPairs `,`}}" />
     </div>
 
-    <div class="ui inverted divider"></div>
+    <div class="three fields">
+        <div class="field">
+            <label>Base Order Size ({{.Config.Trading.QuoteCurrency}})</label>
+            <input type="text" name="trading.base_order_size" value="{{.Config.Trading.BaseOrderSize}}" />
+        </div>
+        <div class="field">
+            <label>Take Profit (%)</label>
+            <input type="text" name="trading.take_profit_percentage" value="{{.Config.Trading.TakeProfitPercentage}}" />
+        </div>
+        <div class="field">
+            <label>Consensus Buy Multiplier</label>
+            <input type="text" name="trading.consensus_buy_multiplier" value="{{.Config.Trading.ConsensusBuyMultiplier}}" />
+        </div>
+    </div>
+
+    <h4 class="ui dividing inverted header">DCA Safety Orders</h4>
+
+    <div class="four fields">
+        <div class="field">
+            <label>Max Safety Orders</label>
+            <input type="text" name="trading.max_safety_orders" value="{{.Config.Trading.MaxSafetyOrders}}" />
+        </div>
+        <div class="field">
+            <label>Price Deviation for SO (%)</label>
+            <input type="text" name="trading.price_deviation_to_open_safety_orders" value="{{.Config.Trading.PriceDeviationToOpenSafetyOrders}}" />
+        </div>
+        <div class="field">
+            <label>SO Step Scale</label>
+            <input type="text" name="trading.safety_order_step_scale" value="{{.Config.Trading.SafetyOrderStepScale}}" />
+        </div>
+        <div class="field">
+            <label>SO Volume Scale</label>
+            <input type="text" name="trading.safety_order_volume_scale" value="{{.Config.Trading.SafetyOrderVolumeScale}}" />
+        </div>
+    </div>
+
+    <h4 class="ui dividing inverted header">Indicators</h4>
+    <div class="five fields">
+        <div class="field">
+            <label>RSI Period</label>
+            <input type="text" name="indicators.rsi_period" value="{{.Config.Indicators.RSIPeriod}}" />
+        </div>
+        <div class="field">
+            <label>ATR Period</label>
+            <input type="text" name="indicators.atr_period" value="{{.Config.Indicators.ATRPeriod}}" />
+        </div>
+        <div class="field">
+            <label>MACD Fast</label>
+            <input type="text" name="indicators.macd_fast_period" value="{{.Config.Indicators.MACDFastPeriod}}" />
+        </div>
+        <div class="field">
+            <label>MACD Slow</label>
+            <input type="text" name="indicators.macd_slow_period" value="{{.Config.Indicators.MACDSlowPeriod}}" />
+        </div>
+        <div class="field">
+            <label>MACD Signal</label>
+            <input type="text" name="indicators.macd_signal_period" value="{{.Config.Indicators.MACDSignalPeriod}}" />
+        </div>
+    </div>
+
+    <h4 class="ui dividing inverted header">Safety & Logging</h4>
+
+    <div class="field">
+        <div class="ui toggle checkbox">
+            <input type="checkbox" name="trading.trailing_stop_enabled" value="on" {{if .Config.Trading.TrailingStopEnabled}}checked{{end}} />
+            <label style="color:white;">Enable Trailing Stop</label>
+        </div>
+    </div>
+
+    <div class="two fields">
+        <div class="field">
+            <div class="ui toggle checkbox">
+                <input type="checkbox" name="circuitbreaker.enabled" value="on" {{if .Config.CircuitBreaker.Enabled}}checked{{end}} />
+                <label style="color:white;">Enable Circuit Breaker</label>
+            </div>
+        </div>
+        <div class="field">
+            <label>Circuit Breaker Max Drawdown (%)</label>
+            <input type="text" name="circuitbreaker.drawdown_threshold_percent" value="{{.Config.CircuitBreaker.DrawdownThresholdPercent}}" />
+        </div>
+    </div>
+
+    <div class="field">
+        <label>Log Level</label>
+        <select name="logging.level" class="ui dropdown">
+            <option value="debug" {{if eq .Config.Logging.Level `debug`}}selected{{end}}>Debug</option>
+            <option value="info" {{if eq .Config.Logging.Level `info`}}selected{{end}}>Info</option>
+            <option value="warn" {{if eq .Config.Logging.Level `warn`}}selected{{end}}>Warn</option>
+            <option value="error" {{if eq .Config.Logging.Level `error`}}selected{{end}}>Error</option>
+        </select>
+    </div>
+
+
+    <div class="ui divider"></div>
     <button class="ui positive button" type="submit">Save and Apply Settings</button>
 </form>
 {{end}}
