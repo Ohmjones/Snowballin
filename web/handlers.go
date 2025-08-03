@@ -51,13 +51,11 @@ func renderTemplate(w http.ResponseWriter, r *http.Request, controller AppContro
 	}
 }
 
-// dashboardHandler is now much simpler and more performant.
-// The controller's GetDashboardData method now does all the heavy lifting.
+// dashboardHandler is now corrected to pass the request context.
 func dashboardHandler(controller AppController) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// This single call now returns all data needed for the dashboard,
-		// including the calculated profit/loss for all positions.
-		dashboardData := controller.GetDashboardData()
+		// FIXED: Pass the request's context to the controller method.
+		dashboardData := controller.GetDashboardData(r.Context())
 		renderTemplate(w, r, controller, "dashboard.html", dashboardData)
 	}
 }
@@ -69,9 +67,7 @@ func assetDetailHandler(controller AppController) http.HandlerFunc {
 		urlPath := strings.TrimPrefix(r.URL.Path, "/asset/")
 		assetPair := strings.Replace(urlPath, "-", "/", 1) // "BTC-USD" -> "BTC/USD"
 
-		// Note: The interface in controller.go does not pass the request context.
-		// The implementation in app.go uses context.TODO() as a placeholder.
-		// Consider refactoring the interface to accept r.Context() in the future.
+		// NOTE: This handler will also need the context plumbing fix eventually.
 		assetData, err := controller.GetAssetDetailData(assetPair)
 		if err != nil {
 			http.Error(w, "Failed to get asset data: "+err.Error(), http.StatusInternalServerError)

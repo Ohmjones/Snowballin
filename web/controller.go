@@ -2,6 +2,7 @@ package web
 
 import (
 	"Snowballin/utilities"
+	"context"
 	"sync"
 )
 
@@ -26,7 +27,7 @@ type AssetDetailData struct {
 // AppController defines the interface the web package needs to interact with
 // the main application's state. We add a new method to get data for one asset.
 type AppController interface {
-	GetDashboardData() DashboardData
+	GetDashboardData(ctx context.Context) DashboardData
 	GetConfig() utilities.AppConfig
 	UpdateAndSaveConfig(newConfig utilities.AppConfig) error
 	GetAssetDetailData(assetPair string) (AssetDetailData, error) // New method

@@ -44,12 +44,42 @@ type TradingState struct {
 	makerFeeRate            float64
 	takerFeeRate            float64
 	lastCMCFetch            time.Time
+	lastAccountValue        float64   // Stores the most recently fetched account value.
+	lastValueFetchTime      time.Time // Timestamp of the last fetch.
 }
 
 var (
 	fngMutex   sync.RWMutex
 	currentFNG dataprovider.FearGreedIndex
 )
+
+const accountValueCacheDuration = 15 * time.Second // Cache the value for 15 seconds
+
+// getFreshAccountValue is a new helper method with caching to prevent API spam.
+func (s *TradingState) getFreshAccountValue(ctx context.Context) (float64, error) {
+	s.stateMutex.Lock() // Use a full lock since we might be writing to the state
+	defer s.stateMutex.Unlock()
+
+	// If the last fetch was within our cache duration, return the cached value.
+	if time.Since(s.lastValueFetchTime) < accountValueCacheDuration {
+		s.logger.LogDebug("getFreshAccountValue: Returning cached account value (%.2f)", s.lastAccountValue)
+		return s.lastAccountValue, nil
+	}
+
+	// If the cache is stale, fetch a new value from the broker.
+	s.logger.LogDebug("getFreshAccountValue: Cache stale, fetching fresh account value from broker...")
+	newValue, err := s.broker.GetAccountValue(ctx, s.config.Trading.QuoteCurrency)
+	if err != nil {
+		// If the fetch fails, return the last known value to prevent errors, but don't update the timestamp.
+		return s.lastAccountValue, err
+	}
+
+	// Update the cache with the new value and timestamp.
+	s.lastAccountValue = newValue
+	s.lastValueFetchTime = time.Now()
+
+	return newValue, nil
+}
 
 func startFNGUpdater(ctx context.Context, fearGreedProvider dataprovider.FearGreedProvider, logger *utilities.Logger, updateInterval time.Duration) {
 	if fearGreedProvider == nil {
@@ -736,7 +766,7 @@ func processTradingCycle(ctx context.Context, state *TradingState) {
 	}
 	state.stateMutex.RUnlock()
 
-	currentPortfolioValue, valErr := state.broker.GetAccountValue(ctx, state.config.Trading.QuoteCurrency)
+	currentPortfolioValue, valErr := state.getFreshAccountValue(ctx)
 	if valErr != nil {
 		state.logger.LogError("Cycle: Could not update portfolio value: %v", valErr)
 		return
@@ -1372,10 +1402,10 @@ func calculateFeeAwareTakeProfitPrice(pos *utilities.Position, state *TradingSta
 
 // GetDashboardData returns a snapshot of data needed for the web dashboard.
 // GetDashboardData is updated to calculate and include P/L data itself for performance.
-func (s *TradingState) GetDashboardData() web.DashboardData {
+func (s *TradingState) GetDashboardData(ctx context.Context) web.DashboardData {
 	// --- Step 1: Get live account value from the broker ---
-	// We use context.TODO() as this interface method doesn't receive a request context.
-	currentValue, err := s.broker.GetAccountValue(context.TODO(), s.config.Trading.QuoteCurrency)
+	// MODIFIED: Use the 'ctx' from the function argument instead of context.TODO()
+	currentValue, err := s.getFreshAccountValue(ctx)
 	if err != nil {
 		s.logger.LogError("GetDashboardData: Failed to get current account value from broker: %v", err)
 		// Return last known peak value as a fallback to prevent the UI from looking broken.
@@ -1398,7 +1428,8 @@ func (s *TradingState) GetDashboardData() web.DashboardData {
 	var totalPL float64
 	if len(assetPairs) > 0 {
 		// Use the GetTickers method for a single, efficient batch request.
-		tickers, tickerErr := s.broker.GetTickers(context.TODO(), assetPairs)
+		// MODIFIED: Pass the context to the broker call.
+		tickers, tickerErr := s.broker.GetTickers(ctx, assetPairs)
 		if tickerErr == nil {
 			for pair, pos := range positionsCopy {
 				if ticker, ok := tickers[pair]; ok {
