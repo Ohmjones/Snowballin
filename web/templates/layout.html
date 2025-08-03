@@ -22,17 +22,29 @@
 
 <div class="ui inverted attached segment">
     <div class="ui inverted secondary pointing menu">
-        <a class="item {{if eq .Template "dashboard.html"}}active{{end}}" href="/">
-        <i class="chart line icon"></i> Dashboard
+        {{/* Define a variable for the dashboard link's class */}}
+        {{$dashClass := "item"}}
+        {{if eq .Template "dashboard.html"}}
+        {{$dashClass = "item active"}}
+        {{end}}
+        <a class="{{$dashClass}}" href="/">
+            <i class="chart line icon"></i> Dashboard
         </a>
-        <a class="item {{if eq .Template "settings.html"}}active{{end}}" href="/settings">
-        <i class="cogs icon"></i> Settings
+
+        {{/* Define a variable for the settings link's class */}}
+        {{$settingsClass := "item"}}
+        {{if eq .Template "settings.html"}}
+        {{$settingsClass = "item active"}}
+        {{end}}
+        <a class="{{$settingsClass}}" href="/settings">
+            <i class="cogs icon"></i> Settings
         </a>
+
         <div class="right menu">
             <div class="item">
                 <div class="ui label">
                     Version
-                    <div class="detail">{{.Data.Version}}</div>
+                    <div class="detail">{{.Version}}</div>
                 </div>
             </div>
         </div>
@@ -40,7 +52,7 @@
 </div>
 
 <div class="ui container" style="margin-top: 2em;">
-    {{template "content" .Data}}
+    {{template "content" .PageData}}
 </div>
 
 

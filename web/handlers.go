@@ -11,12 +11,11 @@ import (
 	"time"
 )
 
-// A helper to parse and execute templates
-func renderTemplate(w http.ResponseWriter, r *http.Request, tmplName string, data interface{}) {
+// renderTemplate now accepts the controller to fetch common layout data.
+func renderTemplate(w http.ResponseWriter, r *http.Request, controller AppController, tmplName string, pageData interface{}) {
 	lp := filepath.Join("web", "templates", "layout.html")
 	fp := filepath.Join("web", "templates", tmplName)
 
-	// Functions to be used in templates
 	funcMap := template.FuncMap{
 		"join": strings.Join,
 		"timeSince": func(t time.Time) string {
@@ -27,13 +26,16 @@ func renderTemplate(w http.ResponseWriter, r *http.Request, tmplName string, dat
 		},
 	}
 
-	// Data to be passed to the layout template
+	// This is the new, consistent data structure for the layout.
+	// It always has a Version and the specific data for the page being rendered.
 	layoutData := struct {
-		Template string      // Which sub-template is being rendered
-		Data     interface{} // The specific data for that sub-template
+		Template string
+		Version  string
+		PageData interface{}
 	}{
 		Template: tmplName,
-		Data:     data,
+		Version:  controller.GetConfig().Version, // Always get the version
+		PageData: pageData,
 	}
 
 	tmpl, err := template.New(filepath.Base(lp)).Funcs(funcMap).ParseFiles(lp, fp)
@@ -47,11 +49,11 @@ func renderTemplate(w http.ResponseWriter, r *http.Request, tmplName string, dat
 	}
 }
 
-// dashboardHandler prepares data for and renders the main dashboard.
+// dashboardHandler now passes the controller to renderTemplate.
 func dashboardHandler(controller AppController) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		dashboardData := controller.GetDashboardData()
-		renderTemplate(w, r, "dashboard.html", dashboardData)
+		renderTemplate(w, r, controller, "dashboard.html", dashboardData)
 	}
 }
 
@@ -66,41 +68,38 @@ func settingsHandler(controller AppController) http.HandlerFunc {
 	}
 }
 
-// settingsGetHandler renders the settings form with the current config.
+// settingsGetHandler now passes the controller to renderTemplate.
 func settingsGetHandler(w http.ResponseWriter, r *http.Request, controller AppController) {
 	currentConfig := controller.GetConfig()
 
-	data := struct {
+	// This is now the page-specific data.
+	pageData := struct {
 		Config  utilities.AppConfig
-		Message string // For displaying success/error messages
+		Message string
 	}{
 		Config:  currentConfig,
 		Message: r.URL.Query().Get("message"),
 	}
-	renderTemplate(w, r, "settings.html", data)
+	renderTemplate(w, r, controller, "settings.html", pageData)
 }
 
-// settingsPostHandler parses the form, updates the config, and saves it.
+// settingsPostHandler does not need changes to its core logic.
 func settingsPostHandler(w http.ResponseWriter, r *http.Request, controller AppController) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "Failed to parse form", http.StatusBadRequest)
 		return
 	}
 
-	// Get a copy of the current config to modify
 	newConfig := controller.GetConfig()
 
-	// --- Trading Settings ---
-	// Handle asset_pairs as a special case for string slices
 	rawPairs := r.FormValue("trading.asset_pairs")
-	newConfig.Trading.AssetPairs = []string{} // Clear existing
+	newConfig.Trading.AssetPairs = []string{}
 	for _, p := range strings.Split(rawPairs, ",") {
 		if trimmed := strings.TrimSpace(p); trimmed != "" {
 			newConfig.Trading.AssetPairs = append(newConfig.Trading.AssetPairs, trimmed)
 		}
 	}
-
-	newConfig.Trading.TrailingStopEnabled, _ = strconv.ParseBool(r.FormValue("trading.trailing_stop_enabled"))
+	newConfig.Trading.TrailingStopEnabled = r.FormValue("trading.trailing_stop_enabled") == "on"
 	newConfig.Trading.BaseOrderSize, _ = strconv.ParseFloat(r.FormValue("trading.base_order_size"), 64)
 	newConfig.Trading.MaxSafetyOrders, _ = strconv.Atoi(r.FormValue("trading.max_safety_orders"))
 	newConfig.Trading.TakeProfitPercentage, _ = strconv.ParseFloat(r.FormValue("trading.take_profit_percentage"), 64)
@@ -108,32 +107,19 @@ func settingsPostHandler(w http.ResponseWriter, r *http.Request, controller AppC
 	newConfig.Trading.SafetyOrderVolumeScale, _ = strconv.ParseFloat(r.FormValue("trading.safety_order_volume_scale"), 64)
 	newConfig.Trading.PriceDeviationToOpenSafetyOrders, _ = strconv.ParseFloat(r.FormValue("trading.price_deviation_to_open_safety_orders"), 64)
 	newConfig.Trading.ConsensusBuyMultiplier, _ = strconv.ParseFloat(r.FormValue("trading.consensus_buy_multiplier"), 64)
-
-	// --- Indicator Settings ---
 	newConfig.Indicators.RSIPeriod, _ = strconv.Atoi(r.FormValue("indicators.rsi_period"))
 	newConfig.Indicators.ATRPeriod, _ = strconv.Atoi(r.FormValue("indicators.atr_period"))
 	newConfig.Indicators.MACDFastPeriod, _ = strconv.Atoi(r.FormValue("indicators.macd_fast_period"))
 	newConfig.Indicators.MACDSlowPeriod, _ = strconv.Atoi(r.FormValue("indicators.macd_slow_period"))
 	newConfig.Indicators.MACDSignalPeriod, _ = strconv.Atoi(r.FormValue("indicators.macd_signal_period"))
-
-	// --- Circuit Breaker ---
-	// Handle checkbox value (only sent if checked)
-	if r.FormValue("circuitbreaker.enabled") == "on" {
-		newConfig.CircuitBreaker.Enabled = true
-	} else {
-		newConfig.CircuitBreaker.Enabled = false
-	}
+	newConfig.CircuitBreaker.Enabled = r.FormValue("circuitbreaker.enabled") == "on"
 	newConfig.CircuitBreaker.DrawdownThresholdPercent, _ = strconv.ParseFloat(r.FormValue("circuitbreaker.drawdown_threshold_percent"), 64)
-
-	// --- Logging ---
 	newConfig.Logging.Level = r.FormValue("logging.level")
 
-	// Call the controller to perform the update and save logic
 	if err := controller.UpdateAndSaveConfig(newConfig); err != nil {
 		http.Error(w, "Failed to update configuration: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Redirect back to settings page with a success message
 	http.Redirect(w, r, "/settings?message=Success! Settings have been saved and applied.", http.StatusFound)
 }
