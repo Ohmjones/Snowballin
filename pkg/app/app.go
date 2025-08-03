@@ -1371,25 +1371,127 @@ func calculateFeeAwareTakeProfitPrice(pos *utilities.Position, state *TradingSta
 // --- web.AppController Interface Implementation ---
 
 // GetDashboardData returns a snapshot of data needed for the web dashboard.
+// GetDashboardData is updated to calculate and include P/L data itself for performance.
 func (s *TradingState) GetDashboardData() web.DashboardData {
 	s.stateMutex.RLock()
-	defer s.stateMutex.RUnlock()
 
-	// Create a deep copy of open positions to avoid race conditions in templates.
+	// Create a deep copy of positions to avoid race conditions in templates.
 	positionsCopy := make(map[string]utilities.Position)
+	assetPairs := make([]string, 0, len(s.openPositions))
 	for k, v := range s.openPositions {
 		positionsCopy[k] = *v
+		assetPairs = append(assetPairs, k)
+	}
+	peakValue := s.peakPortfolioValue
+	quoteCurrency := s.config.Trading.QuoteCurrency
+	version := s.config.Version
+
+	s.stateMutex.RUnlock() // Unlock early before network calls
+
+	// Efficiently calculate P/L for all positions
+	var totalPL float64
+	if len(assetPairs) > 0 {
+		// Use the new GetTickers method for a single, efficient batch request.
+		// We use context.TODO() here as this specific method doesn't have a request context.
+		tickers, err := s.broker.GetTickers(context.TODO(), assetPairs)
+		if err == nil {
+			s.stateMutex.Lock() // Lock again to update the copies
+			for pair, pos := range positionsCopy {
+				if ticker, ok := tickers[pair]; ok {
+					currentValue := pos.TotalVolume * ticker.LastPrice
+					buyValue := pos.TotalVolume * pos.AveragePrice
+					pl := currentValue - buyValue
+					pos.UnrealizedPL = pl
+					if buyValue > 0 {
+						pos.UnrealizedPLPercent = (pl / buyValue) * 100
+					}
+					positionsCopy[pair] = pos // Update the copy with P/L info
+					totalPL += pl
+				}
+			}
+			s.stateMutex.Unlock()
+		} else {
+			s.logger.LogError("GetDashboardData: Failed to get tickers for P/L calculation: %v", err)
+		}
 	}
 
-	// The value of the portfolio is not stored directly in the state,
-	// so we get the latest known peak value as a proxy.
-	// For a live value, you would need another mechanism.
 	return web.DashboardData{
-		ActivePositions: positionsCopy,
-		PortfolioValue:  s.peakPortfolioValue,
-		QuoteCurrency:   s.config.Trading.QuoteCurrency,
-		Version:         s.config.Version,
+		ActivePositions:   positionsCopy,
+		PortfolioValue:    peakValue,
+		QuoteCurrency:     quoteCurrency,
+		Version:           version,
+		TotalUnrealizedPL: totalPL,
 	}
+}
+
+// GetAssetDetailData implements the missing method for the web.AppController interface.
+// This resolves the compiler error.
+func (s *TradingState) GetAssetDetailData(assetPair string) (web.AssetDetailData, error) {
+	s.stateMutex.RLock()
+	var positionCopy *utilities.Position
+	if pos, ok := s.openPositions[assetPair]; ok {
+		pCopy := *pos // Create a copy of the struct to avoid data races
+		positionCopy = &pCopy
+	}
+	peakValue := s.peakPortfolioValue
+	cfg := *s.config
+	s.stateMutex.RUnlock()
+
+	// Since this interface method doesn't receive a context, we use context.TODO().
+	// This is a signal that we should consider refactoring the interface to accept one later.
+	ctx := context.TODO()
+
+	consolidatedData, err := gatherConsolidatedData(ctx, s, assetPair, peakValue)
+	if err != nil {
+		return web.AssetDetailData{}, fmt.Errorf("could not gather market data for %s: %w", assetPair, err)
+	}
+
+	// Use primary (broker) bars for final indicator calculation for the UI
+	primaryBars, ok := consolidatedData.PrimaryOHLCVByTF[cfg.Consensus.MultiTimeframe.BaseTimeframe]
+	if !ok {
+		return web.AssetDetailData{}, fmt.Errorf("missing primary bars for base timeframe '%s'", cfg.Consensus.MultiTimeframe.BaseTimeframe)
+	}
+
+	// Calculate indicators to display
+	rsi, stochRSI, macdHist, _, volSpike, liqHunt, _, _, _, _ := strategy.CalculateIndicators(primaryBars, cfg)
+
+	// Populate the data structure required by the web package
+	indicatorMap := make(map[string]string)
+	indicatorMap["RSI"] = fmt.Sprintf("%.2f", rsi)
+	indicatorMap["StochRSI"] = fmt.Sprintf("%.2f", stochRSI)
+	indicatorMap["MACD Hist"] = fmt.Sprintf("%.4f", macdHist)
+
+	// Create human-readable analysis points for the UI
+	analysisSlice := []string{}
+	if rsi > 70 {
+		analysisSlice = append(analysisSlice, "RSI is overbought (> 70), indicating potential for a pullback.")
+	} else if rsi < 30 {
+		analysisSlice = append(analysisSlice, "RSI is oversold (< 30), indicating potential for a bounce.")
+	} else {
+		analysisSlice = append(analysisSlice, "RSI is in neutral territory.")
+	}
+	if volSpike {
+		analysisSlice = append(analysisSlice, "A recent volume spike was detected.")
+	}
+	if liqHunt {
+		analysisSlice = append(analysisSlice, "A potential liquidity hunt candle was detected.")
+	}
+
+	var currentPrice float64
+	if len(consolidatedData.ProvidersData) > 0 {
+		// Assumes the first provider is the broker (kraken) for the most accurate price
+		currentPrice = consolidatedData.ProvidersData[0].CurrentPrice
+	}
+
+	detailData := web.AssetDetailData{
+		AssetPair:       assetPair,
+		Position:        positionCopy,
+		CurrentPrice:    currentPrice,
+		IndicatorValues: indicatorMap,
+		Analysis:        analysisSlice,
+	}
+
+	return detailData, nil
 }
 
 // GetConfig returns a thread-safe copy of the current application config.

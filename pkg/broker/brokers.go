@@ -27,6 +27,9 @@ type Broker interface {
 	// GetTicker retrieves ticker data for a specific trading pair.
 	GetTicker(ctx context.Context, pair string) (TickerData, error)
 
+	// GetTickers retrieves ticker data for multiple trading pairs in a single batch call.
+	GetTickers(ctx context.Context, pairs []string) (map[string]TickerData, error)
+
 	// GetTrades retrieves the trade history for a specific trading pair.
 	// The 'pair' parameter is the common pair name (e.g., "BTC/USD").
 	// The 'since' parameter can be used to limit trades. If zero, fetch all/default.

@@ -51,28 +51,13 @@ func renderTemplate(w http.ResponseWriter, r *http.Request, controller AppContro
 	}
 }
 
-// dashboardHandler is updated to calculate and pass P/L data.
+// dashboardHandler is now much simpler and more performant.
+// The controller's GetDashboardData method now does all the heavy lifting.
 func dashboardHandler(controller AppController) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// This single call now returns all data needed for the dashboard,
+		// including the calculated profit/loss for all positions.
 		dashboardData := controller.GetDashboardData()
-
-		// This is a simplified P/L calculation. For a more performant version on many assets,
-		// you would fetch all ticker prices at once.
-		if len(dashboardData.ActivePositions) > 0 {
-			var totalPL float64
-			for pair, pos := range dashboardData.ActivePositions {
-				detailData, err := controller.GetAssetDetailData(pair)
-				if err == nil && detailData.Position != nil {
-					// The P/L calculation is now done in GetAssetDetailData, so we just use it.
-					pos.UnrealizedPL = detailData.Position.UnrealizedPL
-					pos.UnrealizedPLPercent = detailData.Position.UnrealizedPLPercent
-					dashboardData.ActivePositions[pair] = pos
-					totalPL += pos.UnrealizedPL
-				}
-			}
-			dashboardData.TotalUnrealizedPL = totalPL
-		}
-
 		renderTemplate(w, r, controller, "dashboard.html", dashboardData)
 	}
 }
@@ -84,6 +69,9 @@ func assetDetailHandler(controller AppController) http.HandlerFunc {
 		urlPath := strings.TrimPrefix(r.URL.Path, "/asset/")
 		assetPair := strings.Replace(urlPath, "-", "/", 1) // "BTC-USD" -> "BTC/USD"
 
+		// Note: The interface in controller.go does not pass the request context.
+		// The implementation in app.go uses context.TODO() as a placeholder.
+		// Consider refactoring the interface to accept r.Context() in the future.
 		assetData, err := controller.GetAssetDetailData(assetPair)
 		if err != nil {
 			http.Error(w, "Failed to get asset data: "+err.Error(), http.StatusInternalServerError)
