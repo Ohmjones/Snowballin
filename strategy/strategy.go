@@ -409,7 +409,7 @@ func checkBearishConfluence(bars []utilities.OHLCVBar, cfg utilities.AppConfig) 
 		reasons = append(reasons, "Stochastic >80 with bearish crossover")
 	}
 
-	if score >= 3 { // Require at least 3 for confluence
+	if score >= 4 { // Require at least 4 for confluence
 		return true, fmt.Sprintf("Bearish Confluence: %s", strings.Join(reasons, " & "))
 	}
 

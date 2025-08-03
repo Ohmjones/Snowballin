@@ -83,7 +83,7 @@ func settingsGetHandler(w http.ResponseWriter, r *http.Request, controller AppCo
 	renderTemplate(w, r, controller, "settings.html", pageData)
 }
 
-// settingsPostHandler does not need changes to its core logic.
+// settingsPostHandler is updated to handle all fields from the new settings page.
 func settingsPostHandler(w http.ResponseWriter, r *http.Request, controller AppController) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "Failed to parse form", http.StatusBadRequest)
@@ -92,6 +92,7 @@ func settingsPostHandler(w http.ResponseWriter, r *http.Request, controller AppC
 
 	newConfig := controller.GetConfig()
 
+	// --- Trading Section ---
 	rawPairs := r.FormValue("trading.asset_pairs")
 	newConfig.Trading.AssetPairs = []string{}
 	for _, p := range strings.Split(rawPairs, ",") {
@@ -99,19 +100,30 @@ func settingsPostHandler(w http.ResponseWriter, r *http.Request, controller AppC
 			newConfig.Trading.AssetPairs = append(newConfig.Trading.AssetPairs, trimmed)
 		}
 	}
-	newConfig.Trading.TrailingStopEnabled = r.FormValue("trading.trailing_stop_enabled") == "on"
+	newConfig.Trading.PortfolioRiskPerTrade, _ = strconv.ParseFloat(r.FormValue("trading.portfolio_risk_per_trade"), 64)
 	newConfig.Trading.BaseOrderSize, _ = strconv.ParseFloat(r.FormValue("trading.base_order_size"), 64)
-	newConfig.Trading.MaxSafetyOrders, _ = strconv.Atoi(r.FormValue("trading.max_safety_orders"))
 	newConfig.Trading.TakeProfitPercentage, _ = strconv.ParseFloat(r.FormValue("trading.take_profit_percentage"), 64)
+	newConfig.Trading.TakeProfitPartialSellPercent, _ = strconv.ParseFloat(r.FormValue("trading.take_profit_partial_sell_percent"), 64)
+
+	// --- DCA Safety Orders Section ---
+	newConfig.Trading.MaxSafetyOrders, _ = strconv.Atoi(r.FormValue("trading.max_safety_orders"))
+	newConfig.Trading.PriceDeviationToOpenSafetyOrders, _ = strconv.ParseFloat(r.FormValue("trading.price_deviation_to_open_safety_orders"), 64)
 	newConfig.Trading.SafetyOrderStepScale, _ = strconv.ParseFloat(r.FormValue("trading.safety_order_step_scale"), 64)
 	newConfig.Trading.SafetyOrderVolumeScale, _ = strconv.ParseFloat(r.FormValue("trading.safety_order_volume_scale"), 64)
-	newConfig.Trading.PriceDeviationToOpenSafetyOrders, _ = strconv.ParseFloat(r.FormValue("trading.price_deviation_to_open_safety_orders"), 64)
-	newConfig.Trading.ConsensusBuyMultiplier, _ = strconv.ParseFloat(r.FormValue("trading.consensus_buy_multiplier"), 64)
+
+	// --- Trailing Stop Section ---
+	newConfig.Trading.TrailingStopEnabled = r.FormValue("trading.trailing_stop_enabled") == "on"
+	newConfig.Trading.TrailingStopDeviation, _ = strconv.ParseFloat(r.FormValue("trading.trailing_stop_deviation"), 64)
+
+	// --- Indicators Section ---
 	newConfig.Indicators.RSIPeriod, _ = strconv.Atoi(r.FormValue("indicators.rsi_period"))
 	newConfig.Indicators.ATRPeriod, _ = strconv.Atoi(r.FormValue("indicators.atr_period"))
 	newConfig.Indicators.MACDFastPeriod, _ = strconv.Atoi(r.FormValue("indicators.macd_fast_period"))
 	newConfig.Indicators.MACDSlowPeriod, _ = strconv.Atoi(r.FormValue("indicators.macd_slow_period"))
 	newConfig.Indicators.MACDSignalPeriod, _ = strconv.Atoi(r.FormValue("indicators.macd_signal_period"))
+	newConfig.Indicators.StochRSIBuyThreshold, _ = strconv.ParseFloat(r.FormValue("indicators.stoch_rsi_buy_threshold"), 64)
+
+	// --- Safety & Logging Section ---
 	newConfig.CircuitBreaker.Enabled = r.FormValue("circuitbreaker.enabled") == "on"
 	newConfig.CircuitBreaker.DrawdownThresholdPercent, _ = strconv.ParseFloat(r.FormValue("circuitbreaker.drawdown_threshold_percent"), 64)
 	newConfig.Logging.Level = r.FormValue("logging.level")
