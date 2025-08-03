@@ -9,11 +9,15 @@ import (
 	krakenBroker "Snowballin/pkg/broker/kraken"
 	"Snowballin/strategy"
 	"Snowballin/utilities"
+	"Snowballin/web"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -363,7 +367,8 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 		takerFeeRate:            takerFee,
 		lastCMCFetch:            time.Time{},
 	}
-
+	// Start the web server in a background goroutine
+	go web.StartWebServer(ctx, state)
 	// --- ADDED: Goroutine to refresh fees periodically ---
 	go func() {
 		ticker := time.NewTicker(24 * time.Hour)
@@ -691,25 +696,25 @@ func updatePositionFromFill(state *TradingState, order broker.Order, assetPair s
 	} else { // Sell order
 		if pos, ok := state.openPositions[assetPair]; ok {
 			if math.Abs(pos.TotalVolume-order.ExecutedVol) < 1e-8 {
-				// --- MODIFIED BLOCK START ---
-				state.stateMutex.Lock()
+				// Get the reason for the sell, which was stored when the order was placed.
+				// We can safely access the map because the parent function holds the lock.
 				reason, hasReason := state.sellReasons[order.ID]
 				if !hasReason {
-					reason = "Unknown" // Fallback
+					reason = "Unknown" // Fallback in case the reason was not stored.
 				}
-				delete(state.sellReasons, order.ID) // Clean up the map
-				state.stateMutex.Unlock()
 
+				// Calculate profit, accounting for fees.
 				totalBuyCost := (pos.AveragePrice * pos.TotalVolume) * (1 + state.makerFeeRate)
-				netProceeds := order.Cost // The cost from a sell order is the net proceeds before fees
+				netProceeds := order.Cost // The 'cost' of a sell order is the proceeds.
 				profit := netProceeds - totalBuyCost
 				profitPercent := (profit / totalBuyCost) * 100
 
-				// Add the reason to the notification
+				// Send the notification with the reason included.
 				state.discordClient.NotifyOrderFilled(order, fmt.Sprintf("💰 **Position Closed**\n**Reason: %s**\nNet Profit: `%.2f %s` (`%.2f%%`)", reason, profit, state.config.Trading.QuoteCurrency, profitPercent))
-				// --- MODIFIED BLOCK END ---
 
+				// Clean up the state.
 				delete(state.openPositions, assetPair)
+				delete(state.sellReasons, order.ID) // Clean up the reasons map.
 				_ = state.cache.DeletePosition(assetPair)
 			} else {
 				profit := (order.Price - pos.AveragePrice) * order.ExecutedVol
@@ -781,10 +786,20 @@ func processTradingCycle(ctx context.Context, state *TradingState) {
 	// [MODIFIED] Get the current FNG value once per cycle.
 	currentFNGValue := getCurrentFNG().Value
 
-	for _, assetPair := range state.config.Trading.AssetPairs {
-		// [MODIFIED] Create a temporary, modulated AppConfig for this specific trading cycle.
-		activeAppConfig := *state.config
-		activeAppConfig.Trading = modulateConfigBySentiment(state.config.Trading, currentFNGValue, state.logger)
+	// --- Thread-Safe Configuration Snapshot ---
+	state.stateMutex.RLock()
+	// Create a snapshot of the config and asset pairs for this cycle.
+	// This prevents the config from changing mid-cycle if updated via the UI.
+	cycleConfig := *state.config
+	assetPairsForCycle := make([]string, len(cycleConfig.Trading.AssetPairs))
+	copy(assetPairsForCycle, cycleConfig.Trading.AssetPairs)
+	state.stateMutex.RUnlock()
+	// --- End Snapshot ---
+
+	for _, assetPair := range assetPairsForCycle {
+		// Modulate the *copied* config for this specific trading cycle.
+		activeAppConfig := cycleConfig // Start with the snapshot
+		activeAppConfig.Trading = modulateConfigBySentiment(cycleConfig.Trading, currentFNGValue, state.logger)
 
 		consolidatedData, err := gatherConsolidatedData(ctx, state, assetPair, currentPortfolioValue)
 		if err != nil {
@@ -1351,4 +1366,73 @@ func calculateFeeAwareTakeProfitPrice(pos *utilities.Position, state *TradingSta
 	finalTargetPrice := breakEvenPrice * (1 + targetProfitRate)
 
 	return finalTargetPrice
+}
+
+// --- web.AppController Interface Implementation ---
+
+// GetDashboardData returns a snapshot of data needed for the web dashboard.
+func (s *TradingState) GetDashboardData() web.DashboardData {
+	s.stateMutex.RLock()
+	defer s.stateMutex.RUnlock()
+
+	// Create a deep copy of open positions to avoid race conditions in templates.
+	positionsCopy := make(map[string]utilities.Position)
+	for k, v := range s.openPositions {
+		positionsCopy[k] = *v
+	}
+
+	// The value of the portfolio is not stored directly in the state,
+	// so we get the latest known peak value as a proxy.
+	// For a live value, you would need another mechanism.
+	return web.DashboardData{
+		ActivePositions: positionsCopy,
+		PortfolioValue:  s.peakPortfolioValue,
+		QuoteCurrency:   s.config.Trading.QuoteCurrency,
+		Version:         s.config.Version,
+	}
+}
+
+// GetConfig returns a thread-safe copy of the current application config.
+func (s *TradingState) GetConfig() utilities.AppConfig {
+	s.stateMutex.RLock()
+	defer s.stateMutex.RUnlock()
+	return *s.config // Return a copy
+}
+
+// UpdateAndSaveConfig atomically updates the in-memory config and saves it to disk.
+func (s *TradingState) UpdateAndSaveConfig(newConfig utilities.AppConfig) error {
+	s.stateMutex.Lock()
+	defer s.stateMutex.Unlock()
+
+	// Save the updated configuration to disk
+	configPath, _ := filepath.Abs("config/config.json")
+	file, err := os.Create(configPath)
+	if err != nil {
+		s.logger.LogError("Failed to open config file for writing: %v", err)
+		return err
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ") // For pretty printing
+	if err := encoder.Encode(newConfig); err != nil {
+		s.logger.LogError("Failed to write new config to file: %v", err)
+		return err
+	}
+
+	// Atomically swap the live config with our new one
+	s.config = &newConfig
+
+	s.logger.LogInfo("Configuration updated and saved successfully via web UI.")
+	return nil
+}
+
+// Logger returns the application's logger instance.
+func (s *TradingState) Logger() *utilities.Logger {
+	return s.logger
+}
+
+// Mutex returns the application's main RWMutex.
+func (s *TradingState) Mutex() *sync.RWMutex {
+	return &s.stateMutex
 }

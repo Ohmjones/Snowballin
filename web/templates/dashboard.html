@@ -1,0 +1,57 @@
+{{define "content"}}
+<h1 class="ui inverted header">
+    <i class="snowflake icon"></i>
+    <div class="content">
+        Bot Dashboard
+        <div class="sub header">Live status and open positions</div>
+    </div>
+</h1>
+<div class="ui inverted divider"></div>
+
+<div class="ui inverted relaxed divided list">
+    <div class="item">
+        <div class="content">
+            <div class="header">Current Portfolio Value</div>
+            <div class="description" style="color: #21ba45; font-size: 1.2em;">{{printf "%.2f" .data.PortfolioValue}} {{.data.QuoteCurrency}}</div>
+        </div>
+    </div>
+</div>
+
+<h2 class="ui inverted header">Open Positions ({{len .data.ActivePositions}})</h2>
+{{if .data.ActivePositions}}
+<table class="ui celled inverted table">
+    <thead>
+    <tr>
+        <th>Asset Pair</th>
+        <th>Avg. Entry Price</th>
+        <th>Total Volume</th>
+        <th>Take Profit Price</th>
+        <th>Safety Orders</th>
+        <th>Position Age</th>
+    </tr>
+    </thead>
+    <tbody>
+    {{range .data.ActivePositions}}
+    <tr>
+        <td><i class="btc icon"></i> {{.AssetPair}}</td>
+        <td>{{printf "%.4f" .AveragePrice}}</td>
+        <td>{{printf "%.6f" .TotalVolume}}</td>
+        <td style="color: #21ba45;">{{printf "%.4f" .CurrentTakeProfit}}</td>
+        <td>{{.FilledSafetyOrders}}</td>
+        <td>{{timeSince .EntryTimestamp}}</td>
+    </tr>
+    {{end}}
+    </tbody>
+</table>
+{{else}}
+<div class="ui icon message">
+    <i class="info circle icon"></i>
+    <div class="content">
+        <div class="header">
+            No Open Positions
+        </div>
+        <p>The bot is currently not holding any open positions.</p>
+    </div>
+</div>
+{{end}}
+{{end}}
