@@ -358,8 +358,10 @@ type Position struct {
 	BrokerOrderID     string  `json:"broker_order_id"` // Tracks the initial base order ID
 
 	// Trailing Stop Loss
-	IsTrailingActive bool    `json:"is_trailing_active"`
-	PeakPriceSinceTP float64 `json:"peak_price_since_tp"`
+	IsTrailingActive    bool    `json:"is_trailing_active"`
+	PeakPriceSinceTP    float64 `json:"peak_price_since_tp"`
+	UnrealizedPL        float64 `json:"-"`
+	UnrealizedPLPercent float64 `json:"-"`
 }
 
 type PreflightConfig struct {

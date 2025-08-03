@@ -27,6 +27,7 @@ func StartWebServer(ctx context.Context, controller AppController) {
 	// Pass the controller to the handlers
 	mux.HandleFunc("/", dashboardHandler(controller))
 	mux.HandleFunc("/settings", settingsHandler(controller))
+	mux.HandleFunc("/asset/", assetDetailHandler(controller))
 
 	server := &http.Server{
 		Addr:         addr,

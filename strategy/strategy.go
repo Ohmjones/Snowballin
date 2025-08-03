@@ -285,7 +285,7 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 
 	if !isConfirmed {
 		s.logger.LogInfo("GenerateSignals [%s]: Final confirmation FAILED. Reason: %s", data.AssetPair, confirmationReason)
-		return nil, nil
+		return nil, fmt.Errorf("Final confirmation failed: %s", confirmationReason)
 	}
 	s.logger.LogInfo("GenerateSignals [%s]: Final confirmation PASSED. Reason: %s. Generating signal.", data.AssetPair, confirmationReason)
 
