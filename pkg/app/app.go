@@ -1373,34 +1373,38 @@ func calculateFeeAwareTakeProfitPrice(pos *utilities.Position, state *TradingSta
 // GetDashboardData returns a snapshot of data needed for the web dashboard.
 // GetDashboardData is updated to calculate and include P/L data itself for performance.
 func (s *TradingState) GetDashboardData() web.DashboardData {
-	s.stateMutex.RLock()
+	// --- Step 1: Get live account value from the broker ---
+	// We use context.TODO() as this interface method doesn't receive a request context.
+	currentValue, err := s.broker.GetAccountValue(context.TODO(), s.config.Trading.QuoteCurrency)
+	if err != nil {
+		s.logger.LogError("GetDashboardData: Failed to get current account value from broker: %v", err)
+		// Return last known peak value as a fallback to prevent the UI from looking broken.
+		currentValue = s.peakPortfolioValue
+	}
 
-	// Create a deep copy of positions to avoid race conditions in templates.
+	// --- Step 2: Get a thread-safe copy of positions and other data ---
+	s.stateMutex.RLock()
 	positionsCopy := make(map[string]utilities.Position)
 	assetPairs := make([]string, 0, len(s.openPositions))
 	for k, v := range s.openPositions {
 		positionsCopy[k] = *v
 		assetPairs = append(assetPairs, k)
 	}
-	peakValue := s.peakPortfolioValue
 	quoteCurrency := s.config.Trading.QuoteCurrency
 	version := s.config.Version
+	s.stateMutex.RUnlock() // Unlock early before the next network call
 
-	s.stateMutex.RUnlock() // Unlock early before network calls
-
-	// Efficiently calculate P/L for all positions
+	// --- Step 3: Efficiently calculate P/L for all positions at once ---
 	var totalPL float64
 	if len(assetPairs) > 0 {
-		// Use the new GetTickers method for a single, efficient batch request.
-		// We use context.TODO() here as this specific method doesn't have a request context.
-		tickers, err := s.broker.GetTickers(context.TODO(), assetPairs)
-		if err == nil {
-			s.stateMutex.Lock() // Lock again to update the copies
+		// Use the GetTickers method for a single, efficient batch request.
+		tickers, tickerErr := s.broker.GetTickers(context.TODO(), assetPairs)
+		if tickerErr == nil {
 			for pair, pos := range positionsCopy {
 				if ticker, ok := tickers[pair]; ok {
-					currentValue := pos.TotalVolume * ticker.LastPrice
+					currentPosValue := pos.TotalVolume * ticker.LastPrice
 					buyValue := pos.TotalVolume * pos.AveragePrice
-					pl := currentValue - buyValue
+					pl := currentPosValue - buyValue
 					pos.UnrealizedPL = pl
 					if buyValue > 0 {
 						pos.UnrealizedPLPercent = (pl / buyValue) * 100
@@ -1409,15 +1413,15 @@ func (s *TradingState) GetDashboardData() web.DashboardData {
 					totalPL += pl
 				}
 			}
-			s.stateMutex.Unlock()
 		} else {
-			s.logger.LogError("GetDashboardData: Failed to get tickers for P/L calculation: %v", err)
+			s.logger.LogError("GetDashboardData: Failed to get tickers for P/L calculation: %v", tickerErr)
 		}
 	}
 
+	// --- Step 4: Assemble and return the final data structure ---
 	return web.DashboardData{
 		ActivePositions:   positionsCopy,
-		PortfolioValue:    peakValue,
+		PortfolioValue:    currentValue, // Use the live value
 		QuoteCurrency:     quoteCurrency,
 		Version:           version,
 		TotalUnrealizedPL: totalPL,

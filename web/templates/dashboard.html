@@ -1,22 +1,23 @@
 {{define "content"}}
 <h1 class="ui inverted header">
-    <i class="chart line icon"></i>
+    <i class="snowflake icon"></i>
     <div class="content">
-        Dashboard
-        <div class="sub header">Portfolio overview and active positions.</div>
+        Bot Dashboard
+        <div class="sub header">Live portfolio overview and active positions</div>
     </div>
 </h1>
 
-<div class="ui two statistics">
-    <div class="inverted statistic">
+<div class="ui two inverted statistics">
+    <div class="statistic">
         <div class="value">
-            <i class="dollar sign icon"></i> {{printf "%.2f" .PortfolioValue}}
+            <i class="dollar sign icon"></i>
+            {{printf "%.2f" .PortfolioValue}}
         </div>
         <div class="label">
-            Portfolio Value ({{.QuoteCurrency}})
+            Current Account Value ({{.QuoteCurrency}})
         </div>
     </div>
-    <div class="{{if ge .TotalUnrealizedPL 0.0}}green{{else}}red{{end}} inverted statistic">
+    <div class="{{if ge .TotalUnrealizedPL 0.0}}green{{else}}red{{end}} statistic">
         <div class="value">
             {{printf "%.2f" .TotalUnrealizedPL}}
         </div>
@@ -72,7 +73,7 @@
         <div class="header">
             No Open Positions
         </div>
-        <p>The bot is currently not holding any open positions and is monitoring the markets.</p>
+        <p>The bot is currently not holding any open positions and is monitoring the markets for entry opportunities.</p>
     </div>
 </div>
 {{end}}
