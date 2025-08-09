@@ -1,143 +1,164 @@
 package web
 
 import (
-	"Snowballin/utilities"
-	"fmt"
 	"html/template"
 	"net/http"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 )
 
-// renderTemplate is updated with a new function to make URLs safe.
+// renderTemplate loads base layout + a page template with func map.
 func renderTemplate(w http.ResponseWriter, r *http.Request, controller AppController, tmplName string, pageData interface{}) {
 	lp := filepath.Join("web", "templates", "layout.html")
 	fp := filepath.Join("web", "templates", tmplName)
 
 	funcMap := template.FuncMap{
-		"join": strings.Join,
-		"timeSince": func(t time.Time) string {
-			if t.IsZero() {
-				return "N/A"
-			}
-			return time.Since(t).Round(time.Second).String()
-		},
-		// New function to make asset pairs safe for URLs (e.g., "BTC/USD" -> "BTC-USD")
-		"safeURL": func(s string) string {
-			return strings.Replace(s, "/", "-", -1)
-		},
-	}
-
-	layoutData := struct {
-		Template string
-		Version  string
-		PageData interface{}
-	}{
-		Template: tmplName,
-		Version:  controller.GetConfig().Version,
-		PageData: pageData,
+		"safeURL": func(s string) template.URL { return template.URL(s) },
+		"replace": strings.Replace,
+		"join":    strings.Join,
 	}
 
 	tmpl, err := template.New(filepath.Base(lp)).Funcs(funcMap).ParseFiles(lp, fp)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Error parsing template: %v", err), http.StatusInternalServerError)
+		controller.Logger().LogError("template parse error: %v", err)
+		http.Error(w, "template error", http.StatusInternalServerError)
 		return
 	}
-
-	if err := tmpl.Execute(w, layoutData); err != nil {
-		http.Error(w, fmt.Sprintf("Error executing template: %v", err), http.StatusInternalServerError)
+	if err := tmpl.ExecuteTemplate(w, filepath.Base(lp), pageData); err != nil {
+		controller.Logger().LogError("template exec error: %v", err)
+		http.Error(w, "template error", http.StatusInternalServerError)
+		return
 	}
 }
 
-// dashboardHandler is now corrected to pass the request context.
+// GET /
 func dashboardHandler(controller AppController) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// FIXED: Pass the request's context to the controller method.
-		dashboardData := controller.GetDashboardData(r.Context())
-		renderTemplate(w, r, controller, "dashboard.html", dashboardData)
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		dd := controller.GetDashboardData(r.Context())
+		cfg := controller.GetConfig()
+		page := DashboardPageData{Dashboard: dd, AssetPairs: cfg.Trading.AssetPairs}
+		renderTemplate(w, r, controller, "dashboard.html", page)
 	}
 }
 
-// assetDetailHandler is the new handler for the asset-specific page.
+// GET/POST /settings
+func settingsHandler(controller AppController) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			page := SettingsPageData{Config: controller.GetConfig()}
+			renderTemplate(w, r, controller, "settings.html", page)
+
+		case http.MethodPost:
+			cfg := controller.GetConfig()
+
+			// Trading – Take Profit controls (float64)
+			if v := r.FormValue("trading.take_profit_percentage"); v != "" {
+				if f, err := strconv.ParseFloat(v, 64); err == nil {
+					cfg.Trading.TakeProfitPercentage = f
+				}
+			}
+			if v := r.FormValue("trading.take_profit_partial_sell_percent"); v != "" {
+				if f, err := strconv.ParseFloat(v, 64); err == nil {
+					cfg.Trading.TakeProfitPartialSellPercent = f
+				}
+			}
+			if v := r.FormValue("trading.trailing_stop_deviation"); v != "" {
+				if f, err := strconv.ParseFloat(v, 64); err == nil {
+					cfg.Trading.TrailingStopDeviation = f
+				}
+			}
+
+			// Indicators – RSI / StochRSI
+			if v := r.FormValue("indicators.rsi_period"); v != "" {
+				if i, err := strconv.Atoi(v); err == nil {
+					cfg.Indicators.RSIPeriod = i
+				}
+			}
+			// RSI Buy Threshold maps to Trading.PredictiveRsiThreshold (float64)
+			if v := r.FormValue("indicators.rsi_buy_threshold"); v != "" {
+				if f, err := strconv.ParseFloat(v, 64); err == nil {
+					cfg.Trading.PredictiveRsiThreshold = f
+				}
+			}
+			if v := r.FormValue("indicators.stoch_rsi_buy_threshold"); v != "" {
+				if f, err := strconv.ParseFloat(v, 64); err == nil {
+					cfg.Indicators.StochRSIBuyThreshold = f
+				}
+			}
+			if v := r.FormValue("indicators.stoch_rsi_sell_threshold"); v != "" {
+				if f, err := strconv.ParseFloat(v, 64); err == nil {
+					cfg.Indicators.StochRSISellThreshold = f
+				}
+			}
+
+			// Consensus timeframes – base + up to 2 extras
+			if v := strings.TrimSpace(r.FormValue("consensus.base_timeframe")); v != "" {
+				cfg.Consensus.MultiTimeframe.BaseTimeframe = v
+			}
+			tfs := []string{}
+			if v := strings.TrimSpace(r.FormValue("consensus.additional_timeframe_1")); v != "" {
+				tfs = append(tfs, v)
+			}
+			if v := strings.TrimSpace(r.FormValue("consensus.additional_timeframe_2")); v != "" {
+				tfs = append(tfs, v)
+			}
+			cfg.Consensus.MultiTimeframe.AdditionalTimeframes = tfs
+
+			// Persist
+			if err := controller.UpdateAndSaveConfig(cfg); err != nil {
+				controller.Logger().LogError("saving config: %v", err)
+				http.Error(w, "failed saving config", http.StatusInternalServerError)
+				return
+			}
+
+			page := SettingsPageData{
+				Config:  cfg,
+				Saved:   true,
+				Message: "Settings saved. Changes apply next cycle.",
+			}
+			renderTemplate(w, r, controller, "settings.html", page)
+
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}
+}
+
+// GET /asset/{PAIR-DASH} e.g., /asset/BTC-USD -> "BTC/USD"
 func assetDetailHandler(controller AppController) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Extract asset pair from URL, e.g., "/asset/BTC-USD"
-		urlPath := strings.TrimPrefix(r.URL.Path, "/asset/")
-		assetPair := strings.Replace(urlPath, "-", "/", 1) // "BTC-USD" -> "BTC/USD"
+		tail := strings.TrimPrefix(r.URL.Path, "/asset/")
+		if tail == "" || strings.Contains(tail, "/") {
+			http.NotFound(w, r)
+			return
+		}
+		pair := strings.ReplaceAll(tail, "-", "/")
 
-		// NOTE: This handler will also need the context plumbing fix eventually.
-		assetData, err := controller.GetAssetDetailData(assetPair)
+		data, err := controller.GetAssetDetailData(pair)
 		if err != nil {
-			http.Error(w, "Failed to get asset data: "+err.Error(), http.StatusInternalServerError)
+			controller.Logger().LogError("asset detail: %v", err)
+			http.NotFound(w, r)
 			return
 		}
 
-		renderTemplate(w, r, controller, "asset_detail.html", assetData)
-	}
-}
+		// Build a local icon path (no controller method needed)
+		symbol := strings.ToLower(strings.Split(pair, "/")[0])
+		iconURL := "/static/icons/" + symbol + ".webp"
 
-// settingsHandler routes GET and POST requests for the settings page.
-func settingsHandler(controller AppController) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			settingsPostHandler(w, r, controller)
-		} else {
-			settingsGetHandler(w, r, controller)
+		page := AssetDetailPageData{
+			AssetPair:       pair,
+			AssetIconURL:    iconURL,
+			Position:        data.Position,
+			IndicatorValues: data.IndicatorValues,
+			Consensus:       data.Consensus,
+			Analysis:        data.Analysis,
 		}
+		renderTemplate(w, r, controller, "asset_detail.html", page)
 	}
-}
-
-// settingsGetHandler remains the same.
-func settingsGetHandler(w http.ResponseWriter, r *http.Request, controller AppController) {
-	currentConfig := controller.GetConfig()
-	pageData := struct {
-		Config  utilities.AppConfig
-		Message string
-	}{
-		Config:  currentConfig,
-		Message: r.URL.Query().Get("message"),
-	}
-	renderTemplate(w, r, controller, "settings.html", pageData)
-}
-
-// settingsPostHandler remains the same.
-func settingsPostHandler(w http.ResponseWriter, r *http.Request, controller AppController) {
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "Failed to parse form", http.StatusBadRequest)
-		return
-	}
-	newConfig := controller.GetConfig()
-	rawPairs := r.FormValue("trading.asset_pairs")
-	newConfig.Trading.AssetPairs = []string{}
-	for _, p := range strings.Split(rawPairs, ",") {
-		if trimmed := strings.TrimSpace(p); trimmed != "" {
-			newConfig.Trading.AssetPairs = append(newConfig.Trading.AssetPairs, trimmed)
-		}
-	}
-	newConfig.Trading.PortfolioRiskPerTrade, _ = strconv.ParseFloat(r.FormValue("trading.portfolio_risk_per_trade"), 64)
-	newConfig.Trading.BaseOrderSize, _ = strconv.ParseFloat(r.FormValue("trading.base_order_size"), 64)
-	newConfig.Trading.TakeProfitPercentage, _ = strconv.ParseFloat(r.FormValue("trading.take_profit_percentage"), 64)
-	newConfig.Trading.TakeProfitPartialSellPercent, _ = strconv.ParseFloat(r.FormValue("trading.take_profit_partial_sell_percent"), 64)
-	newConfig.Trading.MaxSafetyOrders, _ = strconv.Atoi(r.FormValue("trading.max_safety_orders"))
-	newConfig.Trading.PriceDeviationToOpenSafetyOrders, _ = strconv.ParseFloat(r.FormValue("trading.price_deviation_to_open_safety_orders"), 64)
-	newConfig.Trading.SafetyOrderStepScale, _ = strconv.ParseFloat(r.FormValue("trading.safety_order_step_scale"), 64)
-	newConfig.Trading.SafetyOrderVolumeScale, _ = strconv.ParseFloat(r.FormValue("trading.safety_order_volume_scale"), 64)
-	newConfig.Trading.TrailingStopEnabled = r.FormValue("trading.trailing_stop_enabled") == "on"
-	newConfig.Trading.TrailingStopDeviation, _ = strconv.ParseFloat(r.FormValue("trading.trailing_stop_deviation"), 64)
-	newConfig.Indicators.RSIPeriod, _ = strconv.Atoi(r.FormValue("indicators.rsi_period"))
-	newConfig.Indicators.ATRPeriod, _ = strconv.Atoi(r.FormValue("indicators.atr_period"))
-	newConfig.Indicators.MACDFastPeriod, _ = strconv.Atoi(r.FormValue("indicators.macd_fast_period"))
-	newConfig.Indicators.MACDSlowPeriod, _ = strconv.Atoi(r.FormValue("indicators.macd_slow_period"))
-	newConfig.Indicators.MACDSignalPeriod, _ = strconv.Atoi(r.FormValue("indicators.macd_signal_period"))
-	newConfig.Indicators.StochRSIBuyThreshold, _ = strconv.ParseFloat(r.FormValue("indicators.stoch_rsi_buy_threshold"), 64)
-	newConfig.CircuitBreaker.Enabled = r.FormValue("circuitbreaker.enabled") == "on"
-	newConfig.CircuitBreaker.DrawdownThresholdPercent, _ = strconv.ParseFloat(r.FormValue("circuitbreaker.drawdown_threshold_percent"), 64)
-	newConfig.Logging.Level = r.FormValue("logging.level")
-	if err := controller.UpdateAndSaveConfig(newConfig); err != nil {
-		http.Error(w, "Failed to update configuration: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	http.Redirect(w, r, "/settings?message=Success! Settings have been saved and applied.", http.StatusFound)
 }

@@ -1472,7 +1472,7 @@ func (s *TradingState) GetAssetDetailData(assetPair string) (web.AssetDetailData
 	cfg := *s.config
 	s.stateMutex.RUnlock()
 
-	// Since this interface method doesn't receive a context, we use context.TODO().
+	// Since this interface method doesn't receive a context, we use context.
 	// This is a signal that we should consider refactoring the interface to accept one later.
 	ctx := context.TODO()
 
