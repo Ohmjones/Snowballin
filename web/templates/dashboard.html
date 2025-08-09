@@ -11,7 +11,6 @@
 <div class="asset-button-row">
     <div class="ui tiny buttons">
         {{range .AssetPairs}}
-        {{/* "BTC/USD" -> "BTC-USD" for URL */}}
         {{$dash := (replace . "/" "-" -1)}}
         <a class="ui button" href="/asset/{{$dash}}">{{.}}</a>
         {{end}}
@@ -61,44 +60,32 @@
         </thead>
         <tbody>
         {{if .Dashboard.ActivePositions}}
-        {{range .Dashboard.ActivePositions}}
+        {{range $pair, $pos := .Dashboard.ActivePositions}}
         <tr>
-            <td>
-                {{.AssetPair}}
-            </td>
+            <td>{{$pair}}</td>
+            <td class="right aligned">{{printf "%.8f" $pos.AveragePrice}}</td>
+            <td class="right aligned">{{printf "%.6f" $pos.TotalVolume}}</td>
             <td class="right aligned">
-                {{printf "%.8f" .AvgEntryPrice}}
-            </td>
-            <td class="right aligned">
-                {{printf "%.6f" .TotalVolume}}
-            </td>
-            <td class="right aligned">
-                {{if ge .UnrealizedPL 0.0}}
-                <span class="green-number">{{printf "%.2f" .UnrealizedPL}}</span>
+                {{if ge $pos.UnrealizedPL 0.0}}
+                <span class="green-number">{{printf "%.2f" $pos.UnrealizedPL}}</span>
                 {{else}}
-                <span class="red-number">{{printf "%.2f" .UnrealizedPL}}</span>
+                <span class="red-number">{{printf "%.2f" $pos.UnrealizedPL}}</span>
                 {{end}}
             </td>
             <td class="right aligned">
-                {{if ge .UnrealizedPLPercent 0.0}}
-                <span class="green-number">{{printf "%.2f%%" .UnrealizedPLPercent}}</span>
+                {{if ge $pos.UnrealizedPLPercent 0.0}}
+                <span class="green-number">{{printf "%.2f%%" $pos.UnrealizedPLPercent}}</span>
                 {{else}}
-                <span class="red-number">{{printf "%.2f%%" .UnrealizedPLPercent}}</span>
+                <span class="red-number">{{printf "%.2f%%" $pos.UnrealizedPLPercent}}</span>
                 {{end}}
             </td>
-            <td class="right aligned">
-                {{printf "%.8f" .TakeProfitPrice}}
-            </td>
-            <td class="right aligned">
-                {{.Age}}
-            </td>
+            <td class="right aligned">{{printf "%.8f" $pos.CurrentTakeProfit}}</td>
+            <td class="right aligned">{{$pos.Age}}</td>
         </tr>
         {{end}}
         {{else}}
         <tr>
-            <td colspan="7" class="center aligned">
-                No active positions.
-            </td>
+            <td colspan="7" class="center aligned">No active positions.</td>
         </tr>
         {{end}}
         </tbody>

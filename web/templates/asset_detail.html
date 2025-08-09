@@ -1,6 +1,5 @@
 {{define "content"}}
 <h1 class="ui inverted header">
-    {{/* If we have a per-asset icon URL, render it. Else use a generic icon. */}}
     {{if .AssetIconURL}}
     <img class="ui image" src="{{.AssetIconURL}}" alt="{{.AssetPair}} icon" style="width:28px;height:28px;margin-right:8px;border-radius:4px;">
     {{else}}
@@ -25,8 +24,8 @@
             <h4 class="ui inverted header">Position Details</h4>
             <div class="ui inverted relaxed divided list">
                 <div class="item">
-                    <div class="header">Avg Entry</div>
-                    {{printf "%.8f" .Position.AvgEntryPrice}}
+                    <div class="header">Average Price</div>
+                    {{printf "%.8f" .Position.AveragePrice}}
                 </div>
                 <div class="item">
                     <div class="header">Volume</div>
@@ -41,8 +40,8 @@
                     {{end}}
                 </div>
                 <div class="item">
-                    <div class="header">TP Price</div>
-                    {{printf "%.8f" .Position.TakeProfitPrice}}
+                    <div class="header">Current TP</div>
+                    {{printf "%.8f" .Position.CurrentTakeProfit}}
                 </div>
                 <div class="item">
                     <div class="header">Age</div>
@@ -72,7 +71,6 @@
         <div class="ui inverted raised segment">
             <h4 class="ui inverted header">Consensus</h4>
             <div class="ui relaxed divided list">
-                <!-- Broker consensus always shown -->
                 <div class="item">
                     <i class="chart line icon"></i>
                     <div class="content">
@@ -115,7 +113,6 @@
 <!-- TradingView embed -->
 <script type="text/javascript">
     (function() {
-        // "BTC/USD" -> "KRAKEN:BTCUSD" by default
         var pair = "{{.AssetPair}}".replace("/", "");
         var symbol = "KRAKEN:" + pair;
 
@@ -134,10 +131,4 @@
                 allow_symbol_change: false,
                 autosize: true,
                 hide_top_toolbar: false,
-                hide_legend: false
-            });
-        };
-        document.body.appendChild(s);
-    })();
-</script>
-{{end}}
+                hi

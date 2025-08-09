@@ -8,7 +8,7 @@
 </h1>
 
 <form class="ui inverted form" method="POST" action="/settings">
-    <!-- Trading: Take Profit -->
+    <!-- Trading – Take Profit -->
     <h3 class="ui dividing inverted header">Trading – Take Profit</h3>
     <div class="three fields">
         <div class="field">
@@ -38,7 +38,7 @@
         </div>
         <div class="field">
             <label>RSI Buy Threshold</label>
-            <!-- mapped to Trading.PredictiveRsiThreshold -->
+            <!-- maps to Trading.PredictiveRsiThreshold -->
             <input type="number" min="0" max="100" step="1" name="indicators.rsi_buy_threshold"
                    value="{{.Config.Trading.PredictiveRsiThreshold}}">
         </div>
