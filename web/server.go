@@ -6,7 +6,8 @@ import (
 	"path/filepath"
 )
 
-// StartServer configures routes and serves the UI (explicit addr).
+// StartServer configures routes and returns an *http.Server.
+// (Matches your original structure: it does NOT start listening.)
 func StartServer(controller AppController, addr string) *http.Server {
 	staticDir, err := filepath.Abs("./web/static")
 	if err != nil {
@@ -26,13 +27,14 @@ func StartServer(controller AppController, addr string) *http.Server {
 	return srv
 }
 
-// Back-compat: your app calls StartWebServer(ctx, state).
-// Since you hardcode the port, we just use :8080.
+// StartWebServer matches your app.go call signature and actually starts the listener.
+// Hardcoded to :8080 as per your setup.
 func StartWebServer(_ context.Context, controller AppController) *http.Server {
-	return StartServer(controller, ":8080")
-}
-
-// Optional convenience if you ever want to pass a custom address.
-func StartWebServerWithAddr(controller AppController, addr string) *http.Server {
-	return StartServer(controller, addr)
+	srv := StartServer(controller, ":8080")
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			controller.Logger().LogError("Web server error: %v", err)
+		}
+	}()
+	return srv
 }
