@@ -4,37 +4,57 @@ import (
 	"context"
 	"net/http"
 	"path/filepath"
+	"time"
 )
 
-// StartServer configures routes and returns an *http.Server.
-// (Matches your original structure: it does NOT start listening.)
-func StartServer(controller AppController, addr string) *http.Server {
+// StartWebServer initializes and starts the web server in a new goroutine.
+// It takes an AppController, which is an interface implemented by the main application.
+func StartWebServer(ctx context.Context, controller AppController) {
+	addr := ":8080"
+
 	staticDir, err := filepath.Abs("./web/static")
 	if err != nil {
-		controller.Logger().LogFatal("Could not determine absolute path for static: %v", err)
+		// CORRECT: Call the Logger() method, which returns the logger object.
+		// Then, call the LogFatal() method on that object.
+		controller.Logger().LogFatal("Could not determine absolute path for static directory: %v", err)
 	}
 
 	mux := http.NewServeMux()
+
 	fs := http.FileServer(http.Dir(staticDir))
 	mux.Handle("/static/", http.StripPrefix("/static/", fs))
 
+	// Pass the controller to the handlers
 	mux.HandleFunc("/", dashboardHandler(controller))
 	mux.HandleFunc("/settings", settingsHandler(controller))
 	mux.HandleFunc("/asset/", assetDetailHandler(controller))
 
-	srv := &http.Server{Addr: addr, Handler: mux}
-	controller.Logger().LogInfo("Web listening on %s", addr)
-	return srv
-}
+	server := &http.Server{
+		Addr:         addr,
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
 
-// StartWebServer matches your app.go call signature and actually starts the listener.
-// Hardcoded to :8080 as per your setup.
-func StartWebServer(_ context.Context, controller AppController) *http.Server {
-	srv := StartServer(controller, ":8080")
+	// Start the server in a goroutine
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			controller.Logger().LogError("Web server error: %v", err)
+		// CORRECT: controller.Logger().LogInfo(...)
+		// INCORRECT: controller.Logger.LogInfo(...)
+		controller.Logger().LogInfo("Starting web dashboard on http://localhost%s", addr)
+		if err := server.ListenAndServe(); err != http.ErrServerClosed {
+			controller.Logger().LogFatal("Web server failed: %v", err)
 		}
 	}()
-	return srv
+
+	// Listen for context cancellation to gracefully shut down the server
+	go func() {
+		<-ctx.Done()
+		controller.Logger().LogInfo("Shutting down web server...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			controller.Logger().LogError("Web server graceful shutdown failed: %v", err)
+		}
+	}()
 }
