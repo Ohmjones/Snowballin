@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Snowballin' Dashboard</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/semantic-ui@2.5.0/dist/semantic.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/semantic-ui@2.5.0/dist/semantic.min.js"></script>
+    <style>
+        body {
+            background-color: #1b1c1d;
+            color: #ffffff;
+        }
+        .ui.menu .item {
+            color: rgba(255, 255, 255, 0.9);
+        }
+        .ui.menu .active.item {
+            background: rgba(255, 255, 255, 0.08) !important;
+        }
+    </style>
+</head>
+<body>
+
+<div class="ui inverted attached segment">
+    <div class="ui inverted secondary pointing menu">
+        {{/* Define a variable for the dashboard link's class */}}
+        {{$dashClass := "item"}}
+        {{if eq .Template "dashboard.html"}}
+        {{$dashClass = "item active"}}
+        {{end}}
+        <a class="{{$dashClass}}" href="/">
+            <i class="chart line icon"></i> Dashboard
+        </a>
+
+        {{/* Define a variable for the settings link's class */}}
+        {{$settingsClass := "item"}}
+        {{if eq .Template "settings.html"}}
+        {{$settingsClass = "item active"}}
+        {{end}}
+        <a class="{{$settingsClass}}" href="/settings">
+            <i class="cogs icon"></i> Settings
+        </a>
+
+        <div class="right menu">
+            <div class="item">
+                <div class="ui label">
+                    Version
+                    <div class="detail">{{.Version}}</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="ui container" style="margin-top: 2em;">
+    {{template "content" .PageData}}
+</div>
+
+
+<script>
+    $(document).ready(function(){
+        $('.ui.accordion').accordion();
+        $('.ui.dropdown').dropdown();
+        $('.ui.checkbox').checkbox();
+        // Automatically hide success messages after 5 seconds
+        setTimeout(function() {
+            $('.ui.success.message').fadeOut('slow');
+        }, 5000);
+    });
+</script>
+
+</body>
+</html>

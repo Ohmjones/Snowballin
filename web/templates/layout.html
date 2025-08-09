@@ -21,12 +21,6 @@
 <div class="ui inverted menu">
     <a class="active item" href="/">Dashboard</a>
     <a class="item" href="/settings">Settings</a>
-    <div class="right menu">
-        {{/* .Dashboard is available on pages that use DashboardPageData; others won’t render this */}}
-        {{if .Dashboard}}
-        <div class="item">Version: {{.Dashboard.Version}}</div>
-        {{end}}
-    </div>
 </div>
 
 <div class="ui container" style="margin-top:1.5rem">
