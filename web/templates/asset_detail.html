@@ -12,7 +12,6 @@
 </h1>
 
 <div class="ui two column stackable grid">
-    <!-- Left column: Chart + Position -->
     <div class="column">
         <div class="ui inverted raised segment">
             <h4 class="ui inverted header">Chart</h4>
@@ -23,36 +22,21 @@
         <div class="ui inverted raised segment">
             <h4 class="ui inverted header">Position Details</h4>
             <div class="ui inverted relaxed divided list">
-                <div class="item">
-                    <div class="header">Average Price</div>
-                    {{printf "%.8f" .Position.AveragePrice}}
-                </div>
-                <div class="item">
-                    <div class="header">Volume</div>
-                    {{printf "%.6f" .Position.TotalVolume}}
-                </div>
-                <div class="item">
-                    <div class="header">Unrealized P/L</div>
+                <div class="item"><div class="header">Average Price</div>{{printf "%.8f" .Position.AveragePrice}}</div>
+                <div class="item"><div class="header">Volume</div>{{printf "%.6f" .Position.TotalVolume}}</div>
+                <div class="item"><div class="header">Unrealized P/L</div>
                     {{if ge .Position.UnrealizedPL 0.0}}
                     <span class="green-number">{{printf "%.2f" .Position.UnrealizedPL}}</span>
                     {{else}}
                     <span class="red-number">{{printf "%.2f" .Position.UnrealizedPL}}</span>
                     {{end}}
                 </div>
-                <div class="item">
-                    <div class="header">Current TP</div>
-                    {{printf "%.8f" .Position.CurrentTakeProfit}}
-                </div>
-                <div class="item">
-                    <div class="header">Age</div>
-                    {{.Position.Age}}
-                </div>
+                <div class="item"><div class="header">Current TP</div>{{printf "%.8f" .Position.CurrentTakeProfit}}</div>
             </div>
         </div>
         {{end}}
     </div>
 
-    <!-- Right column: Indicators + Consensus (+ Notes) -->
     <div class="column">
         <div class="ui inverted raised segment">
             <h4 class="ui inverted header">Indicators</h4>
@@ -110,7 +94,6 @@
     </div>
 </div>
 
-<!-- TradingView embed -->
 <script type="text/javascript">
     (function() {
         var pair = "{{.AssetPair}}".replace("/", "");
@@ -131,4 +114,10 @@
                 allow_symbol_change: false,
                 autosize: true,
                 hide_top_toolbar: false,
-                hi
+                hide_legend: false
+            });
+        };
+        document.body.appendChild(s);
+    })();
+</script>
+{{end}}

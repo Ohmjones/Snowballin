@@ -24,11 +24,8 @@
             <i class="dollar sign icon"></i>
             <span class="green-number">{{printf "%.2f" .Dashboard.PortfolioValue}}</span>
         </div>
-        <div class="label">
-            CURRENT ACCOUNT VALUE ({{.Dashboard.QuoteCurrency}})
-        </div>
+        <div class="label">CURRENT ACCOUNT VALUE ({{.Dashboard.QuoteCurrency}})</div>
     </div>
-
     <div class="statistic">
         <div class="value">
             {{if ge .Dashboard.TotalUnrealizedPL 0.0}}
@@ -37,9 +34,7 @@
             <span class="red-number">{{printf "%.2f" .Dashboard.TotalUnrealizedPL}}</span>
             {{end}}
         </div>
-        <div class="label">
-            TOTAL UNREALIZED P/L
-        </div>
+        <div class="label">TOTAL UNREALIZED P/L</div>
     </div>
 </div>
 
@@ -55,7 +50,6 @@
             <th class="right aligned">Unrealized P/L</th>
             <th class="right aligned">Unrealized P/L %</th>
             <th class="right aligned">Take Profit Price</th>
-            <th class="right aligned">Age</th>
         </tr>
         </thead>
         <tbody>
@@ -80,13 +74,10 @@
                 {{end}}
             </td>
             <td class="right aligned">{{printf "%.8f" $pos.CurrentTakeProfit}}</td>
-            <td class="right aligned">{{$pos.Age}}</td>
         </tr>
         {{end}}
         {{else}}
-        <tr>
-            <td colspan="7" class="center aligned">No active positions.</td>
-        </tr>
+        <tr><td colspan="6" class="center aligned">No active positions.</td></tr>
         {{end}}
         </tbody>
     </table>
