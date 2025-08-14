@@ -31,7 +31,8 @@
     "symbol_overrides": {
       "BTC": "1",
       "ETH": "1027",
-      "SOL": "5426"
+      "SOL": "5426",
+      "XRP": "52"
     },
     "quote_currency": "USD",
     "request_timeout_sec": 10,

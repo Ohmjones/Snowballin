@@ -336,6 +336,7 @@ func (c *Client) GetCoinID(ctx context.Context, sym string) (string, error) {
 		"BTC": "bitcoin",
 		"ETH": "ethereum",
 		"SOL": "solana",
+		"XRP": "ripple",
 	}
 	if id, ok := priorityMap[up]; ok {
 		c.logger.LogDebug("CoinGecko GetCoinID: Found '%s' in priority map. Using ID: '%s'", up, id)
