@@ -427,7 +427,15 @@ func (c *Client) refreshCoinIDMapIfNeeded(ctx context.Context, force bool) error
 	c.logger.LogInfo("CoinMarketCap Client: Coin ID map refreshed with %d active coins.", len(c.symbolToNumericalIDMap))
 	return nil
 }
-
+func (c *Client) GetCoinIDsBySymbol(ctx context.Context, sym string) ([]string, error) {
+	// Use the existing GetCoinID to leverage its caching and robust lookup.
+	id, err := c.GetCoinID(ctx, sym)
+	if err != nil {
+		return nil, err
+	}
+	// Return the single ID in a slice to match the interface signature.
+	return []string{id}, nil
+}
 func (c *Client) GetCoinID(ctx context.Context, commonAssetSymbol string) (string, error) {
 	// --- START OF FIX ---
 	// Step 1: Check for a manual override first.

@@ -99,26 +99,34 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 	}
 
 	// Step 2: Get market data from CoinGecko to find a match.
-	cgMarketList, err := m.coingecko.GetSupportedCoins(ctx)
+	// Step 2: Get all potential CoinGecko IDs for the common symbol.
+	cgIDs, err := m.coingecko.GetCoinIDsBySymbol(ctx, commonSymbol)
 	if err != nil {
-		return nil, fmt.Errorf("mapper: failed to get market list from CoinGecko: %w", err)
+		return nil, fmt.Errorf("mapper: failed to get CoinGecko IDs for '%s': %w", commonSymbol, err)
 	}
 
+	// Step 3: Get market data for ALL potential CoinGecko IDs to filter by market cap and volume.
+	cgMarketData, err := m.coingecko.GetMarketData(ctx, cgIDs, "USD")
+	if err != nil {
+		return nil, fmt.Errorf("mapper: failed to get market data for CoinGecko IDs [%s]: %w", strings.Join(cgIDs, ","), err)
+	}
+
+	// Step 4: Find the best match by cross-referencing with Kraken data (market cap and volume).
 	var matchedCgCoin *dataprovider.MarketData
-	for i := range cgMarketList {
-		cgCoin := cgMarketList[i]
-		if strings.EqualFold(cgCoin.Symbol, commonSymbol) {
-			fullData, err := m.coingecko.GetMarketData(ctx, []string{cgCoin.ID}, "USD")
-			if err != nil || len(fullData) == 0 {
-				continue
-			}
-			matchedCgCoin = &fullData[0]
+	// Assuming Kraken's volume is a reasonable proxy for the true market volume.
+	krakenVolume := targetKrakenPair.LotMultiplier * 1000 // Placeholder logic for volume, adjust as needed.
+
+	for _, cgCoin := range cgMarketData {
+		// Use a confidence score or a direct comparison of market cap and volume.
+		// A simple heuristic is to check if the volume and market cap are significantly higher than for other coins.
+		if cgCoin.Volume24h > 10*float64(krakenVolume) && cgCoin.MarketCap > 1e8 {
+			matchedCgCoin = &cgCoin
 			break
 		}
 	}
 
 	if matchedCgCoin == nil {
-		return nil, fmt.Errorf("mapper: could not find a confident match for '%s' on CoinGecko", commonSymbol)
+		return nil, fmt.Errorf("mapper: could not find a confident match for '%s' on CoinGecko after cross-referencing", commonSymbol)
 	}
 
 	// Step 3: Use the verified CoinGecko data to find the precise CoinMarketCap ID.

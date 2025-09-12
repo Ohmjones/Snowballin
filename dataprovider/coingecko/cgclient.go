@@ -864,7 +864,35 @@ func ConvertCoinGeckoMarketData(data cgMarketData) (utils.OHLCVBar, error) {
 		Volume:    data.TotalVolume,
 	}, nil
 }
+func (c *Client) GetCoinIDsBySymbol(ctx context.Context, sym string) ([]string, error) {
+	c.idMapMu.RLock()
+	defer c.idMapMu.RUnlock()
 
+	loSym := strings.ToLower(sym)
+	var matchingIDs []string
+
+	// Search for IDs by symbol match first
+	for coinSymbol, coinID := range c.symbolToIDMap {
+		if coinSymbol == loSym {
+			matchingIDs = append(matchingIDs, coinID)
+		}
+	}
+
+	// If no match by symbol, try by name
+	if len(matchingIDs) == 0 {
+		for coinName, coinID := range c.idMap {
+			if strings.Contains(strings.ToLower(coinName), loSym) {
+				matchingIDs = append(matchingIDs, coinID)
+			}
+		}
+	}
+
+	if len(matchingIDs) == 0 {
+		return nil, fmt.Errorf("no matching CoinGecko IDs found for symbol '%s'", sym)
+	}
+
+	return matchingIDs, nil
+}
 func (c *Client) PrimeHistoricalData(ctx context.Context, id, vsCurrency, interval string, days int) error {
 	c.logger.LogInfo("PRIMING CoinGecko Data: Fetching %d days for ID=%s, Interval=%s", days, id, interval)
 
