@@ -171,15 +171,23 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 
 // findPreciseCmcID gets the CMC ID by cross-referencing market cap data to avoid ambiguity.
 func (m *AssetMapper) findPreciseCmcID(ctx context.Context, symbol string, cgMarketCap float64) (string, string, error) {
-	// The GetMarketData interface expects a slice of IDs. For CMC, we can pass the symbol here.
-	cmcMarketData, err := m.coinmarketcap.GetMarketData(ctx, []string{symbol}, "USD")
+	// Step 1: Use the CMC client's own GetCoinID method to resolve the numerical ID.
+	// This will correctly handle the symbol_overrides from the config.
+	cmcID, err := m.coinmarketcap.GetCoinID(ctx, symbol)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get CMC market data for symbol %s: %w", symbol, err)
-	}
-	if len(cmcMarketData) == 0 {
-		return "", "", fmt.Errorf("no market data returned from CMC for symbol %s", symbol)
+		return "", "", fmt.Errorf("failed to get CMC numerical ID for symbol %s: %w", symbol, err)
 	}
 
+	// Step 2: Call GetMarketData with the correct numerical ID.
+	cmcMarketData, err := m.coinmarketcap.GetMarketData(ctx, []string{cmcID}, "USD")
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get CMC market data for ID %s: %w", cmcID, err)
+	}
+	if len(cmcMarketData) == 0 {
+		return "", "", fmt.Errorf("no market data returned from CMC for ID %s", cmcID)
+	}
+
+	// The rest of the function remains the same, as the data returned is now correct.
 	if len(cmcMarketData) == 1 {
 		return cmcMarketData[0].ID, cmcMarketData[0].Image, nil
 	}
