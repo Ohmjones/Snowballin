@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
@@ -23,9 +22,12 @@ type Adapter struct {
 	cache     *dataprovider.SQLiteCache
 }
 
-func NewAdapter(appCfg *utilities.KrakenConfig, HTTPClient *http.Client, logger *utilities.Logger, cache *dataprovider.SQLiteCache) (*Adapter, error) {
+func NewAdapter(appCfg *utilities.KrakenConfig, client *Client, logger *utilities.Logger, cache *dataprovider.SQLiteCache) (*Adapter, error) {
 	if appCfg == nil {
 		return nil, errors.New("kraken adapter: AppConfig cannot be nil")
+	}
+	if client == nil {
+		return nil, errors.New("kraken adapter: client cannot be nil")
 	}
 	if logger == nil {
 		logger = utilities.NewLogger(utilities.Info)
@@ -36,10 +38,9 @@ func NewAdapter(appCfg *utilities.KrakenConfig, HTTPClient *http.Client, logger 
 	}
 
 	logger.LogInfo("Initializing Kraken Adapter...")
-	krakenClient := NewClient(appCfg, HTTPClient, logger)
 
 	adapter := &Adapter{
-		client:    krakenClient,
+		client:    client,
 		logger:    logger,
 		appConfig: appCfg,
 		cache:     cache,

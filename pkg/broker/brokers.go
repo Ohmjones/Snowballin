@@ -20,6 +20,7 @@ type Broker interface {
 
 	// GetBalance retrieves the account balance for a specific currency.
 	GetBalance(ctx context.Context, currency string) (Balance, error)
+	GetAllBalances(ctx context.Context) ([]Balance, error)
 
 	// GetAccountValue retrieves the total portfolio value in the specified quote currency.
 	GetAccountValue(ctx context.Context, quoteCurrency string) (float64, error) // <<< NEW METHOD

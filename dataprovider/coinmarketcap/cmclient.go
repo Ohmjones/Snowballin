@@ -51,10 +51,13 @@ type Client struct {
 }
 
 // --- CMC API Response Structs ---
+// cmcStatus is a common struct in CMC API responses.
 type cmcStatus struct {
 	Timestamp    string `json:"timestamp"`
 	ErrorCode    int    `json:"error_code"`
-	ErrorMessage string `json:"error_message,omitempty"`
+	ErrorMessage string `json:"error_message"`
+	Elapsed      int    `json:"elapsed"`
+	CreditCount  int    `json:"credit_count"`
 }
 type cmcMapEntry struct {
 	ID       int    `json:"id"`
@@ -119,6 +122,19 @@ type cmcGlobalMetricsData struct {
 }
 type cmcGlobalQuote struct {
 	TotalMarketCap float64 `json:"total_market_cap"`
+}
+type cmcListing struct {
+	ID     int    `json:"id"`
+	Name   string `json:"name"`
+	Symbol string `json:"symbol"`
+	Quote  map[string]struct {
+		Price     float64 `json:"price"`
+		MarketCap float64 `json:"market_cap"`
+	} `json:"quote"`
+}
+type cmcListingsResponse struct {
+	Data   []cmcListing `json:"data"`
+	Status cmcStatus    `json:"status"`
 }
 
 // --- Constructor ---
@@ -188,6 +204,133 @@ func NewClient(appCfg *utils.AppConfig, logger *utils.Logger, sqliteCache *datap
 
 	logger.LogInfo("CoinMarketCap client initialized.")
 	return client, nil
+}
+
+// GetTopAssetsByMarketCap fetches the top N assets from CoinMarketCap.
+func (c *Client) GetTopAssetsByMarketCap(ctx context.Context, quoteCurrency string, topN int) ([]string, error) {
+	var response cmcListingsResponse
+	params := url.Values{}
+	params.Add("start", "1")
+	params.Add("limit", strconv.Itoa(topN))
+	params.Add("convert", strings.ToUpper(quoteCurrency))
+	params.Add("sort", "market_cap")
+
+	err := c.makeAPICall(ctx, "/v1/cryptocurrency/listings/latest", params, &response)
+	if err != nil {
+		return nil, fmt.Errorf("CMC GetTopAssetsByMarketCap failed: %w", err)
+	}
+	if response.Status.ErrorCode != 0 {
+		return nil, fmt.Errorf("CMC API error: %s", response.Status.ErrorMessage)
+	}
+
+	var assetPairs []string
+	for _, listing := range response.Data {
+		assetPairs = append(assetPairs, fmt.Sprintf("%s/%s", strings.ToUpper(listing.Symbol), strings.ToUpper(quoteCurrency)))
+	}
+
+	return assetPairs, nil
+}
+
+// GetTrendingSearches implements the DataProvider interface for CoinMarketCap.
+
+func (c *Client) GetTrendingSearches(ctx context.Context) ([]dataprovider.TrendingCoin, error) {
+	// This struct matches the expected response from CMC's trending endpoints.
+	type TrendingResponse struct {
+		Data []struct {
+			ID     int    `json:"id"`
+			Name   string `json:"name"`
+			Symbol string `json:"symbol"`
+			Rank   int    `json:"rank"`
+		} `json:"data"`
+		Status cmcStatus `json:"status"`
+	}
+
+	var response TrendingResponse
+	// Using the correct endpoint for trending coins.
+	err := c.makeAPICall(ctx, "/v1/cryptocurrency/trending/latest", url.Values{}, &response)
+	if err != nil {
+		return nil, fmt.Errorf("CMC GetTrendingSearches failed: %w", err)
+	}
+	if response.Status.ErrorCode != 0 {
+		return nil, fmt.Errorf("CMC API error on trending fetch: %s", response.Status.ErrorMessage)
+	}
+
+	dpTrending := make([]dataprovider.TrendingCoin, 0, len(response.Data))
+	for _, token := range response.Data {
+		dpTrending = append(dpTrending, dataprovider.TrendingCoin{
+			Coin: dataprovider.Coin{
+				ID:     strconv.Itoa(token.ID), // Convert int ID to string to match interface
+				Symbol: token.Symbol,
+				Name:   token.Name,
+			},
+			Score: token.Rank, // Use rank as the score
+		})
+	}
+
+	return dpTrending, nil
+}
+
+// GetGainersAndLosers fetches the top N performing (gainers) and worst performing (losers) assets.
+func (c *Client) GetGainersAndLosers(ctx context.Context, quoteCurrency string, topN int) (gainers []dataprovider.MarketData, losers []dataprovider.MarketData, err error) {
+	// Local helper function to make the API call and parse the response.
+	fetchList := func(sortDir string) ([]dataprovider.MarketData, error) {
+		var response cmcListingsResponse
+		params := url.Values{}
+		params.Add("limit", strconv.Itoa(topN))
+		params.Add("convert", strings.ToUpper(quoteCurrency))
+		params.Add("sort", "percent_change_24h")
+		params.Add("sort_dir", sortDir)
+
+		callErr := c.makeAPICall(ctx, "/v1/cryptocurrency/listings/latest", params, &response)
+		if callErr != nil {
+			return nil, callErr
+		}
+		if response.Status.ErrorCode != 0 {
+			return nil, fmt.Errorf("CMC API error: %s", response.Status.ErrorMessage)
+		}
+
+		// Convert the CMC response to the standardized dataprovider.MarketData type.
+		marketData := make([]dataprovider.MarketData, 0, len(response.Data))
+		for _, listing := range response.Data {
+			quote, ok := listing.Quote[strings.ToUpper(quoteCurrency)]
+			if !ok {
+				continue
+			}
+			marketData = append(marketData, dataprovider.MarketData{
+				ID:             strconv.Itoa(listing.ID),
+				Symbol:         listing.Symbol,
+				Name:           listing.Name,
+				CurrentPrice:   quote.Price,
+				MarketCap:      quote.MarketCap,
+				PriceChange24h: quote.Price, // This field is available in other calls, but we prioritize the list itself.
+			})
+		}
+		return marketData, nil
+	}
+
+	// Fetch Top Gainers (sorted descending)
+	gainers, gErr := fetchList("desc")
+	if gErr != nil {
+		return nil, nil, fmt.Errorf("failed to fetch gainers: %w", gErr)
+	}
+
+	// Fetch Top Losers (sorted ascending)
+	losers, lErr := fetchList("asc")
+	if lErr != nil {
+		return nil, nil, fmt.Errorf("failed to fetch losers: %w", lErr)
+	}
+
+	return gainers, losers, nil
+}
+
+// GetAllTickersForAsset is a placeholder implementation for CoinMarketCap.
+// CMC's API does not have a direct, efficient endpoint for this like CoinGecko.
+// This satisfies the interface contract while making it clear this data comes from CoinGecko.
+func (c *Client) GetAllTickersForAsset(ctx context.Context, coinID string) ([]dataprovider.CrossExchangeTicker, error) {
+	c.logger.LogDebug("CoinMarketCap provider does not support efficient cross-exchange ticker fetching. This is expected. Returning empty slice.")
+	// Return an empty slice and no error. The data gathering logic will gracefully
+	// handle this by relying on the data provided by CoinGecko for this feature.
+	return []dataprovider.CrossExchangeTicker{}, nil
 }
 
 // --- API Call Helper ---
@@ -420,6 +563,107 @@ func (c *Client) GetOHLCVHistorical(ctx context.Context, id, vsCurrency, userInt
 	}
 
 	return sourceBars, nil
+}
+
+// GetOHLCDaily fetches true daily OHLCV data from the CoinMarketCap API.
+// This is required to satisfy the DataProvider interface and is used for volatility/candle-based indicators.
+func (c *Client) GetOHLCDaily(ctx context.Context, id, vsCurrency string, days int) ([]utils.OHLCVBar, error) {
+	c.logger.LogDebug("CoinMarketCap GetOHLCDaily: Fetching %d days of daily OHLC for ID=%s", days, id)
+
+	// --- API Fetching Logic for CoinMarketCap ---
+	var cmcResponse cmcOHLCVHistoricalResponse
+	params := url.Values{}
+	params.Add("id", id)
+	params.Add("count", strconv.Itoa(days))
+	params.Add("convert", strings.ToUpper(vsCurrency)) // CMC uses the 'convert' parameter
+
+	// Use the same v2 endpoint as other historical functions for consistency.
+	endpoint := "/v2/cryptocurrency/ohlcv/historical"
+	err := c.makeAPICall(ctx, endpoint, params, &cmcResponse)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch daily OHLC data from CoinMarketCap for id %s: %w", id, err)
+	}
+
+	if cmcResponse.Status.ErrorCode != 0 {
+		return nil, fmt.Errorf("CoinMarketCap API error on daily fetch: %s", cmcResponse.Status.ErrorMessage)
+	}
+
+	// Correctly unmarshal the json.RawMessage, matching the existing pattern in your file.
+	var apiData cmcOHLCData
+	if err := json.Unmarshal(cmcResponse.Data, &apiData); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal daily historical data for id %s: %w", id, err)
+	}
+
+	if len(apiData.Quotes) == 0 {
+		c.logger.LogWarn("CoinMarketCap API returned no daily OHLC data for id %s over %d days.", id, days)
+		return []utils.OHLCVBar{}, nil
+	}
+
+	quotes := apiData.Quotes
+	ohlcvBars := make([]utils.OHLCVBar, 0, len(quotes))
+
+	// --- Parsing Logic ---
+	for _, quote := range quotes {
+		// The quote currency (e.g., "USD") is nested inside the QuoteMap.
+		quoteData, ok := quote.QuoteMap[strings.ToUpper(vsCurrency)]
+		if !ok {
+			c.logger.LogWarn("CoinMarketCap GetOHLCDaily: Quote for currency '%s' not found in response for id %s. Skipping bar.", vsCurrency, id)
+			continue
+		}
+
+		// CMC uses RFC3339Nano format for timestamps.
+		parsedTime, parseErr := time.Parse(time.RFC3339Nano, quoteData.Timestamp)
+		if parseErr != nil {
+			c.logger.LogWarn("CoinMarketCap GetOHLCDaily: Could not parse timestamp '%s'. Skipping bar.", quoteData.Timestamp)
+			continue
+		}
+
+		bar := utils.OHLCVBar{
+			Timestamp: parsedTime.UnixMilli(),
+			Open:      quoteData.Open,
+			High:      quoteData.High,
+			Low:       quoteData.Low,
+			Close:     quoteData.Close,
+			Volume:    quoteData.Volume,
+		}
+		ohlcvBars = append(ohlcvBars, bar)
+	}
+
+	// CMC data often comes in descending order, so we sort it ascending.
+	utils.SortBarsByTimestamp(ohlcvBars)
+
+	return ohlcvBars, nil
+}
+
+// NOTE: You will also need to add these helper structs to your coinmarketcap/client.go file
+// to correctly parse the JSON response from the /ohlcv/historical endpoint.
+
+type cmcOHLCVResponse struct {
+	Data   map[string]cmcOHLCVData `json:"data"`
+	Status cmcStatus               `json:"status"`
+}
+
+type cmcOHLCVData struct {
+	ID     int            `json:"id"`
+	Name   string         `json:"name"`
+	Symbol string         `json:"symbol"`
+	Quotes []cmcOHLCQuote `json:"quotes"`
+}
+
+type cmcOHLCQuote struct {
+	TimeOpen  string                          `json:"time_open"`
+	TimeClose string                          `json:"time_close"`
+	Quote     map[string]cmcOHLCVQuoteDetails `json:"quote"`
+}
+
+type cmcOHLCVQuoteDetails struct {
+	Open      float64 `json:"open"`
+	High      float64 `json:"high"`
+	Low       float64 `json:"low"`
+	Close     float64 `json:"close"`
+	Volume    float64 `json:"volume"`
+	MarketCap float64 `json:"market_cap"`
+	Timestamp string  `json:"timestamp"`
 }
 
 // fetchBarsFromAPI handles the actual API call and caching logic.

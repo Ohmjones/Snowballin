@@ -130,6 +130,30 @@ type cgMarketChartResponse struct {
 	MarketCaps   [][2]float64 `json:"market_caps"`
 	TotalVolumes [][2]float64 `json:"total_volumes"`
 }
+type cgTicker struct {
+	Base   string `json:"base"`
+	Target string `json:"target"`
+	Market struct {
+		Name string `json:"name"`
+	} `json:"market"`
+	Last                   float64            `json:"last"`
+	ConvertedLast          map[string]float64 `json:"converted_last"`
+	Volume                 float64            `json:"volume"`
+	ConvertedVolume        map[string]float64 `json:"converted_volume"`
+	TrustScore             string             `json:"trust_score"`
+	BidAskSpreadPercentage float64            `json:"bid_ask_spread_percentage"`
+	Timestamp              string             `json:"timestamp"`
+	LastTradedAt           string             `json:"last_traded_at"`
+	LastFetchAt            string             `json:"last_fetch_at"`
+	IsAnomaly              bool               `json:"is_anomaly"`
+	IsStale                bool               `json:"is_stale"`
+	TradeURL               string             `json:"trade_url"`
+}
+
+type cgTickersResponse struct {
+	Name    string     `json:"name"`
+	Tickers []cgTicker `json:"tickers"`
+}
 
 func NewClient(cfg *utils.AppConfig, logger *utils.Logger, cache *dataprovider.SQLiteCache) (*Client, error) {
 	if cfg == nil {
@@ -152,8 +176,8 @@ func NewClient(cfg *utils.AppConfig, logger *utils.Logger, cache *dataprovider.S
 	}
 
 	if cgCfg.RateLimitPerSec <= 0 {
-		cgCfg.RateLimitPerSec = 1.0
-		logger.LogWarn("CoinGecko Client: Invalid RateLimitPerSec, defaulting to 1.0")
+		cgCfg.RateLimitPerSec = 1
+		logger.LogWarn("CoinGecko Client: Invalid RateLimitPerSec, defaulting to 1")
 	}
 
 	if cgCfg.RateLimitBurst <= 0 {
@@ -165,7 +189,6 @@ func NewClient(cfg *utils.AppConfig, logger *utils.Logger, cache *dataprovider.S
 		cgCfg.RequestTimeoutSec = 10
 		logger.LogWarn("CoinGecko Client: Invalid RequestTimeoutSec, defaulting to 10 seconds")
 	}
-	sqliteCache := cache
 
 	if cache == nil {
 		return nil, errors.New("coingecko client: SQLiteCache cannot be nil")
@@ -181,12 +204,70 @@ func NewClient(cfg *utils.AppConfig, logger *utils.Logger, cache *dataprovider.S
 		symbolToIDMap:        make(map[string]string),
 		idMapRefreshInterval: time.Duration(cgCfg.IDMapRefreshIntervalHours) * time.Hour,
 		cfg:                  cgCfg,
-		cache:                sqliteCache,
+		cache:                cache,
 	}
 
 	logger.LogInfo("CoinGecko client initialized with URL: %s, RateLimit: %.2f req/sec", client.BaseURL, cgCfg.RateLimitPerSec)
 
 	return client, nil
+}
+
+// GetTopAssetsByMarketCap fetches the top N assets by market capitalization from CoinGecko.
+func (c *Client) GetTopAssetsByMarketCap(ctx context.Context, quoteCurrency string, topN int) ([]string, error) {
+	var response []cgMarketData
+	params := url.Values{}
+	params.Add("vs_currency", strings.ToLower(quoteCurrency))
+	params.Add("order", "market_cap_desc")
+	params.Add("per_page", strconv.Itoa(topN))
+	params.Add("page", "1")
+	params.Add("sparkline", "false")
+
+	err := c.request(ctx, "/coins/markets", params, &response)
+	if err != nil {
+		return nil, fmt.Errorf("GetTopAssetsByMarketCap failed: %w", err)
+	}
+
+	var assetPairs []string
+	for _, market := range response {
+		// This creates the pair in the format your bot expects, e.g., "BTC/USD"
+		// Note: This assumes a direct mapping. The symbol collision issue you mentioned
+		// is important and will require a dedicated mapping utility later on.
+		assetPairs = append(assetPairs, fmt.Sprintf("%s/%s", strings.ToUpper(market.Symbol), strings.ToUpper(quoteCurrency)))
+	}
+
+	return assetPairs, nil
+}
+
+// GetAllTickersForAsset fetches all market tickers for a specific coin ID from CoinGecko.
+func (c *Client) GetAllTickersForAsset(ctx context.Context, coinID string) ([]dataprovider.CrossExchangeTicker, error) {
+	var response cgTickersResponse
+	endpoint := fmt.Sprintf("/coins/%s/tickers", coinID)
+	params := url.Values{}
+	params.Add("include_exchange_logo", "false")
+	// You can add pagination here if a coin is listed on more than 100 exchanges
+	params.Add("page", "1")
+
+	err := c.request(ctx, endpoint, params, &response)
+	if err != nil {
+		return nil, fmt.Errorf("GetAllTickersForAsset for coin '%s' failed: %w", coinID, err)
+	}
+
+	tickers := make([]dataprovider.CrossExchangeTicker, 0, len(response.Tickers))
+	for _, ticker := range response.Tickers {
+		// The volume is often in the base currency. We use the 'converted_volume' in USD for a consistent measure.
+		usdVolume, ok := ticker.ConvertedVolume["usd"]
+		if !ok {
+			continue // Skip tickers without USD volume data for accurate comparison
+		}
+
+		tickers = append(tickers, dataprovider.CrossExchangeTicker{
+			ExchangeName: ticker.Market.Name,
+			Price:        ticker.Last,
+			Volume24h:    usdVolume,
+		})
+	}
+
+	return tickers, nil
 }
 
 // PrimeCache ensures the coin ID map is populated before trading begins.
@@ -199,13 +280,10 @@ func (c *Client) PrimeCache(ctx context.Context) error {
 // request handles making the HTTP request, rate limiting, API key, and decoding JSON.
 func (c *Client) request(ctx context.Context, endpoint string, queryParams url.Values, result interface{}) error {
 	if ctx == nil {
-		c.logger.LogWarn("CoinGecko Client: request called with nil context for endpoint %s. Using background context.", endpoint)
-		ctx = context.Background() // Fallback, but callers should provide a context
+		ctx = context.Background()
 	}
 
-	// Wait for rate limiter
 	if err := c.limiter.Wait(ctx); err != nil {
-		c.logger.LogError("CoinGecko Client: Rate limiter wait error for endpoint %s: %v", endpoint, err)
 		return fmt.Errorf("rate limiter error for endpoint %s: %w", endpoint, err)
 	}
 
@@ -216,24 +294,15 @@ func (c *Client) request(ctx context.Context, endpoint string, queryParams url.V
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
 	if err != nil {
-		c.logger.LogError("CoinGecko Client: Error creating request for %s: %v", fullURL, err)
 		return fmt.Errorf("failed to create request for %s: %w", fullURL, err)
 	}
 
-	// Initialize queryParams if nil, to ensure API key can be added if present.
 	if queryParams == nil {
 		queryParams = url.Values{}
 	}
 
-	if c.APIKey != "" { // For CoinGecko Pro API
-		// CoinGecko Pro API key is usually passed as a query parameter "x_cg_pro_api_key"
-		// or sometimes "x_cg_demo_api_key" for demo.
-		// Check their latest docs if this is still the preferred method.
-		// The provided code used req.Header.Set("x-cg-pro-api-key", c.APIKey).
-		// For query param method:
-		queryParams.Set("x_cg_pro_api_key", c.APIKey)
-		// If it's a header, it would be: req.Header.Set("X-Cg-Pro-Api-Key", c.APIKey)
-		// Let's stick to query param as it's common for keys not part of auth schemes.
+	if c.APIKey != "" {
+		req.Header.Set("x-cg-pro-api-key", c.APIKey)
 	}
 
 	if len(queryParams) > 0 {
@@ -241,23 +310,12 @@ func (c *Client) request(ctx context.Context, endpoint string, queryParams url.V
 	}
 
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "SnowballinBot/1.0") // Good practice
+	req.Header.Set("User-Agent", "SnowballinBot/1.0")
 	c.logger.LogDebug("CoinGecko Request: %s %s", req.Method, req.URL.String())
 
-	maxRetries := 0 // Default to 0 if cfg or MaxRetries is not set
-	if c.cfg != nil {
-		maxRetries = c.cfg.MaxRetries
-	}
-	if maxRetries < 0 { // Ensure it's not negative
-		maxRetries = 0
-	}
+	maxRetries := c.cfg.MaxRetries
+	retryDelay := time.Duration(c.cfg.RetryDelaySec) * time.Second
 
-	retryDelay := 2 * time.Second // Default
-	if c.cfg != nil && c.cfg.RetryDelaySec > 0 {
-		retryDelay = time.Duration(c.cfg.RetryDelaySec) * time.Second
-	}
-
-	// Use the utils.DoJSONRequest helper
 	return utils.DoJSONRequest(c.HTTPClient, req, maxRetries, retryDelay, result)
 }
 
@@ -474,7 +532,87 @@ func (c *Client) GetMarketData(ctx context.Context, ids []string, vsCurrency str
 	return dpData, nil
 }
 
-// GetOHLCVHistorical fetches OHLCV data for a standard lookback period.
+// GetOHLCDaily fetches true daily OHLCV data from the /ohlc endpoint.
+// This data is required for indicators that rely on full candle structure, like ATR and liquidity hunt detection.
+func (c *Client) GetOHLCDaily(ctx context.Context, id, vsCurrency string, days int) ([]utils.OHLCVBar, error) {
+	c.logger.LogDebug("CoinGecko GetOHLCDaily: Fetching %d days of daily OHLC for ID=%s", days, id)
+
+	cacheProvider := "coingecko"
+	// Use a distinct cache key for this daily data to avoid conflicts with chart data.
+	cacheCoinID := fmt.Sprintf("%s-%s-daily-ohlc", id, vsCurrency)
+
+	// --- Cache Checking Logic ---
+	// Check if we have fresh daily data in the cache first.
+	now := time.Now()
+	startTime := now.AddDate(0, 0, -days)
+	cachedBars, err := c.cache.GetBars(cacheProvider, cacheCoinID, startTime.UnixMilli(), now.UnixMilli())
+	if err != nil {
+		c.logger.LogWarn("cgclient GetOHLCDaily [%s]: Failed to get bars from cache: %v", id, err)
+	}
+
+	if len(cachedBars) > 0 {
+		latestCachedBarTime := time.UnixMilli(cachedBars[len(cachedBars)-1].Timestamp)
+		// Since this is daily data, we consider it fresh if the last bar is less than ~23 hours old.
+		if time.Since(latestCachedBarTime) < 23*time.Hour {
+			c.logger.LogInfo("cgclient GetOHLCDaily [%s]: Using %d fresh daily bars from cache.", id, len(cachedBars))
+			return cachedBars, nil
+		}
+	}
+
+	c.logger.LogInfo("cgclient GetOHLCDaily [%s]: Cache miss or stale daily data. Fetching from API.", id)
+
+	// --- API Fetching Logic ---
+	var ohlcData [][5]float64 // This is the specific response type for the /ohlc endpoint
+	params := url.Values{}
+	params.Add("vs_currency", strings.ToLower(vsCurrency))
+	params.Add("days", strconv.Itoa(days))
+	// No "interval" parameter is needed, as the /ohlc endpoint defaults to daily when `days` > 1.
+
+	endpoint := fmt.Sprintf("/coins/%s/ohlc", id)
+	err = c.request(ctx, endpoint, params, &ohlcData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch daily OHLC data from CoinGecko for %s: %w", id, err)
+	}
+
+	if len(ohlcData) == 0 {
+		c.logger.LogWarn("CoinGecko API returned no daily OHLC data for %s over %d days.", id, days)
+		return []utils.OHLCVBar{}, nil
+	}
+
+	// --- Parsing and Caching Logic ---
+	mergedBars := make([]utils.OHLCVBar, 0, len(ohlcData))
+	for _, ohlcPoint := range ohlcData {
+		if len(ohlcPoint) != 5 {
+			continue // Skip malformed data points
+		}
+		// Volume is not provided by this endpoint, so it is set to 0.
+		// This is acceptable as ATR, Stochastics, and candle patterns do not use volume.
+		bar := utils.OHLCVBar{
+			Timestamp: int64(ohlcPoint[0]),
+			Open:      ohlcPoint[1],
+			High:      ohlcPoint[2],
+			Low:       ohlcPoint[3],
+			Close:     ohlcPoint[4],
+			Volume:    0,
+		}
+		mergedBars = append(mergedBars, bar)
+
+		// Save the accurately fetched daily bar to the cache.
+		if err := c.cache.SaveBar(cacheProvider, cacheCoinID, bar); err != nil {
+			c.logger.LogWarn("cgclient GetOHLCDaily [%s]: Failed to save daily bar to cache: %v", id, err)
+		}
+	}
+
+	sort.Slice(mergedBars, func(i, j int) bool {
+		return mergedBars[i].Timestamp < mergedBars[j].Timestamp
+	})
+
+	return mergedBars, nil
+}
+
+// GetOHLCVHistorical fetches higher-resolution historical data using the /market_chart endpoint.
+// This provides hourly data for requests of 2-90 days, which is better for the strategy's indicators.
+// NOTE: This endpoint does not provide true Open, High, and Low values. They are approximated using the close price.
 func (c *Client) GetOHLCVHistorical(ctx context.Context, id, vsCurrency, interval string) ([]utils.OHLCVBar, error) {
 	// Use a default number of days for general purpose fetching.
 	// Your PrimeHistoricalData function will handle variable-day lookbacks.
@@ -482,7 +620,8 @@ func (c *Client) GetOHLCVHistorical(ctx context.Context, id, vsCurrency, interva
 	c.logger.LogDebug("CoinGecko GetOHLCVHistorical: Fetching for ID=%s, VS=%s, Interval=%s, Days=%d", id, vsCurrency, interval, days)
 
 	cacheProvider := "coingecko"
-	cacheCoinID := fmt.Sprintf("%s-%s-%s", id, vsCurrency, interval)
+	// The cache key now reflects that it's chart data, not specific OHLC.
+	cacheCoinID := fmt.Sprintf("%s-%s-%s-chart", id, vsCurrency, interval)
 
 	// --- The original, robust cache-checking logic is preserved ---
 	var expectedIntervalDuration time.Duration
@@ -514,40 +653,54 @@ func (c *Client) GetOHLCVHistorical(ctx context.Context, id, vsCurrency, interva
 
 	c.logger.LogInfo("cgclient GetOHLCVHistorical [%s]: Cache miss or stale data. Fetching %d days from API.", id, days)
 
-	// --- API Fetching Logic ---
-	var ohlcData []cgOHLCDataPoint
-	ohlcParams := url.Values{}
-	ohlcParams.Add("vs_currency", strings.ToLower(vsCurrency))
-	ohlcParams.Add("days", strconv.Itoa(days))
-	if strings.ToLower(interval) == "daily" || strings.ToLower(interval) == "1d" {
-		ohlcParams.Add("interval", "daily") // Force daily for Analyst plan
+	// --- MODIFIED: API Fetching Logic for /market_chart ---
+	var marketChartData cgMarketChartResponse // Use the correct struct for the new endpoint
+	params := url.Values{}
+	params.Add("vs_currency", strings.ToLower(vsCurrency))
+	params.Add("days", strconv.Itoa(days))
+	// The "interval" parameter is not used by the /market_chart endpoint and has been removed.
+
+	endpoint := fmt.Sprintf("/coins/%s/market_chart", id) // Target the correct endpoint
+	err = c.request(ctx, endpoint, params, &marketChartData)
+	if err != nil {
+		// More specific error message
+		return nil, fmt.Errorf("failed to fetch market chart data from CoinGecko for %s: %w", id, err)
 	}
 
-	ohlcEndpoint := fmt.Sprintf("/coins/%s/ohlc", id)
-	err = c.request(ctx, ohlcEndpoint, ohlcParams, &ohlcData)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch OHLC data from CoinGecko /ohlc for %s: %w", id, err)
-	}
-	if len(ohlcData) == 0 {
-		c.logger.LogWarn("CoinGecko API returned no OHLCV data for %s over %d days.", id, days)
+	// Check if the primary data array is empty
+	if len(marketChartData.Prices) == 0 {
+		c.logger.LogWarn("CoinGecko API returned no price data for %s over %d days.", id, days)
 		return []utils.OHLCVBar{}, nil
 	}
 
-	c.logger.LogInfo("Successfully fetched %d data points from CoinGecko for %s.", len(ohlcData), id)
+	c.logger.LogInfo("Successfully fetched %d data points from CoinGecko for %s.", len(marketChartData.Prices), id)
 
-	// --- Parsing and Caching Logic is preserved ---
-	mergedBars := make([]utils.OHLCVBar, 0, len(ohlcData))
-	for _, ohlcPoint := range ohlcData {
-		if len(ohlcPoint) != 5 {
+	// --- MODIFIED: Parsing and Caching Logic for marketChartData ---
+	numPoints := len(marketChartData.Prices)
+	mergedBars := make([]utils.OHLCVBar, 0, numPoints)
+
+	for i := 0; i < numPoints; i++ {
+		pricePoint := marketChartData.Prices[i]
+		if len(pricePoint) != 2 {
+			c.logger.LogWarn("cgclient GetOHLCVHistorical [%s]: Malformed price point, skipping.", id)
 			continue
 		}
+
+		// Safely get volume, defaulting to 0 if arrays are mismatched
+		var volume float64
+		if i < len(marketChartData.TotalVolumes) && len(marketChartData.TotalVolumes[i]) == 2 {
+			volume = marketChartData.TotalVolumes[i][1]
+		}
+
+		price := pricePoint[1]
 		bar := utils.OHLCVBar{
-			Timestamp: int64(ohlcPoint[0]),
-			Open:      ohlcPoint[1],
-			High:      ohlcPoint[2],
-			Low:       ohlcPoint[3],
-			Close:     ohlcPoint[4],
-			Volume:    0, // Volume not available from this specific CoinGecko endpoint
+			Timestamp: int64(pricePoint[0]),
+			// O, H, L are approximated with the closing price as this endpoint doesn't provide them.
+			Open:   price,
+			High:   price,
+			Low:    price,
+			Close:  price,
+			Volume: volume,
 		}
 		mergedBars = append(mergedBars, bar)
 
@@ -557,6 +710,7 @@ func (c *Client) GetOHLCVHistorical(ctx context.Context, id, vsCurrency, interva
 		}
 	}
 
+	// Sorting is still important as cache and new data might be combined in future logic.
 	sort.Slice(mergedBars, func(i, j int) bool {
 		return mergedBars[i].Timestamp < mergedBars[j].Timestamp
 	})
@@ -663,7 +817,7 @@ func (c *Client) GetGlobalMarketData(ctx context.Context) (dataprovider.GlobalMa
 	return dataprovider.GlobalMarketData{TotalMarketCap: totalMarketCap, BTCDominance: btcDominance}, nil
 }
 
-// GetTrendingSearches implements DataProvider interface.
+// GetTrendingSearches implements the DataProvider interface for CoinGecko.
 func (c *Client) GetTrendingSearches(ctx context.Context) ([]dataprovider.TrendingCoin, error) {
 	var cgTrendingResp cgTrendingResponse // Internal CoinGecko type
 	err := c.request(ctx, "/search/trending", nil, &cgTrendingResp)
@@ -684,6 +838,14 @@ func (c *Client) GetTrendingSearches(ctx context.Context) ([]dataprovider.Trendi
 		})
 	}
 	return dpTrending, nil
+}
+
+// In coingecko/cgclient.go, add a placeholder implementation to satisfy the interface.
+func (c *Client) GetGainersAndLosers(ctx context.Context, quoteCurrency string, topN int) ([]dataprovider.MarketData, []dataprovider.MarketData, error) {
+	// CoinGecko API is not ideal for this specific "top 100 gainers" query compared to CMC.
+	// We will rely on CMC for this feature.
+	c.logger.LogDebug("CoinGecko provider does not implement GetGainersAndLosers. This is expected.")
+	return nil, nil, nil
 }
 
 // ConvertCoinGeckoMarketData converts CGMarketData into utilities.OHLCVBar
@@ -719,7 +881,6 @@ func (c *Client) PrimeHistoricalData(ctx context.Context, id, vsCurrency, interv
 	}
 	ohlcEndpoint := fmt.Sprintf("/coins/%s/ohlc", id)
 
-	// --- MODIFIED: Corrected the target variable from &err to &ohlcData ---
 	err := c.request(ctx, ohlcEndpoint, ohlcParams, &ohlcData)
 	if err != nil {
 		return fmt.Errorf("failed to fetch priming data from CoinGecko /ohlc for %s: %w", id, err)

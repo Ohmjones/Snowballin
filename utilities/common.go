@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"golang.org/x/time/rate"
 	"io"
 	"log"
 	"net/http"
@@ -18,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 // LogLevel defines the severity of a log message.
@@ -404,6 +405,10 @@ type TradingConfig struct {
 	PredictiveSearchWindowPercent    float64  `mapstructure:"predictive_search_window_percent"`
 	UseFearOverride                  bool     `mapstructure:"use_fear_override"`
 	FearOverrideThreshold            int      `mapstructure:"fear_override_threshold"`
+	UseDynamicAssetScanning          bool     `mapstructure:"use_dynamic_asset_scanning"`
+	DynamicAssetScanTopN             int      `mapstructure:"dynamic_asset_scan_top_n"`
+	SMAPeriodForDCA                  int      `mapstructure:"sma_period_for_dca"`
+	SMAPeriodsForExit                []int    `mapstructure:"sma_periods_for_exit"`
 }
 
 // WithdrawalConfig holds settings for automated withdrawal of funds.

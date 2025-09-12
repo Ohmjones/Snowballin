@@ -7,6 +7,7 @@ import (
 	"Snowballin/notification/discord"
 	"Snowballin/pkg/broker"
 	krakenBroker "Snowballin/pkg/broker/kraken"
+	"Snowballin/pkg/mapper"
 	"Snowballin/strategy"
 	"Snowballin/utilities"
 	"Snowballin/web"
@@ -30,6 +31,7 @@ type TradingState struct {
 	config                  *utilities.AppConfig
 	discordClient           *discord.Client
 	cache                   *dataprovider.SQLiteCache
+	assetMapper             *mapper.AssetMapper
 	activeDPs               []dataprovider.DataProvider
 	providerNames           map[dataprovider.DataProvider]string
 	peakPortfolioValue      float64
@@ -46,6 +48,11 @@ type TradingState struct {
 	lastCMCFetch            time.Time
 	lastAccountValue        float64   // Stores the most recently fetched account value.
 	lastValueFetchTime      time.Time // Timestamp of the last fetch.
+	cgTrendingData          []dataprovider.TrendingCoin
+	cmcTrendingData         []dataprovider.TrendingCoin
+	lastGainersLosersFetch  time.Time
+	topGainers              []dataprovider.MarketData
+	topLosers               []dataprovider.MarketData
 }
 
 var (
@@ -114,6 +121,55 @@ func startFNGUpdater(ctx context.Context, fearGreedProvider dataprovider.FearGre
 		}
 	}()
 }
+
+// startSentimentUpdater is a background goroutine to fetch and cache trending data
+func startSentimentUpdater(ctx context.Context, state *TradingState, updateInterval time.Duration) {
+	fetchSentimentData := func() {
+		state.logger.LogInfo("Sentiment Updater: Fetching trending data from providers...")
+		var wg sync.WaitGroup
+		for _, dp := range state.activeDPs {
+			wg.Add(1)
+			go func(provider dataprovider.DataProvider) {
+				defer wg.Done()
+				providerName := state.providerNames[provider]
+				trending, err := provider.GetTrendingSearches(ctx)
+				if err != nil {
+					state.logger.LogWarn("Sentiment Updater: Failed to fetch trending data from %s: %v", providerName, err)
+					return
+				}
+
+				state.stateMutex.Lock()
+				switch providerName {
+				case "coingecko":
+					state.cgTrendingData = trending
+				case "coinmarketcap":
+					state.cmcTrendingData = trending
+				}
+				state.stateMutex.Unlock()
+				state.logger.LogInfo("Sentiment Updater: Successfully updated trending data from %s (%d coins).", providerName, len(trending))
+			}(dp)
+		}
+		wg.Wait()
+	}
+
+	// Fetch immediately on startup
+	go fetchSentimentData()
+
+	// Then fetch periodically
+	ticker := time.NewTicker(updateInterval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				fetchSentimentData()
+			}
+		}
+	}()
+}
+
 func modulateConfigBySentiment(originalConfig utilities.TradingConfig, fngValue int, logger *utilities.Logger) utilities.TradingConfig {
 	// Start with a copy of the original config to avoid modifying the global state.
 	modulatedConfig := originalConfig
@@ -178,7 +234,11 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 	sharedHTTPClient := &http.Client{Timeout: time.Duration(15 * time.Second)}
 
 	logger.LogInfo("Pre-Flight: Initializing and verifying broker (Kraken)...")
-	krakenAdapter, krakenErr := krakenBroker.NewAdapter(&cfg.Kraken, sharedHTTPClient, logger, sqliteCache)
+	// 1. Create the underlying Kraken Client first. This instance will be shared.
+	krakenClient := krakenBroker.NewClient(&cfg.Kraken, sharedHTTPClient, logger)
+
+	// 2. Pass the client into the Adapter.
+	krakenAdapter, krakenErr := krakenBroker.NewAdapter(&cfg.Kraken, krakenClient, logger, sqliteCache)
 	if krakenErr != nil {
 		return fmt.Errorf("pre-flight check failed: could not initialize Kraken adapter: %w", krakenErr)
 	}
@@ -210,20 +270,39 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 
 	var configuredDPs []dataprovider.DataProvider
 	providerNames := make(map[dataprovider.DataProvider]string)
+	var cgClient, cmcClient dataprovider.DataProvider // Keep separate handles for the mapper
+
 	if cfg.Coingecko != nil && cfg.Coingecko.APIKey != "" {
-		cgClient, _ := cg.NewClient(cfg, logger, sqliteCache)
-		if cgClient != nil {
+		cg, err := cg.NewClient(cfg, logger, sqliteCache)
+		if err == nil && cg != nil {
+			cgClient = cg
 			configuredDPs = append(configuredDPs, cgClient)
 			providerNames[cgClient] = "coingecko"
 		}
 	}
 	if cfg.Coinmarketcap != nil && cfg.Coinmarketcap.APIKey != "" {
-		cmcClient, _ := cmc.NewClient(cfg, logger, sqliteCache)
-		if cmcClient != nil {
+		cmc, err := cmc.NewClient(cfg, logger, sqliteCache)
+		if err == nil && cmc != nil {
+			cmcClient = cmc
 			configuredDPs = append(configuredDPs, cmcClient)
 			providerNames[cmcClient] = "coinmarketcap"
 		}
 	}
+
+	logger.LogInfo("Pre-Flight: Initializing the Asset Mapper...")
+	assetMapper := mapper.NewAssetMapper(sqliteCache, logger, krakenClient, cgClient, cmcClient)
+
+	// --- PRE-FLIGHT ASSET MAPPING ---
+	logger.LogInfo("Pre-Flight: Verifying asset identities for configured pairs...")
+	for _, pair := range cfg.Trading.AssetPairs {
+		symbol := strings.Split(pair, "/")[0]
+		_, err := assetMapper.GetIdentity(ctx, symbol)
+		if err != nil {
+			// This is a fatal error because the bot cannot function without knowing its assets.
+			return fmt.Errorf("pre-flight check failed: could not map asset '%s'. Please check symbol. Error: %w", symbol, err)
+		}
+	}
+	logger.LogInfo("Pre-Flight: All configured assets successfully mapped.")
 
 	var activeDPs []dataprovider.DataProvider
 	logger.LogInfo("Pre-Flight: Initializing and priming external data providers...")
@@ -334,22 +413,21 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 		}
 	}
 
-	// 3. If there are any orphaned pairs, fetch ALL trade history ONCE (with pair="") for the lookback period.
-	var allTrades []broker.Trade
-	if len(orphanedPairs) > 0 {
-		lookbackDuration := 90 * 24 * time.Hour // Consider lowering to 30*24*time.Hour if positions aren't old.
-		startTime := time.Now().Add(-lookbackDuration)
-		var err error
-		allTrades, err = krakenAdapter.GetTrades(ctx, "", startTime) // Fetch ALL trades across pairs.
-		if err != nil {
-			return fmt.Errorf("reconciliation failed: could not get all trade history from broker: %w", err)
-		}
-		logger.LogInfo("Reconciliation: Fetched %d trades across all pairs for reconstruction.", len(allTrades))
-	}
-
-	// 4. For each orphaned pair, filter the trades and reconstruct.
+	// 3. For each orphaned pair, fetch its specific trade history and reconstruct it.
 	for _, assetPair := range orphanedPairs {
-		// Find the balance for this pair (from allBalances).
+		logger.LogInfo("Reconciliation: Found orphaned pair %s. Fetching its trade history...", assetPair)
+		lookbackDuration := 90 * 24 * time.Hour
+		startTime := time.Now().Add(-lookbackDuration)
+
+		// Fetch history ONLY for the specific orphaned pair.
+		pairTrades, err := krakenAdapter.GetTrades(ctx, assetPair, startTime)
+		if err != nil {
+			logger.LogFatal("Reconciliation failed for %s: could not get its trade history from broker: %v. Manual intervention required.", assetPair, err)
+			continue // Using LogFatal will stop the app, which is safer here. Use LogError to just skip.
+		}
+		logger.LogInfo("Reconciliation: Fetched %d trades for %s to attempt reconstruction.", len(pairTrades), assetPair)
+
+		// Find the current balance for this pair.
 		var actualBalance float64
 		baseCurrency := strings.Split(assetPair, "/")[0]
 		for _, bal := range allBalances {
@@ -359,15 +437,7 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 			}
 		}
 
-		// Filter allTrades for this specific assetPair.
-		var pairTrades []broker.Trade
-		for _, t := range allTrades {
-			if t.Pair == assetPair {
-				pairTrades = append(pairTrades, t)
-			}
-		}
-
-		// Reconstruct using the filtered trades (modified ReconstructOrphanedPosition below).
+		// Reconstruct using the fetched trades. No filtering is needed now.
 		reconstructedPos, reconErr := ReconstructOrphanedPosition(ctx, tempStateForRecon, assetPair, actualBalance, pairTrades)
 		if reconErr != nil {
 			logger.LogFatal("ORPHANED POSITION DETECTED for %s, but reconstruction failed: %v. Manual intervention required.", assetPair, reconErr)
@@ -386,6 +456,7 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 		config:                  cfg,
 		discordClient:           discordClient,
 		cache:                   sqliteCache,
+		assetMapper:             assetMapper,
 		activeDPs:               activeDPs,
 		providerNames:           providerNames,
 		peakPortfolioValue:      initialPortfolioValue,
@@ -397,6 +468,10 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 		takerFeeRate:            takerFee,
 		lastCMCFetch:            time.Time{},
 	}
+
+	// --- NEW: Start the sentiment updater ---
+	startSentimentUpdater(ctx, state, 30*time.Minute)
+
 	// Start the web server in a background goroutine
 	go web.StartWebServer(ctx, state)
 	// --- ADDED: Goroutine to refresh fees periodically ---
@@ -615,11 +690,7 @@ func processPendingOrders(ctx context.Context, state *TradingState) {
 			assetPair, isPending := state.pendingOrders[orderID]
 			if isPending {
 				updatePositionFromFill(state, order, assetPair)
-				if err := state.broker.CancelOrder(ctx, orderID); err != nil {
-					state.logger.LogError("PendingOrders: Failed to cancel partially filled order %s before re-placing: %v", orderID, err)
-					state.stateMutex.Unlock()
-					continue
-				}
+
 				tf := state.config.Consensus.MultiTimeframe.BaseTimeframe
 				krakenInterval, _ := utilities.ConvertTFToKrakenInterval(tf)
 				bars, barsErr := state.broker.GetLastNOHLCVBars(ctx, assetPair, krakenInterval, state.config.Indicators.ATRPeriod+1)
@@ -634,9 +705,12 @@ func processPendingOrders(ctx context.Context, state *TradingState) {
 					state.stateMutex.Unlock()
 					continue
 				}
-
 				remainingVol := order.RequestedVol - order.ExecutedVol
 				newPrice := strategy.HandlePartialFills(order.RequestedVol, order.ExecutedVol, order.Price, atr, 1.5)
+
+				if err := state.broker.CancelOrder(ctx, orderID); err != nil {
+					state.logger.LogError("PendingOrders: Failed to cancel partially filled order %s before re-placing: %v", orderID, err)
+				}
 
 				newOrderID, placeErr := state.broker.PlaceOrder(ctx, assetPair, order.Side, "limit", remainingVol, newPrice, 0, "")
 				if placeErr != nil {
@@ -646,6 +720,7 @@ func processPendingOrders(ctx context.Context, state *TradingState) {
 					state.pendingOrders[newOrderID] = assetPair
 					_ = state.cache.SavePendingOrder(newOrderID, assetPair)
 				}
+
 				delete(state.pendingOrders, orderID)
 				_ = state.cache.DeletePendingOrder(orderID)
 			}
@@ -758,10 +833,14 @@ func updatePositionFromFill(state *TradingState, order broker.Order, assetPair s
 func processTradingCycle(ctx context.Context, state *TradingState) {
 	state.logger.LogInfo("-------------------- New Trading Cycle --------------------")
 
+	//
+	// Pre-Cycle State & Safety Checks
+	//
+
 	state.stateMutex.RLock()
 	if state.isCircuitBreakerTripped {
 		state.stateMutex.RUnlock()
-		state.logger.LogWarn("Circuit breaker is active. Halting all new trading operations. Manual restart required.")
+		state.logger.LogWarn("Circuit breaker is active. Halting all new trading operations.")
 		return
 	}
 	state.stateMutex.RUnlock()
@@ -778,6 +857,7 @@ func processTradingCycle(ctx context.Context, state *TradingState) {
 	}
 	state.stateMutex.Unlock()
 
+	// Circuit Breaker Drawdown Check
 	if state.config.CircuitBreaker.Enabled && state.peakPortfolioValue > 0 {
 		drawdownPercent := state.config.CircuitBreaker.DrawdownThresholdPercent / 100.0
 		drawdownThresholdValue := state.peakPortfolioValue * (1.0 - drawdownPercent)
@@ -793,10 +873,15 @@ func processTradingCycle(ctx context.Context, state *TradingState) {
 		}
 	}
 
+	//
+	// Data Fetching & Maintenance
+	//
+
+	// Fetch Global Market Data (less frequently)
 	if time.Since(state.lastGlobalMetricsFetch) > 30*time.Minute {
 		state.logger.LogInfo("GlobalMetrics: Fetching updated global market data...")
 		if len(state.activeDPs) > 0 {
-			provider := state.activeDPs[0]
+			provider := state.activeDPs[0] // Use primary provider for this
 			globalData, err := provider.GetGlobalMarketData(ctx)
 			if err != nil {
 				state.logger.LogError("GlobalMetrics: Failed to fetch global data: %v", err)
@@ -810,25 +895,95 @@ func processTradingCycle(ctx context.Context, state *TradingState) {
 		}
 	}
 
+	// Fetch Gainers/Losers for Market Sentiment (less frequently to save API credits)
+	if time.Since(state.lastGainersLosersFetch) > 25*time.Minute {
+		state.logger.LogInfo("Market Sentiment: Updating top gainers and losers from CoinMarketCap...")
+		var cmcProvider dataprovider.DataProvider
+		for dp, name := range state.providerNames {
+			if name == "coinmarketcap" {
+				cmcProvider = dp
+				break
+			}
+		}
+
+		if cmcProvider != nil {
+			// Fetch top 50 to get a good sample size for the ratio calculation
+			gainers, losers, err := cmcProvider.GetGainersAndLosers(ctx, state.config.Trading.QuoteCurrency, 50)
+			if err != nil {
+				state.logger.LogError("Market Sentiment: Failed to fetch gainers/losers: %v", err)
+			} else {
+				state.stateMutex.Lock()
+				state.topGainers = gainers
+				state.topLosers = losers
+				state.lastGainersLosersFetch = time.Now()
+				state.stateMutex.Unlock()
+				state.logger.LogInfo("Market Sentiment: Successfully updated gainers/losers data.")
+			}
+		}
+	}
+
 	processPendingOrders(ctx, state)
 	reapStaleOrders(ctx, state)
 
-	// [MODIFIED] Get the current FNG value once per cycle.
+	//
+	// Asset Scanning & Strategy Execution
+	//
+
 	currentFNGValue := getCurrentFNG().Value
 
-	// --- Thread-Safe Configuration Snapshot ---
+	// --- Thread-Safe Configuration & Asset List Snapshot ---
 	state.stateMutex.RLock()
-	// Create a snapshot of the config and asset pairs for this cycle.
-	// This prevents the config from changing mid-cycle if updated via the UI.
 	cycleConfig := *state.config
-	assetPairsForCycle := make([]string, len(cycleConfig.Trading.AssetPairs))
-	copy(assetPairsForCycle, cycleConfig.Trading.AssetPairs)
+	staticAssetPairs := make([]string, len(cycleConfig.Trading.AssetPairs))
+	copy(staticAssetPairs, cycleConfig.Trading.AssetPairs)
 	state.stateMutex.RUnlock()
-	// --- End Snapshot ---
 
-	for _, assetPair := range assetPairsForCycle {
-		// Modulate the *copied* config for this specific trading cycle.
-		activeAppConfig := cycleConfig // Start with the snapshot
+	finalAssetPairs := staticAssetPairs // Start with the static list from config
+
+	if cycleConfig.Trading.UseDynamicAssetScanning {
+		state.logger.LogInfo("Dynamic Scanning: Enabled. Fetching top %d assets.", cycleConfig.Trading.DynamicAssetScanTopN)
+		var provider dataprovider.DataProvider
+		// Prefer CoinGecko for this as it's generally faster for market cap lists
+		for dp, name := range state.providerNames {
+			if name == "coingecko" {
+				provider = dp
+				break
+			}
+		}
+
+		if provider != nil {
+			dynamicAssetPairs, err := provider.GetTopAssetsByMarketCap(ctx, cycleConfig.Trading.QuoteCurrency, cycleConfig.Trading.DynamicAssetScanTopN)
+			if err != nil {
+				state.logger.LogError("Dynamic Scanning: Failed to fetch top assets: %v. Using static list only.", err)
+			} else {
+				uniquePairs := make(map[string]bool)
+				for _, pair := range staticAssetPairs {
+					uniquePairs[pair] = true
+				}
+				for _, pair := range dynamicAssetPairs {
+					if _, exists := uniquePairs[pair]; !exists {
+						// Pre-flight check the discovered asset before adding it to the trading list
+						symbol := strings.Split(pair, "/")[0]
+						_, mapErr := state.assetMapper.GetIdentity(ctx, symbol)
+						if mapErr != nil {
+							state.logger.LogWarn("Dynamic Scanning: Could not map discovered asset '%s', skipping. Reason: %v", pair, mapErr)
+							continue
+						}
+						finalAssetPairs = append(finalAssetPairs, pair)
+						uniquePairs[pair] = true
+					}
+				}
+				state.logger.LogInfo("Dynamic Scanning: Combined asset list now contains %d unique pairs.", len(finalAssetPairs))
+			}
+		} else {
+			state.logger.LogWarn("Dynamic Scanning: No suitable provider (CoinGecko) found to perform scan.")
+		}
+	}
+
+	// --- CRITICAL FIX: Iterate over the 'finalAssetPairs' list ---
+	for _, assetPair := range finalAssetPairs {
+		// Modulate the config for this specific trading cycle based on Fear & Greed index
+		activeAppConfig := cycleConfig
 		activeAppConfig.Trading = modulateConfigBySentiment(cycleConfig.Trading, currentFNGValue, state.logger)
 
 		consolidatedData, err := gatherConsolidatedData(ctx, state, assetPair, currentPortfolioValue)
@@ -838,41 +993,34 @@ func processTradingCycle(ctx context.Context, state *TradingState) {
 		}
 
 		stratInstance := strategy.NewStrategy(state.logger)
-		// [MODIFIED] Pass the new sentiment-adjusted config to the strategy.
 		signals, _ := stratInstance.GenerateSignals(ctx, *consolidatedData, activeAppConfig)
 
+		// Logging the outcome of the signal generation
 		if len(signals) > 0 && signals[0].Direction != "hold" {
 			mainSignal := signals[0]
-			state.logger.LogInfo("GenerateSignals: %s -> %s - Reason: %s", assetPair, strings.ToUpper(mainSignal.Direction), mainSignal.Reason)
+			state.logger.LogInfo("Signal [%s]: %s -> Reason: %s", assetPair, utilities.ColorCyan+strings.ToUpper(mainSignal.Direction)+utilities.ColorReset, mainSignal.Reason)
 		} else {
-			holdReason := "Conditions for buy/sell not met."
-			if len(signals) > 0 {
-				holdReason = signals[0].Reason
-			}
-			state.logger.LogInfo("GenerateSignals: %s -> HOLD - Reason: %s", assetPair, holdReason)
+			state.logger.LogInfo("Signal [%s]: %s", assetPair, utilities.ColorWhite+"HOLD"+utilities.ColorReset)
 		}
 
 		state.stateMutex.RLock()
 		position, hasPosition := state.openPositions[assetPair]
 		state.stateMutex.RUnlock()
 
+		// Check if the position is effectively dust, allowing a new entry to be sought
 		isEffectivelyDust := false
 		if hasPosition {
 			var currentPrice float64
 			for _, pData := range consolidatedData.ProvidersData {
+				// Use the broker's price for the most accurate dust calculation
 				if pData.Name == "kraken" {
 					currentPrice = pData.CurrentPrice
 					break
 				}
 			}
-
 			if currentPrice > 0 {
 				positionValueUSD := position.TotalVolume * currentPrice
-				// [MODIFIED] Use the active (potentially modulated) config for dust threshold.
-				dustThreshold := 1.0
-				if activeAppConfig.Trading.DustThresholdUSD > 0 {
-					dustThreshold = activeAppConfig.Trading.DustThresholdUSD
-				}
+				dustThreshold := activeAppConfig.Trading.DustThresholdUSD
 				if positionValueUSD < dustThreshold {
 					isEffectivelyDust = true
 					state.logger.LogInfo("Position for %s is considered dust (value: $%.4f). Allowing new entry check.", assetPair, positionValueUSD)
@@ -881,10 +1029,8 @@ func processTradingCycle(ctx context.Context, state *TradingState) {
 		}
 
 		if hasPosition && !isEffectivelyDust {
-			// [MODIFIED] Pass the sentiment-adjusted config.
 			manageOpenPosition(ctx, state, position, signals, consolidatedData, &activeAppConfig)
 		} else {
-			// [MODIFIED] Pass the sentiment-adjusted config.
 			seekEntryOpportunity(ctx, state, assetPair, signals, consolidatedData, &activeAppConfig)
 		}
 	}
@@ -1046,45 +1192,34 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 	if pos.IsDcaActive && pos.FilledSafetyOrders < cfg.Trading.MaxSafetyOrders {
 		var shouldPlaceSafetyOrder bool
 		var nextSafetyOrderPrice float64
-		if cfg.Trading.DcaSpacingMode == "atr" {
-			state.logger.LogDebug("ManagePosition [%s]: Using ATR spacing mode.", pos.AssetPair)
-			tf := cfg.Consensus.MultiTimeframe.BaseTimeframe
-			krakenInterval, _ := utilities.ConvertTFToKrakenInterval(tf)
-			bars, err := state.broker.GetLastNOHLCVBars(ctx, pos.AssetPair, krakenInterval, cfg.Trading.DcaAtrPeriod+1)
-			if err != nil || len(bars) < cfg.Trading.DcaAtrPeriod+1 {
-				state.logger.LogError("ManagePosition [%s]: Could not fetch enough bars for ATR calculation: %v", pos.AssetPair, err)
-			} else {
-				atrValue, err := strategy.CalculateATR(bars, cfg.Trading.DcaAtrPeriod)
-				if err != nil {
-					state.logger.LogError("ManagePosition [%s]: Error calculating ATR: %v", pos.AssetPair, err)
-				} else {
-					// [MODIFIED] Use the sentiment-adjusted ATR spacing multiplier.
-					priceDeviation := atrValue * cfg.Trading.DcaAtrSpacingMultiplier * math.Pow(cfg.Trading.SafetyOrderStepScale, float64(pos.FilledSafetyOrders))
-					lastFilledPrice := pos.AveragePrice
-					if pos.FilledSafetyOrders == 0 {
-						lastFilledPrice = pos.BaseOrderPrice
-					}
-					nextSafetyOrderPrice = lastFilledPrice - priceDeviation
-					if currentPrice <= nextSafetyOrderPrice {
-						shouldPlaceSafetyOrder = true
-					}
-				}
-			}
+
+		// === SMA-BASED DCA LOGIC ===
+		state.logger.LogDebug("ManagePosition [%s]: Using SMA-based DCA spacing.", pos.AssetPair)
+
+		// Fetch the necessary OHLCV bars for the SMA calculation.
+		tf := cfg.Consensus.MultiTimeframe.BaseTimeframe
+		krakenInterval, _ := utilities.ConvertTFToKrakenInterval(tf)
+		bars, err := state.broker.GetLastNOHLCVBars(ctx, pos.AssetPair, krakenInterval, cfg.Trading.SMAPeriodForDCA)
+		if err != nil || len(bars) < cfg.Trading.SMAPeriodForDCA {
+			state.logger.LogError("ManagePosition [%s]: Could not fetch enough bars for SMA calculation: %v", pos.AssetPair, err)
 		} else {
-			state.logger.LogDebug("ManagePosition [%s]: Using percentage spacing mode.", pos.AssetPair)
-			nextSONumber := pos.FilledSafetyOrders + 1
-			var totalDeviationPercentage float64
-			currentStep := cfg.Trading.PriceDeviationToOpenSafetyOrders
-			for i := 0; i < nextSONumber; i++ {
-				totalDeviationPercentage += currentStep
-				currentStep *= cfg.Trading.SafetyOrderStepScale
-			}
-			nextSafetyOrderPrice = pos.BaseOrderPrice * (1 - (totalDeviationPercentage / 100.0))
+			// Extract the close prices and calculate the SMA.
+			closePrices := strategy.ExtractCloses(bars)
+			smaValue := strategy.CalculateSMA(closePrices, cfg.Trading.SMAPeriodForDCA)
+
+			// The trigger for a new safety order is a dip to the SMA level.
+			// The price for the order is set at a small deviation below the SMA to act as a limit order.
+			smaDeviationPercent := cfg.Trading.PriceDeviationToOpenSafetyOrders
+			nextSafetyOrderPrice = smaValue * (1 - (smaDeviationPercent / 100.0))
+
+			// Check if the current price is at or below this target.
 			if currentPrice <= nextSafetyOrderPrice {
 				shouldPlaceSafetyOrder = true
+				state.logger.LogInfo("ManagePosition [%s]: DCA trigger. Price (%.2f) at or below SMA target (%.2f).", pos.AssetPair, currentPrice, nextSafetyOrderPrice)
 			}
 		}
 
+		// === END OF NEW LOGIC ===
 		if shouldPlaceSafetyOrder {
 			strategicSafetyPrice := strategy.FindBestLimitPrice(consolidatedData.BrokerOrderBook, nextSafetyOrderPrice, 0.5)
 			if strategicSafetyPrice != nextSafetyOrderPrice {
@@ -1126,6 +1261,162 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 		}
 	}
 }
+func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair string, portfolioValue float64) (*strategy.ConsolidatedMarketPicture, error) {
+	// --- 1. Get the unified Asset Identity from the mapper ---
+	baseAssetSymbol := strings.Split(assetPair, "/")[0]
+	identity, err := state.assetMapper.GetIdentity(ctx, baseAssetSymbol)
+	if err != nil {
+		return nil, fmt.Errorf("gatherConsolidatedData: could not get asset identity for %s: %w", baseAssetSymbol, err)
+	}
+
+	// --- 2. Initialize data containers and get a config snapshot ---
+	state.stateMutex.RLock()
+	cfg := *state.config
+	// Pre-allocate slice capacity for better performance
+	providersData := make([]strategy.ProviderData, 0, 1+len(state.activeDPs))
+	// Grab data that is updated by background tasks
+	btcDominance := state.lastBTCDominance
+	peakPortfolioValue := state.peakPortfolioValue
+	gainers := state.topGainers
+	losers := state.topLosers
+	cgTrending := state.cgTrendingData
+	cmcTrending := state.cmcTrendingData
+	state.stateMutex.RUnlock()
+
+	// --- 3. Fetch all primary data from the broker (Kraken) ---
+	// This data is critical, so we fetch it first and fail fast if it's unavailable.
+	krakenTicker, tickerErr := state.broker.GetTicker(ctx, assetPair)
+	if tickerErr != nil {
+		// A live price is essential, so we return an error if it fails.
+		return nil, fmt.Errorf("could not get ticker from broker for %s: %w", assetPair, tickerErr)
+	}
+
+	krakenOrderBook, obErr := state.broker.GetOrderBook(ctx, assetPair, 50) // Deeper book for better analysis
+	if obErr != nil {
+		state.logger.LogWarn("gatherConsolidatedData [%s]: could not get order book from broker: %v", assetPair, obErr)
+	}
+
+	// Fetch all required OHLCV timeframes from the broker.
+	tfCfg := cfg.Consensus.MultiTimeframe
+	allTFs := append([]string{tfCfg.BaseTimeframe}, tfCfg.AdditionalTimeframes...)
+	krakenOHLCVByTF := make(map[string][]utilities.OHLCVBar)
+	for idx, tfString := range allTFs {
+		if idx >= len(tfCfg.TFLookbackLengths) {
+			break
+		}
+		lookback := tfCfg.TFLookbackLengths[idx]
+		krakenInterval, _ := utilities.ConvertTFToKrakenInterval(tfString)
+		bars, err := state.broker.GetLastNOHLCVBars(ctx, assetPair, krakenInterval, lookback)
+		if err != nil {
+			state.logger.LogWarn("gatherConsolidatedData [%s]: broker failed to provide '%s' OHLCV: %v", assetPair, tfString, err)
+			continue
+		}
+		krakenOHLCVByTF[tfString] = bars
+	}
+
+	// Add the complete broker data as the first provider.
+	providersData = append(providersData, strategy.ProviderData{
+		Name:         "kraken",
+		Weight:       cfg.DataProviderWeights["kraken"],
+		CurrentPrice: krakenTicker.LastPrice,
+		OHLCVByTF:    krakenOHLCVByTF,
+	})
+
+	// --- 4. Concurrently fetch data from all other external providers ---
+	var wg sync.WaitGroup
+	var providerMutex sync.Mutex // To safely append to the providersData slice
+
+	for _, dp := range state.activeDPs {
+		wg.Add(1)
+		go func(provider dataprovider.DataProvider) {
+			defer wg.Done()
+			providerName := state.providerNames[provider]
+			var providerCoinID string
+
+			switch providerName {
+			case "coingecko":
+				providerCoinID = identity.CoinGeckoID
+			case "coinmarketcap":
+				providerCoinID = identity.CoinMarketCapID
+			default:
+				return // Skip unknown providers
+			}
+
+			if providerCoinID == "N/A" || providerCoinID == "" {
+				return
+			}
+
+			// Fetch Market Data (Current Price)
+			extMarketData, mdErr := provider.GetMarketData(ctx, []string{providerCoinID}, cfg.Trading.QuoteCurrency)
+			if mdErr != nil || len(extMarketData) == 0 {
+				state.logger.LogWarn("gatherConsolidatedData [%s]: Provider %s failed to get market data for ID %s: %v", assetPair, providerName, providerCoinID, mdErr)
+				return
+			}
+
+			// Fetch OHLCV data for all timeframes
+			extOHLCVByTF := make(map[string][]utilities.OHLCVBar)
+			for _, tfString := range allTFs {
+				bars, ohlcvErr := provider.GetOHLCVHistorical(ctx, providerCoinID, cfg.Trading.QuoteCurrency, tfString)
+				if ohlcvErr != nil {
+					continue // Skip timeframe on error
+				}
+				extOHLCVByTF[tfString] = bars
+			}
+
+			providerMutex.Lock()
+			providersData = append(providersData, strategy.ProviderData{
+				Name:         providerName,
+				Weight:       cfg.DataProviderWeights[providerName],
+				CurrentPrice: extMarketData[0].CurrentPrice,
+				OHLCVByTF:    extOHLCVByTF,
+			})
+			providerMutex.Unlock()
+		}(dp)
+	}
+	wg.Wait() // Wait for all external providers to finish
+
+	// --- 5. Perform Analyses & Assemble Final Picture ---
+	// Fetch cross-exchange liquidity data from CoinGecko
+	var aggregatedMetrics strategy.AggregatedLiquidityMetrics
+	for _, dp := range state.activeDPs {
+		if state.providerNames[dp] == "coingecko" {
+			tickers, tickersErr := dp.GetAllTickersForAsset(ctx, identity.CoinGeckoID)
+			if tickersErr != nil {
+				state.logger.LogWarn("Could not fetch all tickers for %s to perform liquidity analysis: %v", assetPair, tickersErr)
+			} else {
+				aggregatedMetrics = strategy.CalculateAggregatedLiquidity(tickers, "Kraken") // Use Kraken as the reference exchange name
+			}
+			break
+		}
+	}
+
+	// Calculate the market sentiment score from cached gainer/loser data
+	marketSentiment := strategy.CalculateMarketSentiment(gainers, losers, state.logger)
+
+	// Assemble the final data structure
+	consolidatedData := &strategy.ConsolidatedMarketPicture{
+		AssetPair:           assetPair,
+		ProvidersData:       providersData,
+		BTCDominance:        btcDominance,
+		FearGreedIndex:      getCurrentFNG(),
+		PortfolioValue:      portfolioValue,
+		PeakPortfolioValue:  peakPortfolioValue,
+		BrokerOrderBook:     krakenOrderBook,
+		PrimaryOHLCVByTF:    krakenOHLCVByTF,       // Storing broker's data separately for direct access
+		DailyOHLCV:          krakenOHLCVByTF["1d"], // Use broker's daily data for consistency
+		AggregatedLiquidity: aggregatedMetrics,
+		CgTrendingData:      cgTrending,
+		CmcTrendingData:     cmcTrending,
+		MarketSentiment:     marketSentiment, // Include the new sentiment score
+	}
+
+	// --- 6. Final Verification ---
+	if _, ok := consolidatedData.PrimaryOHLCVByTF[tfCfg.BaseTimeframe]; !ok {
+		return nil, errors.New("could not fetch base timeframe OHLCV data from broker; cannot proceed")
+	}
+
+	return consolidatedData, nil
+}
 
 // seekEntryOpportunity evaluates signals to open a new position.
 // This is the corrected version of the function.
@@ -1133,6 +1424,19 @@ func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair st
 	for _, sig := range signals {
 		if strings.EqualFold(sig.Direction, "buy") || strings.EqualFold(sig.Direction, "predictive_buy") {
 			state.logger.LogInfo("SeekEntry [%s]: %s signal confirmed. Calculating order...", assetPair, strings.ToUpper(sig.Direction))
+			// Get the primary bars from the consolidated data to check for bearish confluence.
+			primaryBars, ok := consolidatedData.PrimaryOHLCVByTF[cfg.Consensus.MultiTimeframe.BaseTimeframe]
+			if !ok {
+				state.logger.LogError("SeekEntry [%s]: Missing primary bars for bearish check. Aborting buy.", assetPair)
+				continue
+			}
+
+			// Perform the bearish confluence check.
+			isBearish, reason := strategy.CheckBearishConfluence(primaryBars, *cfg)
+			if isBearish {
+				state.logger.LogWarn("SeekEntry [%s]: Buy signal ignored. Reason: Bearish confluence detected: %s", assetPair, reason)
+				continue // Skip the rest of the loop and don't place a buy order.
+			}
 
 			var orderPrice float64
 			var orderSizeInBase float64
@@ -1149,12 +1453,24 @@ func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair st
 				continue
 			}
 
+			// Check for a buy signal and then apply the SMA filter
 			if strings.EqualFold(sig.Direction, "buy") {
-				orderPrice = sig.RecommendedPrice
-				orderSizeInBase = sig.CalculatedSize
-				if cfg.Trading.ConsensusBuyMultiplier > 1.0 {
-					orderSizeInBase *= cfg.Trading.ConsensusBuyMultiplier
-					state.logger.LogInfo("SeekEntry [%s]: Applying x%.2f multiplier to consensus buy. New size: %.4f", assetPair, cfg.Trading.ConsensusBuyMultiplier, orderSizeInBase)
+				// Extract close prices for SMA calculation.
+				// You'll need to define a SMA period in your config.json, let's use a 50-period SMA as an example.
+				closePrices := strategy.ExtractCloses(primaryBars)
+				sma50 := strategy.CalculateSMA(closePrices, 50)
+
+				// Define a tolerance for the SMA check, e.g., 2% of the SMA value.
+				smaTolerance := sma50 * 0.02
+
+				if currentPrice <= (sma50+smaTolerance) && currentPrice >= (sma50-smaTolerance) {
+					// If the price is near the SMA, set the order price to the SMA level.
+					orderPrice = sma50
+					orderSizeInBase = cfg.Trading.BaseOrderSize / orderPrice
+					state.logger.LogInfo("SeekEntry [%s]: SMA confluence found. Placing order at SMA50: %.2f", assetPair, orderPrice)
+				} else {
+					state.logger.LogInfo("SeekEntry [%s]: Buy signal met, but price not near SMA50. Holding.", assetPair)
+					continue
 				}
 			} else { // This is a "predictive_buy"
 				orderPrice = sig.RecommendedPrice
@@ -1218,126 +1534,6 @@ func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair st
 		}
 	}
 }
-func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair string, currentPortfolioValue float64) (*strategy.ConsolidatedMarketPicture, error) {
-	// --- 1. Initialize the data container ---
-	state.stateMutex.RLock()
-	consolidatedData := &strategy.ConsolidatedMarketPicture{
-		AssetPair:          assetPair,
-		ProvidersData:      make([]strategy.ProviderData, 0, 1+len(state.activeDPs)),
-		BTCDominance:       state.lastBTCDominance,
-		FearGreedIndex:     getCurrentFNG(),
-		PortfolioValue:     currentPortfolioValue,
-		PeakPortfolioValue: state.peakPortfolioValue,
-		PrimaryOHLCVByTF:   make(map[string][]utilities.OHLCVBar),
-	}
-	state.stateMutex.RUnlock()
-
-	// --- 2. Fetch primary data from the broker (Kraken) ---
-	// Ticker for the most recent price.
-	krakenTicker, tickerErr := state.broker.GetTicker(ctx, assetPair)
-	if tickerErr != nil {
-		// Log as a warning because other providers might have the price.
-		state.logger.LogWarn("gatherConsolidatedData [%s]: could not get ticker from broker: %v", assetPair, tickerErr)
-	}
-
-	// Order book for liquidity analysis.
-	krakenOrderBook, obErr := state.broker.GetOrderBook(ctx, assetPair, 20)
-	if obErr != nil {
-		state.logger.LogWarn("gatherConsolidatedData [%s]: could not get order book from broker: %v", assetPair, obErr)
-	}
-	consolidatedData.BrokerOrderBook = krakenOrderBook
-
-	// --- 3. Fetch all required OHLCV timeframes from the broker ---
-	tfCfg := state.config.Consensus.MultiTimeframe
-	allTFs := append([]string{tfCfg.BaseTimeframe}, tfCfg.AdditionalTimeframes...)
-
-	for idx, tfString := range allTFs {
-		if idx >= len(tfCfg.TFLookbackLengths) {
-			state.logger.LogWarn("gatherConsolidatedData [%s]: Mismatch between timeframes and lookback lengths in config. Stopping fetch.", assetPair)
-			break
-		}
-		lookback := tfCfg.TFLookbackLengths[idx]
-		krakenInterval, intervalErr := utilities.ConvertTFToKrakenInterval(tfString)
-		if intervalErr != nil {
-			state.logger.LogError("gatherConsolidatedData [%s]: Invalid interval '%s' for broker: %v", assetPair, tfString, intervalErr)
-			continue
-		}
-
-		bars, barsErr := state.broker.GetLastNOHLCVBars(ctx, assetPair, krakenInterval, lookback)
-		if barsErr != nil {
-			state.logger.LogError("gatherConsolidatedData [%s]: Broker failed to provide OHLCV for %s: %v", assetPair, tfString, barsErr)
-			continue // Skip this timeframe if it fails
-		}
-		// This map holds the data from the primary source (the broker).
-		consolidatedData.PrimaryOHLCVByTF[tfString] = bars
-	}
-
-	// --- 4. Verify we have the essential base timeframe data from the broker ---
-	if _, ok := consolidatedData.PrimaryOHLCVByTF[tfCfg.BaseTimeframe]; !ok {
-		return nil, errors.New("could not fetch base timeframe OHLCV data from broker; cannot proceed")
-	}
-
-	// --- 5. Add the broker's complete data to the list of providers ---
-	// This uses the new `OHLCVByTF` map field in the ProviderData struct.
-	consolidatedData.ProvidersData = append(consolidatedData.ProvidersData, strategy.ProviderData{
-		Name:         "kraken",
-		Weight:       state.config.DataProviderWeights["kraken"],
-		CurrentPrice: krakenTicker.LastPrice,
-		OHLCVByTF:    consolidatedData.PrimaryOHLCVByTF,
-	})
-
-	// --- 6. Fetch data from all other active external providers (CoinGecko, CoinMarketCap, etc.) ---
-	baseAssetSymbol := strings.Split(assetPair, "/")[0]
-	for _, dp := range state.activeDPs {
-		providerName := state.providerNames[dp]
-		shouldThrottleCMC := providerName == "coinmarketcap" && time.Since(state.lastCMCFetch) < 30*time.Minute
-		if shouldThrottleCMC {
-			state.logger.LogInfo("gatherConsolidatedData [%s]: Throttling CMC—last pull was recent (%s ago). Relying on internal provider cache to avoid unnecessary API calls.", assetPair, time.Since(state.lastCMCFetch))
-		}
-		providerCoinID, idErr := dp.GetCoinID(ctx, baseAssetSymbol)
-		if idErr != nil {
-			state.logger.LogError("gatherConsolidatedData [%s]: Could not get coin ID for provider %s: %v", assetPair, providerName, idErr)
-			continue
-		}
-		// Get the current price from this provider.
-		extMarketData, mdErr := dp.GetMarketData(ctx, []string{providerCoinID}, state.config.Trading.QuoteCurrency)
-		var currentPrice float64
-		if mdErr == nil && len(extMarketData) > 0 {
-			currentPrice = extMarketData[0].CurrentPrice
-		} else if mdErr != nil {
-			state.logger.LogWarn("gatherConsolidatedData [%s]: Provider %s failed to get market data: %v", assetPair, providerName, mdErr)
-		}
-
-		// **THE FIX**: For each external provider, fetch all configured timeframes.
-		extOHLCVByTF := make(map[string][]utilities.OHLCVBar)
-		for _, tfString := range allTFs {
-			bars, ohlcvErr := dp.GetOHLCVHistorical(ctx, providerCoinID, state.config.Trading.QuoteCurrency, tfString)
-			if ohlcvErr != nil {
-				state.logger.LogWarn("gatherConsolidatedData [%s]: Provider %s failed to get OHLCV for %s: %v", assetPair, providerName, tfString, ohlcvErr)
-				continue // Skip this timeframe, but try the next one
-			}
-			extOHLCVByTF[tfString] = bars
-		}
-
-		// Add this provider's complete data to the list.
-		consolidatedData.ProvidersData = append(consolidatedData.ProvidersData, strategy.ProviderData{
-			Name:         providerName,
-			Weight:       state.config.DataProviderWeights[providerName],
-			CurrentPrice: currentPrice,
-			OHLCVByTF:    extOHLCVByTF,
-		})
-
-		// Update timestamp ONLY for CMC and if not throttled (i.e., an actual fetch likely occurred) and no major errors
-		if providerName == "coinmarketcap" && !shouldThrottleCMC && mdErr == nil {
-			// Additional check: Assume success if at least one timeframe fetched without error (simplified; could check all)
-			state.stateMutex.Lock()
-			state.lastCMCFetch = time.Now()
-			state.stateMutex.Unlock()
-		}
-	}
-
-	return consolidatedData, nil
-}
 func liquidateAllPositions(ctx context.Context, state *TradingState, reason string) {
 	state.stateMutex.Lock()
 	defer state.stateMutex.Unlock()
@@ -1400,8 +1596,6 @@ func calculateFeeAwareTakeProfitPrice(pos *utilities.Position, state *TradingSta
 
 // --- web.AppController Interface Implementation ---
 
-// GetDashboardData returns a snapshot of data needed for the web dashboard.
-// GetDashboardData is updated to calculate and include P/L data itself for performance.
 func (s *TradingState) GetDashboardData(ctx context.Context) web.DashboardData {
 	// --- Step 1: Get live account value from the broker ---
 	// MODIFIED: Use the 'ctx' from the function argument instead of context.TODO()
@@ -1458,9 +1652,6 @@ func (s *TradingState) GetDashboardData(ctx context.Context) web.DashboardData {
 		TotalUnrealizedPL: totalPL,
 	}
 }
-
-// GetAssetDetailData implements the missing method for the web.AppController interface.
-// This resolves the compiler error.
 func (s *TradingState) GetAssetDetailData(assetPair string) (web.AssetDetailData, error) {
 	s.stateMutex.RLock()
 	var positionCopy *utilities.Position

@@ -1,5 +1,5 @@
 {
-  "version": "3.2.0",
+  "version": "4.0.0",
   "logging": {
     "level": "info"
   },
@@ -60,9 +60,10 @@
   "trading": {
     "asset_pairs": [
       "BTC/USD",
-      "ETH/USD",
-      "SOL/USD"
+      "ETH/USD"
     ],
+    "use_dynamic_asset_scanning": true,
+    "dynamic_asset_scan_top_n": 25,
     "trailing_stop_enabled": true,
     "take_profit_partial_sell_percent": 50.0,
     "trailing_stop_deviation": 1.5,
@@ -84,6 +85,8 @@
     "consensus_buy_multiplier": 2.0,
     "predictive_rsi_threshold": 50,
     "rsi_adjust_factor": 5.0,
+    "sma_period_for_dca": 50,
+    "sma_periods_for_exit": [50, 200],
     "use_fear_override": true,
     "fear_override_threshold": 25
 },
@@ -134,6 +137,7 @@
   },
   "circuit_breaker": {
     "enabled": true,
-    "drawdown_threshold_percent": 10
+    "drawdown_threshold_percent": 10,
+    "atr_volatility_threshold": 0.0
   }
 }

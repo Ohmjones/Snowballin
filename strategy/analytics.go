@@ -1,24 +1,126 @@
 package strategy
 
 import (
+	"Snowballin/dataprovider"
 	"Snowballin/pkg/broker"
 	"Snowballin/utilities"
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 )
 
-// --- NEW: A struct to hold the results of a detailed order book analysis ---
 type OrderBookAnalysis struct {
 	DepthScore       float64            // The original -1.0 to 1.0 score indicating buy/sell pressure.
 	SupportLevels    []SignificantLevel // A list of price levels with unusually high bid volume (buy walls).
 	ResistanceLevels []SignificantLevel // A list of price levels with unusually high ask volume (sell walls).
 }
 
-// --- NEW: Represents a specific price level with significant volume ---
 type SignificantLevel struct {
 	PriceLevel float64
 	Volume     float64
+}
+
+// SentimentConsensus holds the result of a cross-provider analysis of an asset's social traction.
+type SentimentConsensus struct {
+	IsTrending     bool     // True if the asset is trending on a consensus basis.
+	AttentionScore float64  // A weighted score from 0.0 to 1.0 indicating the level of consensus.
+	TrendingOn     []string // A list of providers where the asset is trending.
+}
+
+// CalculateSentimentConsensus checks if a specific asset symbol is present in the trending lists
+// from multiple data providers and calculates a weighted attention score.
+func CalculateSentimentConsensus(
+	assetSymbol string,
+	cgTrending []dataprovider.TrendingCoin,
+	cmcTrending []dataprovider.TrendingCoin,
+	logger *utilities.Logger,
+) SentimentConsensus {
+
+	// Define the weights for each provider.
+	weights := map[string]float64{
+		"coingecko":     0.51,
+		"coinmarketcap": 0.49,
+	}
+
+	var attentionScore float64
+	var trendingOn []string
+	upperAssetSymbol := strings.ToUpper(assetSymbol)
+
+	// Check CoinGecko's list
+	for _, coin := range cgTrending {
+		if strings.ToUpper(coin.Coin.Symbol) == upperAssetSymbol {
+			attentionScore += weights["coingecko"]
+			trendingOn = append(trendingOn, "CoinGecko")
+			logger.LogInfo("Sentiment Check [%s]: Asset is trending on CoinGecko.", assetSymbol)
+			break // Stop after finding a match
+		}
+	}
+
+	// Check CoinMarketCap's list
+	for _, coin := range cmcTrending {
+		if strings.ToUpper(coin.Coin.Symbol) == upperAssetSymbol {
+			attentionScore += weights["coinmarketcap"]
+			trendingOn = append(trendingOn, "CoinMarketCap")
+			logger.LogInfo("Sentiment Check [%s]: Asset is trending on CoinMarketCap.", assetSymbol)
+			break // Stop after finding a match
+		}
+	}
+
+	// The threshold for consensus can be adjusted. Here, we consider it "trending"
+	// if it appears on at least one major provider (score > 0.49).
+	isTrending := attentionScore > 0.49
+
+	return SentimentConsensus{
+		IsTrending:     isTrending,
+		AttentionScore: attentionScore,
+		TrendingOn:     trendingOn,
+	}
+}
+
+// CalculateMarketSentiment analyzes top gainers and losers to create a market sentiment score.
+func CalculateMarketSentiment(gainers []dataprovider.MarketData, losers []dataprovider.MarketData, logger *utilities.Logger) MarketSentiment {
+	if len(gainers) == 0 || len(losers) == 0 {
+		return MarketSentiment{State: "Neutral", Score: 0, Message: "Insufficient gainer/loser data."}
+	}
+
+	// Define what constitutes a "significant" move.
+	const significantMoveThreshold = 5.0 // 5%
+
+	var significantGainers, significantLosers int
+
+	for _, gainer := range gainers {
+		if gainer.PriceChange24h > significantMoveThreshold {
+			significantGainers++
+		}
+	}
+
+	for _, loser := range losers {
+		// PriceChange24h for losers will be negative.
+		if loser.PriceChange24h < -significantMoveThreshold {
+			significantLosers++
+		}
+	}
+
+	// Avoid division by zero if there are no significant losers.
+	if significantLosers == 0 {
+		if significantGainers > 5 { // If we have many gainers and no losers, it's very bullish.
+			return MarketSentiment{State: "Bullish", Score: 1.0, Message: fmt.Sprintf("Strongly Bullish: %d significant gainers vs. 0 losers.", significantGainers)}
+		}
+		return MarketSentiment{State: "Neutral", Score: 0.5, Message: "Neutral: Some gainers but no significant losers."}
+	}
+
+	ratio := float64(significantGainers) / float64(significantLosers)
+
+	// Normalize the ratio into a state and score.
+	if ratio > 2.0 {
+		return MarketSentiment{State: "Bullish", Score: math.Min(1.0, ratio/4.0), Message: fmt.Sprintf("Bullish market mood (%.2f : 1 gainer/loser ratio).", ratio)}
+	}
+	if ratio < 0.75 {
+		return MarketSentiment{State: "Bearish", Score: math.Max(-1.0, ratio-1.0), Message: fmt.Sprintf("Bearish market mood (%.2f : 1 gainer/loser ratio).", ratio)}
+	}
+
+	return MarketSentiment{State: "Neutral", Score: (ratio-0.75)/(2.0-0.75)*1.5 - 0.75, Message: fmt.Sprintf("Neutral market mood (%.2f : 1 gainer/loser ratio).", ratio)}
 }
 
 // ComputeEMASeries explicitly computes the Exponential Moving Average (EMA).
@@ -37,7 +139,6 @@ func ComputeEMASeries(data []float64, period int) ([]float64, []float64) {
 	return ema, nil
 }
 
-// --- ADDED: Helper function to calculate SMA for a series of floats ---
 func CalculateSMA(data []float64, period int) float64 {
 	if len(data) < period {
 		return 0.0
@@ -74,7 +175,6 @@ func CalculateATR(bars []utilities.OHLCVBar, period int) (float64, error) { // C
 	return sum / float64(period), nil // Return result and nil error
 }
 
-// --- NEW: Top-level function to conduct a full analysis of the order book. ---
 // This function combines the general depth pressure score with the identification of
 // specific support and resistance levels (walls).
 func PerformOrderBookAnalysis(orderBook broker.OrderBookData, depthPercent float64, windowSize int, spikeMultiplier float64) OrderBookAnalysis {
@@ -100,7 +200,7 @@ func PerformOrderBookAnalysis(orderBook broker.OrderBookData, depthPercent float
 	}
 }
 
-// --- NEW: Finds significant volume clusters (buy/sell walls) in the order book. ---
+// --- Finds significant volume clusters (buy/sell walls) in the order book. ---
 // It identifies levels where the volume is significantly higher than its neighbors.
 // `windowSize`: Number of neighboring levels to average for comparison.
 // `spikeMultiplier`: How many times larger the volume must be than the average to be "significant".
@@ -236,8 +336,9 @@ func CheckMultiIndicatorConfirmation(rsi, stochRSI, macdHist, obv float64, volum
 	isRsiOversold := rsi < 40
 	isStochRsiOversold := stochRSI < cfg.StochRSIBuyThreshold // e.g., < 20
 
-	if isRsiOversold && isStochRsiOversold {
-		return true, fmt.Sprintf("Bullish Confirmation: RSI (%.2f) and StochRSI (%.2f) are both oversold.", rsi, stochRSI)
+	isObvBullish := isOBVBullish(obv, bars)
+	if isRsiOversold && isStochRsiOversold && isObvBullish {
+		return true, fmt.Sprintf("Bullish Confirmation: RSI (%.2f), StochRSI (%.2f), and OBV (%.2f) are aligned.", rsi, stochRSI, obv)
 	}
 	// --- END MODIFIED LOGIC ---
 
@@ -416,4 +517,52 @@ func FindSupportNearPrice(orderBook broker.OrderBookData, targetPrice float64, s
 	}
 
 	return bestPrice, foundSupport
+}
+
+// This function will process the data fetched from the new dataprovider method
+func CalculateAggregatedLiquidity(tickers []dataprovider.CrossExchangeTicker, primaryExchangeName string) AggregatedLiquidityMetrics {
+	var totalVolume, weightedPriceSum float64
+	var primaryExchangeVolume float64
+
+	if len(tickers) == 0 {
+		return AggregatedLiquidityMetrics{}
+	}
+
+	// Sort tickers by volume to easily find the top ones
+	sort.Slice(tickers, func(i, j int) bool {
+		return tickers[i].Volume24h > tickers[j].Volume24h
+	})
+
+	for _, ticker := range tickers {
+		// Only include tickers with a positive price and volume for accurate calculations
+		if ticker.Price > 0 && ticker.Volume24h > 0 {
+			totalVolume += ticker.Volume24h
+			weightedPriceSum += ticker.Price * ticker.Volume24h
+			if strings.EqualFold(ticker.ExchangeName, primaryExchangeName) {
+				primaryExchangeVolume = ticker.Volume24h
+			}
+		}
+	}
+
+	vwap := 0.0
+	if totalVolume > 0 {
+		vwap = weightedPriceSum / totalVolume
+	}
+
+	primaryShare := 0.0
+	if totalVolume > 0 {
+		primaryShare = primaryExchangeVolume / totalVolume
+	}
+
+	var topExchanges []string
+	for i := 0; i < 5 && i < len(tickers); i++ {
+		topExchanges = append(topExchanges, tickers[i].ExchangeName)
+	}
+
+	return AggregatedLiquidityMetrics{
+		VolumeWeightedAvgPrice: vwap,
+		TopExchangesByVolume:   topExchanges,
+		KrakenVolumeShare:      primaryShare,
+		TotalMarketVolume24h:   totalVolume,
+	}
 }

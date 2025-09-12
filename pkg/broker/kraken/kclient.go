@@ -7,13 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"golang.org/x/time/rate"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 type PairDetail struct {
@@ -36,7 +37,7 @@ type Client struct {
 	assetInfoMap        map[string]AssetInfo
 	commonToKrakenAsset map[string]string
 
-	pairInfoMap           map[string]AssetPairAPIInfo
+	pairInfoMap           map[string]AssetPairInfo
 	pairDetailsCache      map[string]PairDetail
 	commonToTradeablePair map[string]string
 	commonToPrimaryPair   map[string]string
@@ -92,8 +93,8 @@ func (c *Client) RefreshAssets(ctx context.Context) error {
 func (c *Client) RefreshAssetPairs(ctx context.Context) error {
 	c.logger.LogInfo("Kraken Client: Refreshing asset pairs info...")
 	var resp struct {
-		Error  []string                    `json:"error"`
-		Result map[string]AssetPairAPIInfo `json:"result"`
+		Error  []string                 `json:"error"`
+		Result map[string]AssetPairInfo `json:"result"`
 	}
 	if err := c.callPublic(ctx, "/0/public/AssetPairs", nil, &resp); err != nil {
 		return err
@@ -151,6 +152,27 @@ func (c *Client) RefreshAssetPairs(ctx context.Context) error {
 	}
 	c.logger.LogInfo("Kraken Client: Refreshed %d asset pairs and built comprehensive translation maps.", len(c.pairInfoMap))
 	return nil
+}
+
+// GetAssetPairsAPI fetches the raw asset pair information from the public Kraken API.
+func (c *Client) GetAssetPairsAPI(ctx context.Context, pair string) (map[string]AssetPairInfo, error) {
+	params := url.Values{}
+	if pair != "" {
+		params.Set("pair", pair)
+	}
+
+	var resp struct {
+		Error  []string                 `json:"error"`
+		Result map[string]AssetPairInfo `json:"result"`
+	}
+
+	if err := c.callPublic(ctx, "/0/public/AssetPairs", params, &resp); err != nil {
+		return nil, fmt.Errorf("GetAssetPairsAPI: API call failed: %w", err)
+	}
+	if len(resp.Error) > 0 {
+		return nil, fmt.Errorf("GetAssetPairsAPI: API error: %s", strings.Join(resp.Error, ", "))
+	}
+	return resp.Result, nil
 }
 
 func (c *Client) ParseOHLCV(kBar []interface{}) (utilities.OHLCVBar, error) {
@@ -361,7 +383,7 @@ func NewClient(appCfg *utilities.KrakenConfig, HTTPClient *http.Client, logger *
 		cfg:                   appCfg,
 		assetInfoMap:          make(map[string]AssetInfo),
 		commonToKrakenAsset:   make(map[string]string),
-		pairInfoMap:           make(map[string]AssetPairAPIInfo),
+		pairInfoMap:           make(map[string]AssetPairInfo),
 		commonToKrakenPair:    make(map[string]string),
 		krakenToCommonPair:    make(map[string]string),
 		commonToPrimaryPair:   make(map[string]string),

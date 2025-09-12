@@ -36,8 +36,8 @@ func CalculateRSI(bars []utilities.OHLCVBar, period int) float64 {
 	return 100.0 - (100.0 / (1.0 + rs))
 }
 
-// extractCloses is a helper function to get a slice of close prices from OHLCV bars.
-func extractClosesForIndicators(bars []utilities.OHLCVBar) []float64 {
+// ExtractCloses is a helper function to get a slice of close prices from OHLCV bars.
+func ExtractCloses(bars []utilities.OHLCVBar) []float64 {
 	closes := make([]float64, len(bars))
 	for i, bar := range bars {
 		closes[i] = bar.Close
@@ -51,7 +51,7 @@ func CalculateStochRSI(bars []utilities.OHLCVBar, rsiPeriod, stochPeriod int) fl
 		return 0
 	}
 
-	closePrices := extractClosesForIndicators(bars)
+	closePrices := ExtractCloses(bars)
 
 	// Calculate RSI series
 	rsiSeries := make([]float64, 0, len(closePrices)-rsiPeriod)
@@ -336,7 +336,7 @@ func CalculateBollingerBands(bars []utilities.OHLCVBar, period int, stdDev float
 		return 0, 0
 	}
 
-	closes := extractClosesForIndicators(bars)
+	closes := ExtractCloses(bars)
 	segment := closes[len(closes)-period:]
 
 	// Calculate SMA (middle band)
@@ -427,7 +427,7 @@ func CalculateIndicators(bars []utilities.OHLCVBar, cfg utilities.AppConfig) (
 	stochD float64,
 ) {
 	indicatorCfg := cfg.Indicators
-	closePrices := extractClosesForIndicators(bars)
+	closePrices := ExtractCloses(bars)
 
 	rsi = CalculateRSI(bars, indicatorCfg.RSIPeriod)
 	stochRSI = CalculateStochRSI(bars, indicatorCfg.RSIPeriod, indicatorCfg.StochRSIPeriod)

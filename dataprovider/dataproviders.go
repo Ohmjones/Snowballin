@@ -6,17 +6,40 @@ import (
 	"time"
 )
 
+// AssetIdentity holds the unified, cross-referenced identification for a tradable asset.
+// This is the single source of truth for asset mapping.
+type AssetIdentity struct {
+	ID              int       `json:"id"`               // Primary key
+	CommonSymbol    string    `json:"common_symbol"`    // e.g., "XRP"
+	KrakenAsset     string    `json:"kraken_asset"`     // e.g., "XXRP"
+	KrakenWsName    string    `json:"kraken_ws_name"`   // e.g., "XRP/USD"
+	CoinGeckoID     string    `json:"coingecko_id"`     // e.g., "ripple"
+	CoinMarketCapID string    `json:"coinmarketcap_id"` // e.g., "52"
+	IconPath        string    `json:"icon_path"`        // e.g., "web/static/icons/ripple.webp"
+	LastUpdated     time.Time `json:"last_updated"`
+}
+
 // DataProvider defines the interface for accessing market data from various sources.
 type DataProvider interface {
 	GetSupportedCoins(ctx context.Context) ([]Coin, error)
 	GetMarketData(ctx context.Context, ids []string, vsCurrency string) ([]MarketData, error)
 	GetOHLCVHistorical(ctx context.Context, id, vsCurrency, interval string) ([]utilities.OHLCVBar, error)
+	GetOHLCDaily(ctx context.Context, id, vsCurrency string, days int) ([]utilities.OHLCVBar, error)
 	GetHistoricalPrice(ctx context.Context, id, date string) (HistoricalPrice, error)
 	GetExchangeDetails(ctx context.Context, exchangeID string) (ExchangeDetails, error)
 	GetGlobalMarketData(ctx context.Context) (GlobalMarketData, error)
 	GetCoinID(ctx context.Context, commonAssetSymbol string) (string, error)
 	PrimeCache(ctx context.Context) error
-	PrimeHistoricalData(ctx context.Context, id, vsCurrency, interval string, days int) error // New method for bulk downloads
+	PrimeHistoricalData(ctx context.Context, id, vsCurrency, interval string, days int) error
+	GetTopAssetsByMarketCap(ctx context.Context, quoteCurrency string, topN int) ([]string, error)
+	GetAllTickersForAsset(ctx context.Context, coinID string) ([]CrossExchangeTicker, error)
+	GetTrendingSearches(ctx context.Context) ([]TrendingCoin, error)
+	GetGainersAndLosers(ctx context.Context, quoteCurrency string, topN int) (gainers []MarketData, losers []MarketData, err error)
+}
+type CrossExchangeTicker struct {
+	ExchangeName string
+	Price        float64
+	Volume24h    float64
 }
 type FearGreedProvider interface {
 	GetFearGreedIndex(ctx context.Context) (FearGreedIndex, error)
@@ -35,14 +58,15 @@ type MarketData struct {
 	ID             string
 	Symbol         string
 	Name           string
+	Image          string // Added for icon URL
 	CurrentPrice   float64
 	MarketCap      float64
 	Volume24h      float64
 	High24h        float64
 	Low24h         float64
-	PriceChange1h  float64 // As percentage
-	PriceChange24h float64 // As percentage
-	PriceChange7d  float64 // As percentage
+	PriceChange1h  float64
+	PriceChange24h float64
+	PriceChange7d  float64
 	LastUpdated    time.Time
 	Price          float64
 }

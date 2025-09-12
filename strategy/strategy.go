@@ -14,15 +14,6 @@ func NewStrategy(logger *utilities.Logger) Strategy {
 	return &strategyImpl{logger: logger}
 }
 
-// extractCloses is a helper function to get a slice of close prices from OHLCV bars.
-func extractCloses(bars []utilities.OHLCVBar) []float64 {
-	closes := make([]float64, len(bars))
-	for i, bar := range bars {
-		closes[i] = bar.Close
-	}
-	return closes
-}
-
 // getConsensusIndicatorValue calculates a weighted average for a given indicator across all available data providers.
 // It takes a calculation function `calcFunc` which defines how to get the desired value from a set of bars.
 func getConsensusIndicatorValue(
@@ -64,10 +55,13 @@ func (s *strategyImpl) checkMultiTimeframeConsensus(data ConsolidatedMarketPictu
 	var trendReason string
 
 	consensusLastClose, priceOk := getConsensusIndicatorValue(data, "1d", 50, func(bars []utilities.OHLCVBar) (float64, bool) {
-		return bars[len(bars)-1].Close, true
+		if len(bars) > 0 {
+			return bars[len(bars)-1].Close, true
+		}
+		return 0, false
 	})
 	consensusEMA50, emaOk := getConsensusIndicatorValue(data, "1d", 50, func(bars []utilities.OHLCVBar) (float64, bool) {
-		closes := extractCloses(bars)
+		closes := ExtractCloses(bars)
 		ema, _ := ComputeEMASeries(closes, 50)
 		if len(ema) > 0 {
 			return ema[len(ema)-1], true
@@ -104,7 +98,7 @@ func (s *strategyImpl) checkMultiTimeframeConsensus(data ConsolidatedMarketPictu
 	var isMomentumShifting bool
 	var momentumReason string
 	consensusMacdHistSeries, macdOk := getConsensusIndicatorValue(data, "4h", cfg.Indicators.MACDSlowPeriod+cfg.Indicators.MACDSignalPeriod, func(bars []utilities.OHLCVBar) (float64, bool) {
-		closes := extractCloses(bars)
+		closes := ExtractCloses(bars)
 		_, _, macdHist := CalculateMACDSeries(closes, cfg.Indicators.MACDFastPeriod, cfg.Indicators.MACDSlowPeriod, cfg.Indicators.MACDSignalPeriod)
 		if len(macdHist) < 2 {
 			return 0, false
@@ -193,81 +187,42 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 		return nil, fmt.Errorf("cannot generate signals without any provider data")
 	}
 
-	// For final confirmation and ATR, we use the primary (broker) bars for simplicity and direct execution context.
+	// Use the primary broker's data for execution-critical calculations like ATR.
 	primaryBars, ok := data.PrimaryOHLCVByTF[cfg.Consensus.MultiTimeframe.BaseTimeframe]
-	if !ok || len(primaryBars) < cfg.Indicators.MACDSlowPeriod {
-		s.logger.LogWarn("GenerateSignals [%s]: Insufficient primary (broker) bars (%d). Falling back to provider consensus for indicators.", data.AssetPair, len(primaryBars))
-
-		// Fallback: Build consensus primary bars from providers (daily for trend)
-		fallbackBars, fallbackOk := getConsensusBars(data, cfg.Consensus.MultiTimeframe.BaseTimeframe, cfg.Indicators.MACDSlowPeriod)
-		if !fallbackOk {
-			s.logger.LogWarn("GenerateSignals [%s]: Fallback failed—insufficient provider bars for consensus.", data.AssetPair)
-			return nil, nil
-		}
-		primaryBars = fallbackBars // Override with fallback
-	}
-	atr, err := CalculateATR(primaryBars, cfg.Indicators.ATRPeriod)
-	if err != nil {
-		s.logger.LogError("GenerateSignals [%s]: Could not calculate ATR: %v", data.AssetPair, err)
-		return nil, err
+	if !ok || len(primaryBars) < cfg.Indicators.ATRPeriod+1 {
+		s.logger.LogWarn("GenerateSignals [%s]: Insufficient primary (broker) bars for signal generation.", data.AssetPair)
+		return nil, nil // Not an error, just not enough data to proceed.
 	}
 
-	// Perform Multi-Timeframe Consensus check
+	// --- 1. Perform Multi-Timeframe Consensus check ---
 	isBuy, reason := s.checkMultiTimeframeConsensus(data, cfg)
+	currentPrice := data.ProvidersData[0].CurrentPrice // Use broker's current price
 
-	// Extract currentPrice early for use in predictive logic
-	currentPrice := data.ProvidersData[0].CurrentPrice
-
-	// --- PREDICTIVE BUY LOGIC V2 ---
-	// This logic attempts to "snipe" a whipsaw by placing a limit order at a deep,
-	// volatility-defined support level, bypassing the standard MTF consensus.
+	// --- 2. Predictive Buy Logic (Snipe Opportunity) ---
+	// This logic runs independently of the main consensus check.
 	bookAnalysis := PerformOrderBookAnalysis(data.BrokerOrderBook, 1.0, 10, 1.5)
 	if !isBuy && bookAnalysis.DepthScore > cfg.Trading.MinBookConfidenceForPredictive {
 		s.logger.LogInfo("GenerateSignals [%s]: MTF Consensus failed, but strong book (%.2f). Checking for predictive snipe...", data.AssetPair, bookAnalysis.DepthScore)
-
-		// Fetch primary bars for ATR and RSI calculation to ensure data integrity.
-		primaryBars, hasPrimaryBars := data.PrimaryOHLCVByTF[cfg.Consensus.MultiTimeframe.BaseTimeframe]
-		if !hasPrimaryBars || len(primaryBars) < cfg.Indicators.ATRPeriod {
-			s.logger.LogWarn("GenerateSignals [%s]: Insufficient broker bars for predictive buy. Skipping.", data.AssetPair)
-			return nil, nil
-		}
-
-		// 1. Calculate ATR to determine a dynamic "snipe" distance based on current volatility.
 		atr, err := CalculateATR(primaryBars, cfg.Indicators.ATRPeriod)
 		if err != nil || atr == 0 {
 			s.logger.LogError("GenerateSignals [%s]: Could not calculate ATR for predictive buy: %v", data.AssetPair, err)
-			return nil, nil
+		} else {
+			targetSnipePrice := currentPrice - (atr * cfg.Trading.PredictiveAtrMultiplier)
+			snipePrice, foundSupport := FindSupportNearPrice(data.BrokerOrderBook, targetSnipePrice, cfg.Trading.PredictiveSearchWindowPercent)
+			if foundSupport {
+				s.logger.LogWarn("GenerateSignals [%s]: PREDICTIVE BUY SIGNAL TRIGGERED!", data.AssetPair)
+				predictiveSignal := StrategySignal{
+					Direction:        "predictive_buy",
+					Reason:           fmt.Sprintf("Predictive Snipe: Strong book (Conf: %.2f) at volatility-defined support. Target: %.2f", bookAnalysis.DepthScore, snipePrice),
+					RecommendedPrice: snipePrice,
+					CalculatedSize:   cfg.Trading.BaseOrderSize / snipePrice, // Use base size for predictive entries
+				}
+				return []StrategySignal{predictiveSignal}, nil
+			}
 		}
-
-		// 2. Define the ideal target price for the snipe. This is a deep level.
-		targetSnipePrice := currentPrice - (atr * cfg.Trading.PredictiveAtrMultiplier)
-
-		// 3. Search for the strongest buy wall (support) *around* that ideal target price.
-		snipePrice, foundSupport := FindSupportNearPrice(data.BrokerOrderBook, targetSnipePrice, cfg.Trading.PredictiveSearchWindowPercent)
-		if !foundSupport {
-			s.logger.LogInfo("GenerateSignals [%s]: Predictive snipe skipped. No significant support wall found near the target price of %.2f.", data.AssetPair, targetSnipePrice)
-			return nil, nil
-		}
-
-		// 4. Final check: Ensure we are not trying to catch a rip on high volume.
-		volumeSpike := CheckVolumeSpike(primaryBars, cfg.Indicators.VolumeSpikeFactor, cfg.Indicators.VolumeLookbackPeriod)
-		if volumeSpike {
-			s.logger.LogInfo("GenerateSignals [%s]: Predictive snipe skipped due to recent volume spike.", data.AssetPair)
-			return nil, nil
-		}
-
-		// 5. Generate the signal.
-		s.logger.LogWarn("GenerateSignals [%s]: PREDICTIVE BUY SIGNAL TRIGGERED!", data.AssetPair)
-		predictiveSignal := StrategySignal{
-			Direction:        "predictive_buy",
-			Reason:           fmt.Sprintf("Predictive Snipe: Strong book (Conf: %.2f) at volatility-defined support. Target: %.2f", bookAnalysis.DepthScore, snipePrice),
-			RecommendedPrice: snipePrice,
-			CalculatedSize:   0, // Size will be calculated in the app layer based on Martingale logic.
-		}
-		return []StrategySignal{predictiveSignal}, nil
 	}
-	// --- END OF PREDICTIVE BUY LOGIC ---
 
+	// --- 3. Main Buy Signal Logic (Requires MTF Consensus) ---
 	if !isBuy {
 		s.logger.LogInfo("GenerateSignals: %s -> %s - Reason: %s",
 			utilities.ColorYellow+data.AssetPair+utilities.ColorReset,
@@ -276,79 +231,100 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 		)
 		return nil, nil
 	}
-	s.logger.LogInfo("GenerateSignals [%s]: MTF Consensus PASSED. Reason: %s. Performing final confirmation...", data.AssetPair, reason)
 
-	rsi, stochRSI, macdHist, obv, volumeSpike, liquidityHunt, _, _, _, _ := CalculateIndicators(primaryBars, cfg) // Discard unused
-	isConfirmed, confirmationReason := CheckMultiIndicatorConfirmation(
-		rsi, stochRSI, macdHist, obv, volumeSpike, liquidityHunt, primaryBars, cfg.Indicators,
-	)
+	s.logger.LogInfo("GenerateSignals [%s]: MTF Consensus PASSED. Reason: %s. Performing final checks...", data.AssetPair, reason)
 
+	// Final Confirmation
+	rsi, stochRSI, macdHist, obv, volumeSpike, liquidityHunt, _, _, _, _ := CalculateIndicators(primaryBars, cfg)
+	isConfirmed, confirmationReason := CheckMultiIndicatorConfirmation(rsi, stochRSI, macdHist, obv, volumeSpike, liquidityHunt, primaryBars, cfg.Indicators)
 	if !isConfirmed {
 		s.logger.LogInfo("GenerateSignals [%s]: Final confirmation FAILED. Reason: %s", data.AssetPair, confirmationReason)
-		return nil, fmt.Errorf("Final confirmation failed: %s", confirmationReason)
+		return nil, nil
 	}
-	s.logger.LogInfo("GenerateSignals [%s]: Final confirmation PASSED. Reason: %s. Generating signal.", data.AssetPair, confirmationReason)
 
-	var signals []StrategySignal
+	// --- 4. Integrate All Sentiment Layers ---
+	// a) Asset-specific trending consensus
+	baseAssetSymbol := strings.Split(data.AssetPair, "/")[0]
+	sentiment := CalculateSentimentConsensus(baseAssetSymbol, data.CgTrendingData, data.CmcTrendingData, s.logger)
+
+	// b) Build the comprehensive reason string for the signal
+	finalReason := fmt.Sprintf("%s | %s", reason, confirmationReason)
+	if sentiment.IsTrending {
+		finalReason += fmt.Sprintf(" | Trending Score: %.2f (%s)", sentiment.AttentionScore, strings.Join(sentiment.TrendingOn, ", "))
+	}
+	if data.MarketSentiment.State != "Neutral" {
+		finalReason += " | Market Mood: " + data.MarketSentiment.State
+	}
+
+	// --- 5. Calculate Order Parameters & Apply Sentiment Modulation ---
+	atr, _ := CalculateATR(primaryBars, cfg.Indicators.ATRPeriod) // We know this works from the check above
 	recommendedPrice := FindBestLimitPrice(data.BrokerOrderBook, currentPrice-atr, 1.0)
-	// For a standard buy, we still calculate the size here based on portfolio risk.
-	//calculatedSize := AdjustPositionSize(data.PortfolioValue, atr, cfg.Trading.PortfolioRiskPerTrade)
 	calculatedSize := cfg.Trading.BaseOrderSize / recommendedPrice
+
+	// **MODULATION**: Increase buy size if market mood is bullish
+	if data.MarketSentiment.State == "Bullish" {
+		originalSize := calculatedSize
+		// Use the multiplier from the sentiment-modulated config
+		calculatedSize *= cfg.Trading.ConsensusBuyMultiplier
+		s.logger.LogInfo("BULLISH SENTIMENT OVERLAY: Increasing buy size by x%.2f from %.4f to %.4f",
+			cfg.Trading.ConsensusBuyMultiplier, originalSize, calculatedSize)
+	}
+
 	stopLossPrice := VolatilityAdjustedOrderPrice(recommendedPrice, atr, 2.0, true)
 	orderBookConfidence := AnalyzeOrderBookDepth(data.BrokerOrderBook, 1.0)
 
 	s.logger.LogInfo("GenerateSignals [%s]: BUY signal triggered. Price: %.2f, Size: %.4f, SL: %.2f, OB-Conf: %.2f",
 		data.AssetPair, recommendedPrice, calculatedSize, stopLossPrice, orderBookConfidence)
 
-	signals = append(signals, StrategySignal{
-		AssetPair:        data.AssetPair,
-		Direction:        "buy",
-		Confidence:       (1.0 + orderBookConfidence) / 2.0,
-		Reason:           fmt.Sprintf("%s | %s", reason, confirmationReason),
-		GeneratedAt:      time.Now(),
-		FearGreedIndex:   data.FearGreedIndex.Value,
-		RecommendedPrice: recommendedPrice,
-		CalculatedSize:   calculatedSize,
-		StopLossPrice:    stopLossPrice,
-	})
+	// --- 6. Return the Final Signal ---
+	signals := []StrategySignal{
+		{
+			AssetPair:        data.AssetPair,
+			Direction:        "buy",
+			Confidence:       (1.0 + orderBookConfidence) / 2.0,
+			Reason:           finalReason,
+			GeneratedAt:      time.Now(),
+			FearGreedIndex:   data.FearGreedIndex.Value,
+			RecommendedPrice: recommendedPrice,
+			CalculatedSize:   calculatedSize,
+			StopLossPrice:    stopLossPrice,
+		},
+	}
 
 	return signals, nil
 }
 
-// GenerateExitSignal checks for liquidity hunts or bearish confluence to generate an exit signal.
+// GenerateExitSignal checks for high-probability technical exit conditions.
+// Note: The sentiment-based exit logic (tightening a trailing stop) is applied
+// in the `manageOpenPosition` function in `app.go`, as it modifies an existing state
+// rather than generating a new, independent "sell" signal.
 func (s *strategyImpl) GenerateExitSignal(ctx context.Context, data ConsolidatedMarketPicture, cfg utilities.AppConfig) (StrategySignal, bool) {
-	_ = ctx // Acknowledge context is not used in this specific function body
+	_ = ctx // Acknowledge unused parameter
 
-	// This initial check is correct and remains.
 	if len(data.ProvidersData) == 0 {
 		return StrategySignal{}, false
 	}
 
-	// This check for sufficient bar data is also correct and remains.
+	// Use the primary broker's data for exit signals to match the execution environment.
 	primaryBars, ok := data.PrimaryOHLCVByTF[cfg.Consensus.MultiTimeframe.BaseTimeframe]
 	if !ok || len(primaryBars) < 2 {
 		return StrategySignal{}, false
 	}
 
-	// [FIX] Call the updated CalculateIndicators function to get all signals at once.
-	// We use '_' to ignore the indicator values we don't need for this specific exit logic.
-	// The important variable is the final boolean we named 'bearishHuntReversal'.
+	// Check for a confirmed bearish reversal after a liquidity hunt (a strong exit signal).
 	_, _, _, _, _, bearishHuntReversal, _, _, _, _ := CalculateIndicators(primaryBars, cfg)
 
-	// [FIX] Use the new 'bearishHuntReversal' boolean for the check.
 	if bearishHuntReversal {
-		// [FIX] Updated the log message for clarity.
 		s.logger.LogWarn("GenerateExitSignal [%s]: EXIT triggered. Reason: Confirmed Bearish Reversal after Liquidity Hunt", data.AssetPair)
 		return StrategySignal{
 			AssetPair: data.AssetPair,
 			Direction: "sell",
-			// The reason is also updated to be more descriptive.
-			Reason: "Confirmed Bearish Reversal after Liquidity Hunt",
+			Reason:    "Confirmed Bearish Reversal after Liquidity Hunt",
 		}, true
 	}
 
-	// This existing check for bearish confluence is a great fallback and remains untouched.
-	isBearish, reason := checkBearishConfluence(primaryBars, cfg)
+	// As a fallback, check for a broader confluence of multiple bearish indicators.
+	isBearish, reason := CheckBearishConfluence(primaryBars, cfg)
 	if isBearish {
 		s.logger.LogWarn("GenerateExitSignal [%s]: EXIT triggered. Reason: %s", data.AssetPair, reason)
 		return StrategySignal{
@@ -367,8 +343,9 @@ func isHammerCandle(bar utilities.OHLCVBar) bool {
 	return lowerShadow > 2*body && (bar.High-math.Max(bar.Open, bar.Close)) < body // Long lower shadow for dip reversal
 }
 
-// checkBearishConfluence checks for a confluence of bearish signals for an exit.
-func checkBearishConfluence(bars []utilities.OHLCVBar, cfg utilities.AppConfig) (bool, string) {
+// CheckBearishConfluence checks for a confluence of bearish signals for an exit.
+// CheckBearishConfluence checks for a confluence of bearish signals for an exit.
+func CheckBearishConfluence(bars []utilities.OHLCVBar, cfg utilities.AppConfig) (bool, string) {
 	if len(bars) < cfg.Indicators.MACDSlowPeriod {
 		return false, "Insufficient data for bearish confluence"
 	}
@@ -385,6 +362,27 @@ func checkBearishConfluence(bars []utilities.OHLCVBar, cfg utilities.AppConfig) 
 
 	// New: Stochastic check (overbought >80 and bearish crossover: K crosses below D)
 	isStochOverbought := stochK > 80 && stochK < stochD // Bearish crossover
+
+	// === NEW SMA-BASED CONFLUENCE CHECK ===
+	isSMACrossoverBearish := false
+	var smaReason string
+	if len(cfg.Trading.SMAPeriodsForExit) == 2 {
+		shortPeriod := cfg.Trading.SMAPeriodsForExit[0]
+		longPeriod := cfg.Trading.SMAPeriodsForExit[1]
+
+		if len(bars) >= longPeriod {
+			closePrices := ExtractCloses(bars)
+			shortSMA := CalculateSMA(closePrices, shortPeriod)
+			longSMA := CalculateSMA(closePrices, longPeriod)
+
+			// Check for a death cross (short SMA below long SMA)
+			if shortSMA < longSMA {
+				isSMACrossoverBearish = true
+				smaReason = fmt.Sprintf("Death Cross: SMA(%d) is below SMA(%d)", shortPeriod, longPeriod)
+			}
+		}
+	}
+	// === END NEW LOGIC ===
 
 	score := 0
 	var reasons []string
@@ -408,8 +406,12 @@ func checkBearishConfluence(bars []utilities.OHLCVBar, cfg utilities.AppConfig) 
 		score++
 		reasons = append(reasons, "Stochastic >80 with bearish crossover")
 	}
+	if isSMACrossoverBearish {
+		score++
+		reasons = append(reasons, smaReason)
+	}
 
-	if score >= 4 { // Require at least 4 for confluence
+	if score >= 4 { // The score is now out of 6, so we can adjust the threshold if needed.
 		return true, fmt.Sprintf("Bearish Confluence: %s", strings.Join(reasons, " & "))
 	}
 

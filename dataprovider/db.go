@@ -114,12 +114,83 @@ func (s *SQLiteCache) InitSchema() error {
 		pair TEXT PRIMARY KEY,
 		data BLOB NOT NULL, -- JSON blob of TickerInfo
 		timestamp INTEGER NOT NULL
-);`
+	);
+
+	CREATE TABLE IF NOT EXISTS asset_identities (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		common_symbol TEXT NOT NULL UNIQUE,
+		kraken_asset TEXT NOT NULL,
+		kraken_ws_name TEXT NOT NULL,
+		coingecko_id TEXT NOT NULL,
+		coinmarketcap_id TEXT NOT NULL,
+		icon_path TEXT,
+		last_updated INTEGER NOT NULL
+	);`
 	if _, err := s.db.Exec(schema); err != nil {
 		s.logger.LogError("Failed to execute database schema: %v", err)
 		return fmt.Errorf("failed to execute database schema: %w", err)
 	}
 	s.logger.LogInfo("Database schema initialized successfully.")
+	return nil
+}
+
+// GetAssetIdentity retrieves a cached asset identity from the database by its common symbol.
+func (s *SQLiteCache) GetAssetIdentity(commonSymbol string) (*AssetIdentity, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	query := `SELECT id, common_symbol, kraken_asset, kraken_ws_name, coingecko_id, coinmarketcap_id, icon_path, last_updated 
+               FROM asset_identities WHERE common_symbol = ?`
+
+	row := s.db.QueryRow(query, commonSymbol)
+
+	var identity AssetIdentity
+	var lastUpdated int64
+	err := row.Scan(
+		&identity.ID,
+		&identity.CommonSymbol,
+		&identity.KrakenAsset,
+		&identity.KrakenWsName,
+		&identity.CoinGeckoID,
+		&identity.CoinMarketCapID,
+		&identity.IconPath,
+		&lastUpdated,
+	)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil // Not found is not an error, it's a cache miss
+		}
+		return nil, fmt.Errorf("error scanning asset identity for %s: %w", commonSymbol, err)
+	}
+
+	identity.LastUpdated = time.Unix(lastUpdated, 0)
+	return &identity, nil
+}
+
+// SaveAssetIdentity saves or updates an asset identity in the database.
+func (s *SQLiteCache) SaveAssetIdentity(identity *AssetIdentity) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `INSERT OR REPLACE INTO asset_identities 
+              (common_symbol, kraken_asset, kraken_ws_name, coingecko_id, coinmarketcap_id, icon_path, last_updated) 
+              VALUES (?, ?, ?, ?, ?, ?, ?)`
+
+	_, err := s.db.Exec(query,
+		identity.CommonSymbol,
+		identity.KrakenAsset,
+		identity.KrakenWsName,
+		identity.CoinGeckoID,
+		identity.CoinMarketCapID,
+		identity.IconPath,
+		identity.LastUpdated.Unix(),
+	)
+
+	if err != nil {
+		s.logger.LogError("Failed to save asset identity for %s: %v", identity.CommonSymbol, err)
+		return err
+	}
 	return nil
 }
 

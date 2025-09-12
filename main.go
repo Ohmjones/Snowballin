@@ -6,11 +6,12 @@ import (
 	"Snowballin/utilities"
 	"context"
 	"fmt"
-	"github.com/spf13/viper"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/spf13/viper"
 )
 
 const banner = `
@@ -27,6 +28,9 @@ const banner = `
 
 // LoadConfig explicitly loads your AppConfig from JSON file using viper and creates Logger instance
 func LoadConfig(path string) (utilities.AppConfig, *utilities.Logger, error) {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return utilities.AppConfig{}, nil, fmt.Errorf("config file not found: %w", err)
+	}
 	viper.SetConfigFile(path)
 	viper.SetConfigType("json") // Configuration file format
 	viper.AutomaticEnv()

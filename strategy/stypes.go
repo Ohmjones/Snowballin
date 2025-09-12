@@ -64,14 +64,35 @@ type ProviderData struct {
 	OHLCVByTF    map[string][]utilities.OHLCVBar
 }
 
-// ConsolidatedMarketPicture brings together all data points for a single asset at a moment in time.
+// AggregatedLiquidityMetrics holds the results of a cross-exchange liquidity analysis.
+type AggregatedLiquidityMetrics struct {
+	VolumeWeightedAvgPrice float64  // The true market price weighted by volume across all exchanges.
+	TopExchangesByVolume   []string // A list of the top 3-5 exchanges driving the volume.
+	KrakenVolumeShare      float64  // The percentage of global volume occurring on Kraken (0.0 to 1.0).
+	TotalMarketVolume24h   float64  // The total 24h volume in USD across all tracked exchanges.
+}
+
 type ConsolidatedMarketPicture struct {
-	AssetPair          string
-	ProvidersData      []ProviderData
-	BTCDominance       float64
-	PortfolioValue     float64
-	PeakPortfolioValue float64
-	PrimaryOHLCVByTF   map[string][]utilities.OHLCVBar
-	BrokerOrderBook    broker.OrderBookData
-	FearGreedIndex     dataprovider.FearGreedIndex
+	AssetPair           string
+	ProvidersData       []ProviderData
+	BTCDominance        float64
+	FearGreedIndex      dataprovider.FearGreedIndex
+	PortfolioValue      float64
+	PeakPortfolioValue  float64
+	BrokerOrderBook     broker.OrderBookData
+	PrimaryOHLCVByTF    map[string][]utilities.OHLCVBar
+	DailyOHLCV          []utilities.OHLCVBar
+	AggregatedLiquidity AggregatedLiquidityMetrics
+	CgTrendingData      []dataprovider.TrendingCoin
+	CmcTrendingData     []dataprovider.TrendingCoin
+	MarketSentiment     MarketSentiment
+}
+
+// MarketSentiment holds a high-level view of the market's mood.
+type MarketSentiment struct {
+	State            string  // "Bullish", "Bearish", "Neutral"
+	Score            float64 // A normalized score from -1.0 (very bearish) to 1.0 (very bullish).
+	Message          string  // A human-readable summary.
+	GainerLoserRatio float64 `json:"gainer_loser_ratio"`
+	Level            string  `json:"level"`
 }
