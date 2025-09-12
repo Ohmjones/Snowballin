@@ -79,8 +79,15 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 	var targetKrakenPair *kraken.AssetPairInfo
 	var krakenAssetName string
 	for name, pair := range krakenPairs {
-		if strings.HasPrefix(pair.Altname, commonSymbol) && (strings.HasSuffix(pair.Altname, "USD") || strings.HasSuffix(pair.Altname, "USDT")) {
-			p := pair // Create a copy to take its address
+		// Use the client's mapping logic to get the common name for the base asset.
+		commonBaseName, err := m.kraken.GetCommonAssetName(ctx, pair.Base)
+		if err != nil {
+			continue // Skip if the base asset cannot be mapped.
+		}
+
+		// Check if the common name matches the one we're looking for.
+		if strings.EqualFold(commonBaseName, commonSymbol) && (strings.EqualFold(pair.Quote, "ZUSD") || strings.EqualFold(pair.Quote, "USDT")) {
+			p := pair // Create a copy
 			targetKrakenPair = &p
 			krakenAssetName = name
 			break
