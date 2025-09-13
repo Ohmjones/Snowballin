@@ -865,6 +865,13 @@ func ConvertCoinGeckoMarketData(data cgMarketData) (utils.OHLCVBar, error) {
 	}, nil
 }
 func (c *Client) GetCoinIDsBySymbol(ctx context.Context, sym string) ([]string, error) {
+	// Add a safety check to ensure the ID map is populated
+	rc, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := c.refreshCoinIDMapIfNeeded(rc, false); err != nil {
+		c.logger.LogWarn("CoinGecko GetCoinIDsBySymbol: non-critical error refreshing ID map: %v", err)
+	}
+
 	c.idMapMu.RLock()
 	defer c.idMapMu.RUnlock()
 
@@ -873,7 +880,7 @@ func (c *Client) GetCoinIDsBySymbol(ctx context.Context, sym string) ([]string, 
 
 	// Search for IDs by symbol match first
 	for coinSymbol, coinID := range c.symbolToIDMap {
-		if coinSymbol == loSym {
+		if strings.EqualFold(coinSymbol, loSym) {
 			matchingIDs = append(matchingIDs, coinID)
 		}
 	}
