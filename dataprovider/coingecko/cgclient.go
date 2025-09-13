@@ -27,6 +27,7 @@ type Client struct {
 	idMap                map[string]string
 	symbolToIDMap        map[string]string
 	idMapMu              sync.RWMutex
+	idMapOnce            sync.Once
 	lastIDMapRefresh     time.Time
 	idMapRefreshInterval time.Duration
 	isRefreshingIDMap    bool
@@ -201,11 +202,21 @@ func NewClient(cfg *utils.AppConfig, logger *utils.Logger, cache *dataprovider.S
 		limiter:              rate.NewLimiter(rate.Limit(cgCfg.RateLimitPerSec), cgCfg.RateLimitBurst),
 		logger:               logger,
 		idMap:                make(map[string]string),
+		idMapOnce:            sync.Once{},
 		symbolToIDMap:        make(map[string]string),
 		idMapRefreshInterval: time.Duration(cgCfg.IDMapRefreshIntervalHours) * time.Hour,
 		cfg:                  cgCfg,
 		cache:                cache,
 	}
+
+	// This block ensures the map is populated once, and safely, before any lookups.
+	client.idMapOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := client.refreshCoinIDMapIfNeeded(ctx, true); err != nil {
+			client.logger.LogError("CoinGecko Client: Initial coin ID map refresh failed: %v", err)
+		}
+	})
 
 	logger.LogInfo("CoinGecko client initialized with URL: %s, RateLimit: %.2f req/sec", client.BaseURL, cgCfg.RateLimitPerSec)
 
