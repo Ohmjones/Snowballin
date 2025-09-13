@@ -516,15 +516,15 @@ func (c *Client) GetMarketData(ctx context.Context, ids []string, vsCurrency str
 		return nil, fmt.Errorf("GetMarketData for CoinGecko IDs [%s] in %s failed: %w", strings.Join(ids, ","), vsCurrency, err)
 	}
 
-	dpData := make([]dataprovider.MarketData, len(cgData))
-	for i, cgItem := range cgData {
+	var dpData []dataprovider.MarketData
+	for _, cgItem := range cgData {
 		ohlcvBar, err := ConvertCoinGeckoMarketData(cgItem)
 		if err != nil {
 			c.logger.LogWarn("GetMarketData: Error converting OHLCV data for %s: %v", cgItem.ID, err)
 			ohlcvBar = utils.OHLCVBar{} // Safe empty fallback on conversion error
 		}
 
-		dpData[i] = dataprovider.MarketData{
+		dpData = append(dpData, dataprovider.MarketData{
 			ID:             cgItem.ID,
 			Symbol:         cgItem.Symbol,
 			Name:           cgItem.Name,
@@ -538,7 +538,7 @@ func (c *Client) GetMarketData(ctx context.Context, ids []string, vsCurrency str
 			PriceChange7d:  cgItem.PriceChangePercentage7dInCurrency,
 			LastUpdated:    time.UnixMilli(ohlcvBar.Timestamp).UTC(),
 			MarketCapRank:  cgItem.MarketCapRank,
-		}
+		})
 	}
 
 	return dpData, nil
