@@ -537,6 +537,7 @@ func (c *Client) GetMarketData(ctx context.Context, ids []string, vsCurrency str
 			PriceChange24h: cgItem.PriceChangePercentage24hInCurrency,
 			PriceChange7d:  cgItem.PriceChangePercentage7dInCurrency,
 			LastUpdated:    time.UnixMilli(ohlcvBar.Timestamp).UTC(),
+			MarketCapRank:  cgItem.MarketCapRank,
 		}
 	}
 
