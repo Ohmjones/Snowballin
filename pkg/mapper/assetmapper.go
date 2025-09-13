@@ -98,7 +98,6 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 		return nil, fmt.Errorf("mapper: could not find a matching USD/USDT asset pair for '%s' on Kraken", commonSymbol)
 	}
 
-	// Step 2: Get market data from CoinGecko to find a match.
 	// Step 2: Get all potential CoinGecko IDs for the common symbol.
 	cgIDs, err := m.coingecko.GetCoinIDsBySymbol(ctx, commonSymbol)
 	if err != nil {
@@ -113,13 +112,12 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 
 	// Step 4: Find the best match by cross-referencing with Kraken data (market cap and volume).
 	var matchedCgCoin *dataprovider.MarketData
-	// Assuming Kraken's volume is a reasonable proxy for the true market volume.
-	krakenVolume := targetKrakenPair.LotMultiplier * 1000 // Placeholder logic for volume, adjust as needed.
-
 	for _, cgCoin := range cgMarketData {
-		// Use a confidence score or a direct comparison of market cap and volume.
-		// A simple heuristic is to check if the volume and market cap are significantly higher than for other coins.
-		if cgCoin.Volume24h > 10*float64(krakenVolume) && cgCoin.MarketCap > 1e8 {
+		// Simpler and more reliable confidence check.
+		// We found a coin with a matching symbol on CoinGecko.
+		// Now we just need to ensure it's a major coin with a non-zero market cap and volume,
+		// as a proxy for confidence.
+		if strings.EqualFold(cgCoin.Symbol, commonSymbol) && cgCoin.MarketCap > 1e8 && cgCoin.Volume24h > 1e6 {
 			matchedCgCoin = &cgCoin
 			break
 		}

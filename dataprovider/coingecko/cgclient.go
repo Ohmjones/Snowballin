@@ -876,32 +876,34 @@ func ConvertCoinGeckoMarketData(data cgMarketData) (utils.OHLCVBar, error) {
 	}, nil
 }
 func (c *Client) GetCoinIDsBySymbol(ctx context.Context, sym string) ([]string, error) {
-	// Add a safety check to ensure the ID map is populated
-	rc, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	if err := c.refreshCoinIDMapIfNeeded(rc, false); err != nil {
-		c.logger.LogWarn("CoinGecko GetCoinIDsBySymbol: non-critical error refreshing ID map: %v", err)
-	}
+	// This is the correct way to use sync.Once for lazy initialization.
+	// The `Do` call will block until the map has been populated.
+	c.idMapOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := c.refreshCoinIDMapIfNeeded(ctx, true); err != nil {
+			c.logger.LogError("CoinGecko Client: Initial coin ID map refresh failed: %v", err)
+		}
+	})
 
+	// The rest of the function remains the same.
 	c.idMapMu.RLock()
 	defer c.idMapMu.RUnlock()
 
 	loSym := strings.ToLower(sym)
 	var matchingIDs []string
 
-	// Search for IDs by symbol match first
+	// Filter the internal maps to find all matches, case-insensitively.
 	for coinSymbol, coinID := range c.symbolToIDMap {
 		if strings.EqualFold(coinSymbol, loSym) {
 			matchingIDs = append(matchingIDs, coinID)
 		}
 	}
 
-	// If no match by symbol, try by name
-	if len(matchingIDs) == 0 {
-		for coinName, coinID := range c.idMap {
-			if strings.Contains(strings.ToLower(coinName), loSym) {
-				matchingIDs = append(matchingIDs, coinID)
-			}
+	// Also check for matches in CoinGecko's full coin name list.
+	for coinName, coinID := range c.idMap {
+		if strings.Contains(strings.ToLower(coinName), loSym) {
+			matchingIDs = append(matchingIDs, coinID)
 		}
 	}
 
@@ -909,7 +911,17 @@ func (c *Client) GetCoinIDsBySymbol(ctx context.Context, sym string) ([]string, 
 		return nil, fmt.Errorf("no matching CoinGecko IDs found for symbol '%s'", sym)
 	}
 
-	return matchingIDs, nil
+	// Remove duplicates
+	keys := make(map[string]bool)
+	list := []string{}
+	for _, entry := range matchingIDs {
+		if _, value := keys[entry]; !value {
+			keys[entry] = true
+			list = append(list, entry)
+		}
+	}
+
+	return list, nil
 }
 func (c *Client) PrimeHistoricalData(ctx context.Context, id, vsCurrency, interval string, days int) error {
 	c.logger.LogInfo("PRIMING CoinGecko Data: Fetching %d days for ID=%s, Interval=%s", days, id, interval)
