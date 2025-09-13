@@ -19,6 +19,7 @@ import (
 
 // AssetMapper is responsible for resolving and caching asset identities across all providers.
 type AssetMapper struct {
+	cfg           *utilities.AppConfig
 	db            *dataprovider.SQLiteCache
 	logger        *utilities.Logger
 	kraken        *kraken.Client
@@ -28,13 +29,15 @@ type AssetMapper struct {
 }
 
 // NewAssetMapper creates a new instance of the AssetMapper.
-func NewAssetMapper(db *dataprovider.SQLiteCache, logger *utilities.Logger, kr *kraken.Client, cg, cmc dataprovider.DataProvider) *AssetMapper {
+func NewAssetMapper(db *dataprovider.SQLiteCache, logger *utilities.Logger, kr *kraken.Client, cg, cmc dataprovider.DataProvider, cfg *utilities.AppConfig) *AssetMapper {
 	return &AssetMapper{
+		cfg:           cfg,
 		db:            db,
 		logger:        logger,
 		kraken:        kr,
 		coingecko:     cg,
 		coinmarketcap: cmc,
+		identityCache: sync.Map{},
 	}
 }
 
@@ -110,14 +113,11 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 		return nil, fmt.Errorf("mapper: failed to get market data for CoinGecko IDs [%s]: %w", strings.Join(cgIDs, ","), err)
 	}
 
-	// Step 4: Find the best match by cross-referencing with Kraken data (market cap and volume).
+	// Step 4: Find the best match by cross-referencing with Kraken data and market cap rank.
 	var matchedCgCoin *dataprovider.MarketData
 	for _, cgCoin := range cgMarketData {
-		// Simpler and more reliable confidence check.
-		// We found a coin with a matching symbol on CoinGecko.
-		// Now we just need to ensure it's a major coin with a non-zero market cap and volume,
-		// as a proxy for confidence.
-		if strings.EqualFold(cgCoin.Symbol, commonSymbol) && cgCoin.MarketCap > 1e8 && cgCoin.Volume24h > 1e6 {
+		// Check for a symbol match, a valid market cap rank, and that the rank is within our configured top N.
+		if strings.EqualFold(cgCoin.Symbol, commonSymbol) && cgCoin.MarketCapRank > 0 && cgCoin.MarketCapRank <= m.cfg.Trading.DynamicAssetScanTopN {
 			matchedCgCoin = &cgCoin
 			break
 		}

@@ -290,7 +290,7 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 	}
 
 	logger.LogInfo("Pre-Flight: Initializing the Asset Mapper...")
-	assetMapper := mapper.NewAssetMapper(sqliteCache, logger, krakenClient, cgClient, cmcClient)
+	assetMapper := mapper.NewAssetMapper(sqliteCache, logger, krakenClient, cgClient, cmcClient, cfg)
 
 	// --- PRE-FLIGHT ASSET MAPPING ---
 	logger.LogInfo("Pre-Flight: Verifying asset identities for configured pairs...")

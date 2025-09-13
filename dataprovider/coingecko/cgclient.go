@@ -859,8 +859,14 @@ func (c *Client) GetGainersAndLosers(ctx context.Context, quoteCurrency string, 
 	return nil, nil, nil
 }
 
-// ConvertCoinGeckoMarketData converts CGMarketData into utilities.OHLCVBar
+// In cgclient.go
 func ConvertCoinGeckoMarketData(data cgMarketData) (utils.OHLCVBar, error) {
+	// --- FIX: Handle empty LastUpdated string gracefully ---
+	if data.LastUpdated == "" {
+		// Log a warning and return an error or a zero-value bar.
+		return utils.OHLCVBar{}, fmt.Errorf("CoinGecko LastUpdated time is empty")
+	}
+
 	parsedTime, err := time.Parse(time.RFC3339, data.LastUpdated)
 	if err != nil {
 		return utils.OHLCVBar{}, fmt.Errorf("failed to parse CoinGecko last updated time: %w", err)

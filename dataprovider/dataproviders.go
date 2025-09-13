@@ -70,6 +70,7 @@ type MarketData struct {
 	PriceChange7d  float64
 	LastUpdated    time.Time
 	Price          float64
+	MarketCapRank  int
 }
 
 // OrderBookData represents summarized order book info (or ticker info from CG).
