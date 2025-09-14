@@ -403,7 +403,7 @@ func (c *Client) GetCoinID(ctx context.Context, commonAssetSymbol string) (strin
 		return ids[0], nil
 	}
 
-	// Multiple IDs, fetch market data to select the one with the lowest MarketCapRank (highest market cap)
+	// Multiple IDs, fetch market data to select the one with the lowest MarketCapRank and matching symbol/name
 	marketData, err := c.GetMarketData(ctx, ids, "usd")
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch market data to resolve ID for '%s': %w", commonAssetSymbol, err)
@@ -413,10 +413,18 @@ func (c *Client) GetCoinID(ctx context.Context, commonAssetSymbol string) (strin
 		return "", fmt.Errorf("no market data available to resolve ID for '%s'", commonAssetSymbol)
 	}
 
+	// Sort by MarketCapRank and filter for exact symbol or name match
 	sort.Slice(marketData, func(i, j int) bool {
 		return marketData[i].MarketCapRank < marketData[j].MarketCapRank
 	})
 
+	for _, data := range marketData {
+		if strings.EqualFold(data.Symbol, symLower) || strings.Contains(strings.ToLower(data.Name), symLower) {
+			return data.ID, nil
+		}
+	}
+
+	// Fallback to the lowest MarketCapRank if no exact match is found
 	return marketData[0].ID, nil
 }
 
