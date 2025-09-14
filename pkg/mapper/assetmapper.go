@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -114,20 +115,24 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 	}
 
 	// Step 4: Find the best match by cross-referencing with Kraken data and market cap rank.
-	var matchedCgCoin *dataprovider.MarketData
+	var candidates []dataprovider.MarketData
 	for _, cgCoin := range cgMarketData {
-		// Check for a symbol match, a valid market cap rank, and that the rank is within our configured top N.
 		if strings.EqualFold(cgCoin.Symbol, commonSymbol) && cgCoin.MarketCapRank > 0 && cgCoin.MarketCapRank <= m.cfg.Trading.DynamicAssetScanTopN {
-			matchedCgCoin = &cgCoin
-			break
+			candidates = append(candidates, cgCoin)
 		}
 	}
 
-	if matchedCgCoin == nil {
+	if len(candidates) == 0 {
 		return nil, fmt.Errorf("mapper: could not find a confident match for '%s' on CoinGecko after cross-referencing", commonSymbol)
 	}
 
-	// Step 3: Use the verified CoinGecko data to find the precise CoinMarketCap ID.
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].MarketCapRank < candidates[j].MarketCapRank
+	})
+	var matchedCgCoin *dataprovider.MarketData // FIX: Declare the variable here to resolve unresolved reference errors.
+	matchedCgCoin = &candidates[0]
+
+	// Step 5: Use the verified CoinGecko data to find the precise CoinMarketCap ID.
 	var cmcID, cmcLogoURL string
 	// --- RESILIENCY CHECK: Only search CMC if it's configured ---
 	if m.coinmarketcap != nil {
@@ -143,7 +148,7 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 	}
 	// --- END CHECK ---
 
-	// Step 4: Download the icon
+	// Step 6: Download the icon
 	iconURL := matchedCgCoin.Image
 	if iconURL == "" {
 		iconURL = cmcLogoURL
@@ -154,7 +159,7 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 		iconPath = ""
 	}
 
-	// Step 5: Assemble the complete identity object
+	// Step 7: Assemble the complete identity object
 	newIdentity := &dataprovider.AssetIdentity{
 		CommonSymbol:    commonSymbol,
 		KrakenAsset:     krakenAssetName,
@@ -165,7 +170,7 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 		LastUpdated:     time.Now(),
 	}
 
-	// Step 6: Save to the database
+	// Step 8: Save to the database
 	if err := m.db.SaveAssetIdentity(newIdentity); err != nil {
 		return nil, fmt.Errorf("mapper: failed to save asset identity for '%s': %w", commonSymbol, err)
 	}

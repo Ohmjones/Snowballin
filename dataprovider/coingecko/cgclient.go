@@ -25,7 +25,7 @@ type Client struct {
 	limiter              *rate.Limiter
 	logger               *utils.Logger
 	idMap                map[string]string
-	symbolToIDMap        map[string]string
+	symbolToIDMap        map[string][]string
 	idMapMu              sync.RWMutex
 	idMapOnce            sync.Once
 	lastIDMapRefresh     time.Time
@@ -203,7 +203,7 @@ func NewClient(cfg *utils.AppConfig, logger *utils.Logger, cache *dataprovider.S
 		logger:               logger,
 		idMap:                make(map[string]string),
 		idMapOnce:            sync.Once{},
-		symbolToIDMap:        make(map[string]string),
+		symbolToIDMap:        make(map[string][]string),
 		idMapRefreshInterval: time.Duration(cgCfg.IDMapRefreshIntervalHours) * time.Hour,
 		cfg:                  cgCfg,
 		cache:                cache,
@@ -331,24 +331,12 @@ func (c *Client) request(ctx context.Context, endpoint string, queryParams url.V
 }
 
 // refreshCoinIDMapIfNeeded fetches the coin list from CoinGecko and updates the internal ID maps.
+// refreshCoinIDMapIfNeeded refreshes the coin ID map if needed.
 func (c *Client) refreshCoinIDMapIfNeeded(ctx context.Context, force bool) error {
-	c.idMapMu.RLock()
-	mapIsEmpty := len(c.idMap) == 0
-	var intervalPassed bool
-	if c.idMapRefreshInterval > 0 { // Avoid panic if interval is zero
-		intervalPassed = time.Since(c.lastIDMapRefresh) > c.idMapRefreshInterval
-	}
-	c.idMapMu.RUnlock()
-
-	if !force && !mapIsEmpty && !intervalPassed {
-		return nil // Map is populated and fresh enough
-	}
-
 	c.refreshMapMu.Lock()
-	if c.isRefreshingIDMap && !force { // Check again after acquiring lock
+	if c.isRefreshingIDMap {
 		c.refreshMapMu.Unlock()
-		c.logger.LogDebug("CoinGecko Client: Coin ID map refresh already in progress by another goroutine.")
-		return nil
+		return nil // Already refreshing
 	}
 	c.isRefreshingIDMap = true
 	c.refreshMapMu.Unlock()
@@ -359,114 +347,77 @@ func (c *Client) refreshCoinIDMapIfNeeded(ctx context.Context, force bool) error
 		c.refreshMapMu.Unlock()
 	}()
 
-	c.logger.LogInfo("CoinGecko Client: Refreshing coin ID map (Forced: %t, MapEmpty: %t, IntervalPassed: %t)...", force, mapIsEmpty, intervalPassed)
+	needsRefresh := force || len(c.idMap) == 0 || time.Since(c.lastIDMapRefresh) > c.idMapRefreshInterval
 
-	cgCoins, err := c.GetSupportedCoins(ctx) // Use the method that takes context
+	if !needsRefresh {
+		return nil
+	}
+
+	c.logger.LogInfo("CoinGecko Client: Refreshing coin ID map (Forced: %v, MapEmpty: %v, IntervalPassed: %v)...", force, len(c.idMap) == 0, time.Since(c.lastIDMapRefresh) > c.idMapRefreshInterval)
+
+	var coinList []cgCoinListEntry
+	err := c.request(ctx, "/coins/list", url.Values{}, &coinList)
 	if err != nil {
-		return fmt.Errorf("refreshCoinIDMapIfNeeded: failed to get supported coins from CoinGecko: %w", err)
+		return fmt.Errorf("failed to fetch coin list from CoinGecko: %w", err)
 	}
 
 	c.idMapMu.Lock()
-	defer c.idMapMu.Unlock()
+	c.idMap = make(map[string]string, len(coinList)*2)
+	c.symbolToIDMap = make(map[string][]string, len(coinList))
 
-	c.idMap = make(map[string]string, len(cgCoins)*2) // Estimate size
-	c.symbolToIDMap = make(map[string]string, len(cgCoins)*2)
+	for _, entry := range coinList {
+		cgIDLower := strings.ToLower(entry.ID)
+		c.idMap[cgIDLower] = cgIDLower
 
-	for _, cgCoin := range cgCoins { // cgCoin is dataprovider.Coin
-		cgIDLower := strings.ToLower(cgCoin.ID) // CoinGecko IDs are typically lowercase
-
-		c.idMap[cgIDLower] = cgIDLower // Map CoinGecko ID to itself
-
-		if cgCoin.Symbol != "" {
-			commonSymbolUpper := strings.ToUpper(cgCoin.Symbol)
-			c.idMap[commonSymbolUpper] = cgIDLower // Map common Uppercase Symbol to CG ID
-
-			// Also map CoinGecko's own symbol (lowercase) -> CoinGecko ID
-			c.symbolToIDMap[strings.ToLower(cgCoin.Symbol)] = cgIDLower
+		if entry.Symbol != "" {
+			symbolLower := strings.ToLower(entry.Symbol)
+			c.symbolToIDMap[symbolLower] = append(c.symbolToIDMap[symbolLower], cgIDLower)
 		}
-		if cgCoin.Name != "" {
-			// Map CoinGecko name (lowercase) -> CoinGecko ID
-			c.symbolToIDMap[strings.ToLower(cgCoin.Name)] = cgIDLower
+
+		if entry.Name != "" {
+			nameLower := strings.ToLower(entry.Name)
+			c.idMap[nameLower] = cgIDLower
 		}
 	}
-	c.lastIDMapRefresh = time.Now().UTC()
-	c.logger.LogInfo("CoinGecko Client: Successfully refreshed coin ID map. Mapped %d coins.", len(cgCoins))
+	c.lastIDMapRefresh = time.Now()
+	c.idMapMu.Unlock()
+
+	c.logger.LogInfo("CoinGecko Client: Successfully refreshed coin ID map. Mapped %d coins.", len(coinList))
+
 	return nil
 }
 
-// GetCoinID implements DataProvider interface.
-// commonAssetSymbol: e.g., "BTC", "Ethereum", "bitcoin"
-func (c *Client) GetCoinID(ctx context.Context, sym string) (string, error) {
-	up := strings.ToUpper(sym)
-	lo := strings.ToLower(sym)
-
-	// --- ADDED: Priority map for critical assets ---
-	priorityMap := map[string]string{
-		"BTC": "bitcoin",
-		"ETH": "ethereum",
-		"SOL": "solana",
-		"XRP": "ripple",
-	}
-	if id, ok := priorityMap[up]; ok {
-		c.logger.LogDebug("CoinGecko GetCoinID: Found '%s' in priority map. Using ID: '%s'", up, id)
-		return id, nil
+// GetCoinID resolves the primary CoinGecko ID for a symbol, selecting the highest ranked if multiple.
+func (c *Client) GetCoinID(ctx context.Context, commonAssetSymbol string) (string, error) {
+	symLower := strings.ToLower(commonAssetSymbol)
+	ids, err := c.GetCoinIDsBySymbol(ctx, symLower)
+	if err != nil {
+		return "", err
 	}
 
-	// 1) Refresh with short timeout
-	rc, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	if err := c.refreshCoinIDMapIfNeeded(rc, false); err != nil {
-		c.logger.LogWarn(
-			"CoinGecko GetCoinID: non-critical error refreshing ID map for '%s': %v; proceeding",
-			sym, err,
-		)
+	if len(ids) == 0 {
+		return "", fmt.Errorf("no CoinGecko ID found for symbol '%s'", commonAssetSymbol)
 	}
 
-	// 2) Grab read-lock and bail if empty
-	c.idMapMu.RLock()
-	mapLen := len(c.idMap) + len(c.symbolToIDMap)
-	if mapLen == 0 {
-		c.idMapMu.RUnlock()
-		return "", fmt.Errorf(
-			"CoinGecko ID map is empty for asset '%s'; initial population may be pending or failed",
-			sym,
-		)
+	if len(ids) == 1 {
+		return ids[0], nil
 	}
 
-	// 4) Data-driven lookup strategies
-	if id, ok := c.idMap[up]; ok {
-		c.idMapMu.RUnlock()
-		return id, nil
-	}
-	if id, ok := c.idMap[lo]; ok {
-		c.idMapMu.RUnlock()
-		return id, nil
-	}
-	if id, ok := c.symbolToIDMap[lo]; ok {
-		c.idMapMu.RUnlock()
-		return id, nil
+	// Multiple IDs, fetch market data to select the one with the lowest MarketCapRank (highest market cap)
+	marketData, err := c.GetMarketData(ctx, ids, "usd")
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch market data to resolve ID for '%s': %w", commonAssetSymbol, err)
 	}
 
-	// 5) XBT → BTC → bitcoin special case
-	if up == "XBT" {
-		if id, ok := c.idMap["BTC"]; ok {
-			c.idMapMu.RUnlock()
-			return id, nil
-		}
-		if id, ok := c.idMap["bitcoin"]; ok {
-			c.idMapMu.RUnlock()
-			return id, nil
-		}
+	if len(marketData) == 0 {
+		return "", fmt.Errorf("no market data available to resolve ID for '%s'", commonAssetSymbol)
 	}
 
-	c.idMapMu.RUnlock()
+	sort.Slice(marketData, func(i, j int) bool {
+		return marketData[i].MarketCapRank < marketData[j].MarketCapRank
+	})
 
-	// 6) Nothing matched
-	c.logger.LogWarn(
-		"CoinGecko GetCoinID: no ID found for symbol '%s'",
-		sym,
-	)
-	return "", fmt.Errorf("CoinGecko ID not found for asset symbol: %s", sym)
+	return marketData[0].ID, nil
 }
 
 // --- DataProvider Interface Method Implementations ---
@@ -901,16 +852,9 @@ func (c *Client) GetCoinIDsBySymbol(ctx context.Context, sym string) ([]string, 
 	var matchingIDs []string
 
 	// Filter the internal maps to find all matches, case-insensitively.
-	for coinSymbol, coinID := range c.symbolToIDMap {
+	for coinSymbol, coinIDs := range c.symbolToIDMap {
 		if strings.EqualFold(coinSymbol, loSym) {
-			matchingIDs = append(matchingIDs, coinID)
-		}
-	}
-
-	// Also check for matches in CoinGecko's full coin name list.
-	for coinName, coinID := range c.idMap {
-		if strings.Contains(strings.ToLower(coinName), loSym) {
-			matchingIDs = append(matchingIDs, coinID)
+			matchingIDs = append(matchingIDs, coinIDs...)
 		}
 	}
 
@@ -955,9 +899,7 @@ func (c *Client) PrimeHistoricalData(ctx context.Context, id, vsCurrency, interv
 	cacheCoinID := fmt.Sprintf("%s-%s-%s", id, strings.ToLower(vsCurrency), interval)
 
 	for _, ohlcPoint := range ohlcData {
-		if len(ohlcPoint) != 5 {
-			continue
-		}
+		// FIX: Remove unnecessary len check (always 5 for fixed array [5]float64).
 		bar := utils.OHLCVBar{
 			Timestamp: int64(ohlcPoint[0]),
 			Open:      ohlcPoint[1],
