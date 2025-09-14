@@ -32,7 +32,8 @@ type Client struct {
 	idMapRefreshInterval time.Duration
 	isRefreshingIDMap    bool
 	refreshMapMu         sync.Mutex
-	cfg                  *utils.CoingeckoConfig
+	appCfg               *utils.AppConfig       // Full AppConfig for access to Trading fields
+	cgCfg                *utils.CoingeckoConfig // Coingecko-specific config
 	cache                *dataprovider.SQLiteCache
 }
 
@@ -156,71 +157,42 @@ type cgTickersResponse struct {
 	Tickers []cgTicker `json:"tickers"`
 }
 
-func NewClient(cfg *utils.AppConfig, logger *utils.Logger, cache *dataprovider.SQLiteCache) (*Client, error) {
-	if cfg == nil {
-		return nil, errors.New("coingecko client: AppConfig cannot be nil")
+// Updated NewClient function in cgclient.go
+func NewClient(appCfg *utils.AppConfig, logger *utils.Logger, cache *dataprovider.SQLiteCache) (*Client, error) {
+	if appCfg == nil {
+		return nil, errors.New("CoinGecko client: AppConfig cannot be nil")
 	}
+
 	if logger == nil {
 		logger = utils.NewLogger(utils.Info)
 		logger.LogWarn("CoinGecko Client: Logger not provided, using default logger.")
 	}
 
-	var cgCfg *utils.CoingeckoConfig
-	if cfg.Coingecko != nil {
-		cgCfg = cfg.Coingecko
-	} else {
-		return nil, errors.New("coingecko client: CoingeckoConfig missing in AppConfig")
+	if appCfg.Coingecko == nil {
+		return nil, errors.New("CoinGecko client: CoingeckoConfig missing in AppConfig")
 	}
 
-	if cgCfg.BaseURL == "" {
-		return nil, errors.New("coingecko client: BaseURL is required in CoingeckoConfig")
+	cgCfg := appCfg.Coingecko
+
+	limiter := rate.NewLimiter(rate.Every(time.Duration(1/cgCfg.RateLimitPerSec)*time.Second), cgCfg.RateLimitBurst)
+
+	httpClient := &http.Client{
+		Timeout: time.Duration(cgCfg.RequestTimeoutSec) * time.Second,
 	}
 
-	if cgCfg.RateLimitPerSec <= 0 {
-		cgCfg.RateLimitPerSec = 1
-		logger.LogWarn("CoinGecko Client: Invalid RateLimitPerSec, defaulting to 1")
-	}
-
-	if cgCfg.RateLimitBurst <= 0 {
-		cgCfg.RateLimitBurst = 1
-		logger.LogWarn("CoinGecko Client: Invalid RateLimitBurst, defaulting to 1")
-	}
-
-	if cgCfg.RequestTimeoutSec <= 0 {
-		cgCfg.RequestTimeoutSec = 10
-		logger.LogWarn("CoinGecko Client: Invalid RequestTimeoutSec, defaulting to 10 seconds")
-	}
-
-	if cache == nil {
-		return nil, errors.New("coingecko client: SQLiteCache cannot be nil")
-	}
-
-	client := &Client{
+	return &Client{
 		BaseURL:              cgCfg.BaseURL,
 		APIKey:               cgCfg.APIKey,
-		HTTPClient:           &http.Client{Timeout: time.Duration(cgCfg.RequestTimeoutSec) * time.Second},
-		limiter:              rate.NewLimiter(rate.Limit(cgCfg.RateLimitPerSec), cgCfg.RateLimitBurst),
+		HTTPClient:           httpClient,
+		limiter:              limiter,
 		logger:               logger,
 		idMap:                make(map[string]string),
-		idMapOnce:            sync.Once{},
 		symbolToIDMap:        make(map[string][]string),
 		idMapRefreshInterval: time.Duration(cgCfg.IDMapRefreshIntervalHours) * time.Hour,
-		cfg:                  cgCfg,
+		appCfg:               appCfg,
+		cgCfg:                cgCfg,
 		cache:                cache,
-	}
-
-	// This block ensures the map is populated once, and safely, before any lookups.
-	client.idMapOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := client.refreshCoinIDMapIfNeeded(ctx, true); err != nil {
-			client.logger.LogError("CoinGecko Client: Initial coin ID map refresh failed: %v", err)
-		}
-	})
-
-	logger.LogInfo("CoinGecko client initialized with URL: %s, RateLimit: %.2f req/sec", client.BaseURL, cgCfg.RateLimitPerSec)
-
-	return client, nil
+	}, nil
 }
 
 // GetTopAssetsByMarketCap fetches the top N assets by market capitalization from CoinGecko.
@@ -324,8 +296,8 @@ func (c *Client) request(ctx context.Context, endpoint string, queryParams url.V
 	req.Header.Set("User-Agent", "SnowballinBot/1.0")
 	c.logger.LogDebug("CoinGecko Request: %s %s", req.Method, req.URL.String())
 
-	maxRetries := c.cfg.MaxRetries
-	retryDelay := time.Duration(c.cfg.RetryDelaySec) * time.Second
+	maxRetries := c.cgCfg.MaxRetries
+	retryDelay := time.Duration(c.cgCfg.RetryDelaySec) * time.Second
 
 	return utils.DoJSONRequest(c.HTTPClient, req, maxRetries, retryDelay, result)
 }
@@ -387,7 +359,7 @@ func (c *Client) refreshCoinIDMapIfNeeded(ctx context.Context, force bool) error
 	return nil
 }
 
-// GetCoinID resolves the primary CoinGecko ID for a symbol, selecting the highest ranked if multiple.
+// Updated GetCoinID to use c.cfg.Trading...
 func (c *Client) GetCoinID(ctx context.Context, commonAssetSymbol string) (string, error) {
 	symLower := strings.ToLower(commonAssetSymbol)
 	ids, err := c.GetCoinIDsBySymbol(ctx, symLower)
@@ -403,7 +375,7 @@ func (c *Client) GetCoinID(ctx context.Context, commonAssetSymbol string) (strin
 		return ids[0], nil
 	}
 
-	// Multiple IDs, fetch market data to select the one with the lowest MarketCapRank and matching symbol/name
+	// Multiple IDs, fetch market data to select the one with the lowest MarketCapRank within the configured top N
 	marketData, err := c.GetMarketData(ctx, ids, "usd")
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch market data to resolve ID for '%s': %w", commonAssetSymbol, err)
@@ -413,19 +385,25 @@ func (c *Client) GetCoinID(ctx context.Context, commonAssetSymbol string) (strin
 		return "", fmt.Errorf("no market data available to resolve ID for '%s'", commonAssetSymbol)
 	}
 
-	// Sort by MarketCapRank and filter for exact symbol or name match
-	sort.Slice(marketData, func(i, j int) bool {
-		return marketData[i].MarketCapRank < marketData[j].MarketCapRank
-	})
-
+	// Collect candidates with rank >0 and <= topN, and matching symbol or name
+	var candidates []dataprovider.MarketData
+	topN := c.appCfg.Trading.DynamicAssetScanTopN // Access from AppConfig
 	for _, data := range marketData {
-		if strings.EqualFold(data.Symbol, symLower) || strings.Contains(strings.ToLower(data.Name), symLower) {
-			return data.ID, nil
+		if data.MarketCapRank > 0 && data.MarketCapRank <= topN && (strings.EqualFold(data.Symbol, symLower) || strings.Contains(strings.ToLower(data.Name), symLower)) {
+			candidates = append(candidates, data)
 		}
 	}
 
-	// Fallback to the lowest MarketCapRank if no exact match is found
-	return marketData[0].ID, nil
+	if len(candidates) == 0 {
+		return "", fmt.Errorf("no confident CoinGecko ID match found for symbol '%s' within top %d market cap ranks", commonAssetSymbol, topN)
+	}
+
+	// Sort candidates by MarketCapRank ascending (lowest rank first)
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].MarketCapRank < candidates[j].MarketCapRank
+	})
+
+	return candidates[0].ID, nil
 }
 
 // --- DataProvider Interface Method Implementations ---
@@ -708,9 +686,9 @@ func (c *Client) GetHistoricalPrice(ctx context.Context, id, date string) (datap
 	}
 
 	// Determine the quote currency to use from config, defaulting to USD
-	quoteCurrencyKey := "usd"                      // Default to USD
-	if c.cfg != nil && c.cfg.QuoteCurrency != "" { // Check if configured quote currency exists
-		quoteCurrencyKey = strings.ToLower(c.cfg.QuoteCurrency)
+	quoteCurrencyKey := "usd"                          // Default to USD
+	if c.cgCfg != nil && c.cgCfg.QuoteCurrency != "" { // Check if configured quote currency exists
+		quoteCurrencyKey = strings.ToLower(c.cgCfg.QuoteCurrency)
 	}
 
 	price, ok := cgHistory.MarketData.CurrentPrice[quoteCurrencyKey]
@@ -760,8 +738,8 @@ func (c *Client) GetGlobalMarketData(ctx context.Context) (dataprovider.GlobalMa
 	}
 
 	quoteCurrencyKey := "usd" // Default to USD
-	if c.cfg != nil && c.cfg.QuoteCurrency != "" {
-		quoteCurrencyKey = strings.ToLower(c.cfg.QuoteCurrency)
+	if c.cgCfg != nil && c.cgCfg.QuoteCurrency != "" {
+		quoteCurrencyKey = strings.ToLower(c.cgCfg.QuoteCurrency)
 	}
 
 	totalMarketCap, ok := cgGlobalResp.Data.TotalMarketCap[quoteCurrencyKey]
