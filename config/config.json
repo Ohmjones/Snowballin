@@ -1,5 +1,5 @@
 {
-  "version": "4.0.0",
+  "version": "5.0.0",
   "logging": {
     "level": "info"
   },
@@ -62,7 +62,7 @@
       "BTC/USD",
       "ETH/USD"
     ],
-    "use_dynamic_asset_scanning": true,
+    "use_dynamic_asset_scanning": false,
     "dynamic_asset_scan_top_n": 25,
     "trailing_stop_enabled": true,
     "take_profit_partial_sell_percent": 50.0,
