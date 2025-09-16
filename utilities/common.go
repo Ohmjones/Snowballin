@@ -172,6 +172,10 @@ type IndicatorsConfig struct {
 	LiquidityHunt         LiquidityHuntConfig `mapstructure:"liquidity_hunt"`
 	StochasticK           int                 `mapstructure:"stochastic_k_period"` // e.g., 14
 	StochasticD           int                 `mapstructure:"stochastic_d_period"` // e.g., 3
+	BollingerPeriod       int                 `mapstructure:"bollinger_period"`
+	BollingerStdDev       float64             `mapstructure:"bollinger_std_dev"`
+	UseSlowStochastic     bool                `mapstructure:"use_slow_stochastic"`
+	StochasticSlowPeriod  int                 `mapstructure:"stochastic_slow_period"`
 }
 
 // InMemoryNonceCounter provides a simple in-memory nonce generator.

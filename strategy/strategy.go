@@ -234,8 +234,15 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 
 	s.logger.LogInfo("GenerateSignals [%s]: MTF Consensus PASSED. Reason: %s. Performing final checks...", data.AssetPair, reason)
 
-	// Final Confirmation
-	rsi, stochRSI, macdHist, obv, volumeSpike, liquidityHunt, _, _, _, _ := CalculateIndicators(primaryBars, cfg)
+	// Final Confirmation with VWAP integration
+	rsi, stochRSI, macdHist, obv, volumeSpike, liquidityHunt, _, _, _, _, vwap := CalculateIndicators(primaryBars, cfg) // Updated to include vwap
+	// VWAP Check: Only proceed if current price is below VWAP, indicating undervaluation
+	if currentPrice >= vwap {
+		s.logger.LogInfo("GenerateSignals [%s]: VWAP Check FAILED. Current Price %.2f >= VWAP %.2f", data.AssetPair, currentPrice, vwap)
+		return nil, nil
+	}
+	s.logger.LogInfo("GenerateSignals [%s]: VWAP Check PASSED. Current Price %.2f < VWAP %.2f", data.AssetPair, currentPrice, vwap)
+
 	isConfirmed, confirmationReason := CheckMultiIndicatorConfirmation(rsi, stochRSI, macdHist, obv, volumeSpike, liquidityHunt, primaryBars, cfg.Indicators)
 	if !isConfirmed {
 		s.logger.LogInfo("GenerateSignals [%s]: Final confirmation FAILED. Reason: %s", data.AssetPair, confirmationReason)
@@ -248,7 +255,7 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 	sentiment := CalculateSentimentConsensus(baseAssetSymbol, data.CgTrendingData, data.CmcTrendingData, s.logger)
 
 	// b) Build the comprehensive reason string for the signal
-	finalReason := fmt.Sprintf("%s | %s", reason, confirmationReason)
+	finalReason := fmt.Sprintf("%s | %s | VWAP Undervaluation (Price %.2f < VWAP %.2f)", reason, confirmationReason, currentPrice, vwap)
 	if sentiment.IsTrending {
 		finalReason += fmt.Sprintf(" | Trending Score: %.2f (%s)", sentiment.AttentionScore, strings.Join(sentiment.TrendingOn, ", "))
 	}
@@ -260,6 +267,14 @@ func (s *strategyImpl) GenerateSignals(ctx context.Context, data ConsolidatedMar
 	atr, _ := CalculateATR(primaryBars, cfg.Indicators.ATRPeriod) // We know this works from the check above
 	recommendedPrice := FindBestLimitPrice(data.BrokerOrderBook, currentPrice-atr, 1.0)
 	calculatedSize := cfg.Trading.BaseOrderSize / recommendedPrice
+
+	// New: Compounding Reinvestment - Scale size based on portfolio growth
+	profitFactor := data.PortfolioValue / data.PeakPortfolioValue // >1 if profits
+	if profitFactor > 1.0 {
+		originalSize := calculatedSize
+		calculatedSize *= profitFactor // Reinvest proportional to growth
+		s.logger.LogInfo("COMPOUNDING: Scaling size by %.2f (from %.4f to %.4f) due to profits", profitFactor, originalSize, calculatedSize)
+	}
 
 	// **MODULATION**: Increase buy size if market mood is bullish
 	if data.MarketSentiment.State == "Bullish" {
@@ -312,7 +327,7 @@ func (s *strategyImpl) GenerateExitSignal(ctx context.Context, data Consolidated
 	}
 
 	// Check for a confirmed bearish reversal after a liquidity hunt (a strong exit signal).
-	_, _, _, _, _, bearishHuntReversal, _, _, _, _ := CalculateIndicators(primaryBars, cfg)
+	_, _, _, _, _, bearishHuntReversal, _, _, _, _, _ := CalculateIndicators(primaryBars, cfg)
 
 	if bearishHuntReversal {
 		s.logger.LogWarn("GenerateExitSignal [%s]: EXIT triggered. Reason: Confirmed Bearish Reversal after Liquidity Hunt", data.AssetPair)
@@ -343,46 +358,38 @@ func isHammerCandle(bar utilities.OHLCVBar) bool {
 	return lowerShadow > 2*body && (bar.High-math.Max(bar.Open, bar.Close)) < body // Long lower shadow for dip reversal
 }
 
-// CheckBearishConfluence checks for a confluence of bearish signals for an exit.
-// CheckBearishConfluence checks for a confluence of bearish signals for an exit.
 func CheckBearishConfluence(bars []utilities.OHLCVBar, cfg utilities.AppConfig) (bool, string) {
 	if len(bars) < cfg.Indicators.MACDSlowPeriod {
 		return false, "Insufficient data for bearish confluence"
 	}
 
-	rsi, stochRSI, macdHist, _, _, _, upperBB, _, stochK, stochD := CalculateIndicators(bars, cfg) // Discard unused
+	rsi, stochRSI, macdHist, obv, _, _, upperBB, _, stochK, stochD, _ := CalculateIndicators(bars, cfg) // Include obv
 
 	isMacdBearish := macdHist < 0
 	isRsiOverbought := rsi > 70
 	isStochRsiOverbought := stochRSI > cfg.Indicators.StochRSISellThreshold
-
-	// New: Bollinger Bands check (e.g., price touching upper band for overbought)
 	currentClose := bars[len(bars)-1].Close
 	isBollingerOverbought := currentClose >= upperBB
-
-	// New: Stochastic check (overbought >80 and bearish crossover: K crosses below D)
-	isStochOverbought := stochK > 80 && stochK < stochD // Bearish crossover
-
-	// === NEW SMA-BASED CONFLUENCE CHECK ===
+	isStochOverbought := stochK > 80 && stochK < stochD
 	isSMACrossoverBearish := false
 	var smaReason string
 	if len(cfg.Trading.SMAPeriodsForExit) == 2 {
 		shortPeriod := cfg.Trading.SMAPeriodsForExit[0]
 		longPeriod := cfg.Trading.SMAPeriodsForExit[1]
-
 		if len(bars) >= longPeriod {
 			closePrices := ExtractCloses(bars)
 			shortSMA := CalculateSMA(closePrices, shortPeriod)
 			longSMA := CalculateSMA(closePrices, longPeriod)
-
-			// Check for a death cross (short SMA below long SMA)
 			if shortSMA < longSMA {
 				isSMACrossoverBearish = true
 				smaReason = fmt.Sprintf("Death Cross: SMA(%d) is below SMA(%d)", shortPeriod, longPeriod)
 			}
 		}
 	}
-	// === END NEW LOGIC ===
+
+	// New: Check OBV for bearish divergence
+	prevObv := CalculateOBV(bars[:len(bars)-1]) // OBV without last bar
+	isObvBearishDivergence := obv < prevObv && bars[len(bars)-1].Close > bars[len(bars)-2].Close
 
 	score := 0
 	var reasons []string
@@ -410,8 +417,12 @@ func CheckBearishConfluence(bars []utilities.OHLCVBar, cfg utilities.AppConfig) 
 		score++
 		reasons = append(reasons, smaReason)
 	}
+	if isObvBearishDivergence {
+		score++
+		reasons = append(reasons, "OBV Bearish Divergence")
+	}
 
-	if score >= 4 { // The score is now out of 6, so we can adjust the threshold if needed.
+	if score >= 4 {
 		return true, fmt.Sprintf("Bearish Confluence: %s", strings.Join(reasons, " & "))
 	}
 

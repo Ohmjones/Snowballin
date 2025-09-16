@@ -1679,7 +1679,7 @@ func (s *TradingState) GetAssetDetailData(assetPair string) (web.AssetDetailData
 	}
 
 	// Calculate indicators to display
-	rsi, stochRSI, macdHist, _, volSpike, liqHunt, _, _, _, _ := strategy.CalculateIndicators(primaryBars, cfg)
+	rsi, stochRSI, macdHist, _, volSpike, liqHunt, _, _, _, _, _ := strategy.CalculateIndicators(primaryBars, cfg)
 
 	// Populate the data structure required by the web package
 	indicatorMap := make(map[string]string)

@@ -102,7 +102,11 @@
       "min_wick_percent": 60.0,
       "vol_spike_multiplier": 1.8,
       "vol_ma_period": 20
-    }
+    },
+    "bollinger_period": 20,
+    "bollinger_std_dev": 2.0,
+    "use_slow_stochastic": false,
+    "stochastic_slow_period": 3
   },
   "consensus": {
     "use_multi_timeframe_consensus": true,

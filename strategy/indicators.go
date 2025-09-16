@@ -53,25 +53,38 @@ func CalculateStochRSI(bars []utilities.OHLCVBar, rsiPeriod, stochPeriod int) fl
 
 	closePrices := ExtractCloses(bars)
 
-	// Calculate RSI series
+	// Calculate RSI series using Wilder's method
 	rsiSeries := make([]float64, 0, len(closePrices)-rsiPeriod)
 	for i := rsiPeriod; i < len(closePrices); i++ {
-		segment := closePrices[i-rsiPeriod : i+1]
-		var gain, loss float64
-		for j := 1; j < len(segment); j++ {
-			change := segment[j] - segment[j-1]
+		segment := bars[i-rsiPeriod : i+1] // Use full OHLCV bars for consistency
+		var gains, losses float64
+
+		// Initial simple averages for first period of the segment
+		for j := 1; j <= rsiPeriod && j < len(segment); j++ {
+			change := segment[j].Close - segment[j-1].Close
 			if change > 0 {
-				gain += change
+				gains += change
 			} else {
-				loss -= change
+				losses -= change
 			}
 		}
+		avgGain := gains / float64(rsiPeriod)
+		avgLoss := losses / float64(rsiPeriod)
 
-		if loss == 0 {
+		// Apply Wilder's EMA smoothing for the latest change if more bars available
+		if len(segment) > rsiPeriod+1 {
+			lastChange := segment[len(segment)-1].Close - segment[len(segment)-2].Close
+			currentGain := math.Max(lastChange, 0)
+			currentLoss := math.Abs(math.Min(lastChange, 0))
+			avgGain = (avgGain*float64(rsiPeriod-1) + currentGain) / float64(rsiPeriod)
+			avgLoss = (avgLoss*float64(rsiPeriod-1) + currentLoss) / float64(rsiPeriod)
+		}
+
+		if avgLoss == 0 {
 			rsiSeries = append(rsiSeries, 100)
 		} else {
-			rs := (gain / float64(rsiPeriod)) / (loss / float64(rsiPeriod))
-			rsiSeries = append(rsiSeries, 100-(100/(1+rs)))
+			rs := avgGain / avgLoss
+			rsiSeries = append(rsiSeries, 100.0-(100.0/(1.0+rs)))
 		}
 	}
 
@@ -98,10 +111,9 @@ func CalculateStochRSI(bars []utilities.OHLCVBar, rsiPeriod, stochPeriod int) fl
 	return ((currentRSI - minRSI) / (maxRSI - minRSI)) * 100
 }
 
-// CalculateMACD calculates the MACD line, signal line, and histogram.
-func CalculateMACD(data []float64, fastPeriod, slowPeriod, signalPeriod int) (macdLine, signalLine, macdHist float64) {
-	if len(data) < slowPeriod+signalPeriod {
-		return 0, 0, 0
+func CalculateMACD(data []float64, fastPeriod, slowPeriod, signalPeriod int) (macdLine, signalLine, macdHist float64, isCrossoverBullish, isCrossoverBearish, isBearishDivergence bool) {
+	if len(data) < slowPeriod+signalPeriod+1 { // +1 for prev comparison
+		return 0, 0, 0, false, false, false
 	}
 
 	ema := func(series []float64, period int) []float64 {
@@ -125,7 +137,7 @@ func CalculateMACD(data []float64, fastPeriod, slowPeriod, signalPeriod int) (ma
 	slowEMA := ema(data, slowPeriod)
 
 	if fastEMA == nil || slowEMA == nil {
-		return 0, 0, 0
+		return 0, 0, 0, false, false, false
 	}
 
 	macdSeries := make([]float64, 0, len(data)-slowPeriod+1)
@@ -134,19 +146,58 @@ func CalculateMACD(data []float64, fastPeriod, slowPeriod, signalPeriod int) (ma
 	}
 
 	if len(macdSeries) < signalPeriod {
-		return 0, 0, 0
+		return 0, 0, 0, false, false, false
 	}
 
 	signalSeries := ema(macdSeries, signalPeriod)
 	if signalSeries == nil {
-		return 0, 0, 0
+		return 0, 0, 0, false, false, false
+	}
+
+	// Ensure we have enough data for previous values
+	if len(macdSeries) < 2 || len(signalSeries) < 2 {
+		finalMacdLine := macdSeries[len(macdSeries)-1]
+		finalSignalLine := signalSeries[len(signalSeries)-1]
+		finalMacdHist := finalMacdLine - finalSignalLine
+		return finalMacdLine, finalSignalLine, finalMacdHist, false, false, false
 	}
 
 	finalMacdLine := macdSeries[len(macdSeries)-1]
 	finalSignalLine := signalSeries[len(signalSeries)-1]
 	finalMacdHist := finalMacdLine - finalSignalLine
 
-	return finalMacdLine, finalSignalLine, finalMacdHist
+	// Crossover: Compare current vs previous values with bounds check
+	prevMacdLine := macdSeries[len(macdSeries)-2]
+	prevSignalLine := signalSeries[len(signalSeries)-2]
+	isCrossoverBullish = (prevMacdLine <= prevSignalLine && finalMacdLine > finalSignalLine)
+	isCrossoverBearish = (prevMacdLine >= prevSignalLine && finalMacdLine < finalSignalLine)
+
+	// Bearish Divergence: Over lookback=20, price higher high but MACD lower high
+	lookback := 20
+	if len(data) < lookback+1 { // +1 for current bar
+		return finalMacdLine, finalSignalLine, finalMacdHist, isCrossoverBullish, isCrossoverBearish, false
+	}
+	recentData := data[len(data)-lookback-1:]             // Include current and lookback
+	recentMacd := macdSeries[len(macdSeries)-lookback-1:] // Align with data
+	if len(recentData) < 2 || len(recentMacd) < 2 {
+		return finalMacdLine, finalSignalLine, finalMacdHist, isCrossoverBullish, isCrossoverBearish, false
+	}
+	priceHighIdx := argmax(recentData)
+	macdHighIdx := argmax(recentMacd)
+	isBearishDivergence = (recentData[len(recentData)-1] > recentData[priceHighIdx] && recentMacd[len(recentMacd)-1] < recentMacd[macdHighIdx])
+
+	return finalMacdLine, finalSignalLine, finalMacdHist, isCrossoverBullish, isCrossoverBearish, isBearishDivergence
+}
+
+// Helper function to find the index of the maximum value in a slice
+func argmax(slice []float64) int {
+	maxIdx := 0
+	for i := 1; i < len(slice); i++ {
+		if slice[i] > slice[maxIdx] {
+			maxIdx = i
+		}
+	}
+	return maxIdx
 }
 
 // CalculateMACDSeries calculates and returns the full series for MACD line, signal line, and histogram.
@@ -226,6 +277,23 @@ func CalculateOBV(bars []utilities.OHLCVBar) float64 {
 		}
 	}
 	return obv
+}
+
+func CalculateVWAP(bars []utilities.OHLCVBar, period int) float64 {
+	if len(bars) < period {
+		return 0
+	}
+	segment := bars[len(bars)-period:]
+	var sumPV, sumV float64
+	for _, bar := range segment {
+		typicalPrice := (bar.High + bar.Low + bar.Close) / 3
+		sumPV += typicalPrice * bar.Volume
+		sumV += bar.Volume
+	}
+	if sumV == 0 {
+		return 0
+	}
+	return sumPV / sumV
 }
 
 // CheckVolumeSpike checks for volume spikes.
@@ -330,8 +398,18 @@ func IsBearishReversalAfterHuntDetected(bars []utilities.OHLCVBar, minWickPercen
 	return wickyVolSpike || reversalVolSpike
 }
 
-// CalculateBollingerBands calculates the upper and lower Bollinger Bands for the last bar.
-func CalculateBollingerBands(bars []utilities.OHLCVBar, period int, stdDev float64) (upperBand, lowerBand float64) {
+// CalculateBollingerBands calculates Bollinger Bands using configurable period and standard deviation.
+// Uses defaults (period=20, stdDev=2.0) if config values are invalid or missing.
+func CalculateBollingerBands(bars []utilities.OHLCVBar, cfg utilities.AppConfig) (upperBand, lowerBand float64) {
+	period := cfg.Indicators.BollingerPeriod
+	if period <= 0 { // Fallback to default if invalid
+		period = 20
+	}
+	stdDev := cfg.Indicators.BollingerStdDev
+	if stdDev <= 0 { // Fallback to default if invalid
+		stdDev = 2.0
+	}
+
 	if len(bars) < period {
 		return 0, 0
 	}
@@ -359,47 +437,97 @@ func CalculateBollingerBands(bars []utilities.OHLCVBar, period int, stdDev float
 	return upperBand, lowerBand
 }
 
-// CalculateStochastic calculates the Stochastic Oscillator (%K and %D) for the last bar.
-func CalculateStochastic(bars []utilities.OHLCVBar, kPeriod, dPeriod int) (percentK, percentD float64) {
+// CalculateWilderRSI calculates RSI using Wilder's EMA smoothing method.
+func CalculateWilderRSI(bars []utilities.OHLCVBar, period int) float64 {
+	if len(bars) < period+1 || period <= 0 {
+		return 50.0 // neutral
+	}
+
+	closes := make([]float64, len(bars))
+	for i, v := range bars {
+		closes[i] = v.Close
+	}
+
+	// Initial simple averages for first period
+	var gains, losses float64
+	for i := 1; i <= period; i++ {
+		change := closes[i] - closes[i-1]
+		if change > 0 {
+			gains += change
+		} else {
+			losses -= change
+		}
+	}
+	avgGain := gains / float64(period)
+	avgLoss := losses / float64(period)
+
+	// For the latest value, use EMA smoothing if more bars available
+	if len(closes) > period+1 {
+		change := closes[len(closes)-1] - closes[len(closes)-2]
+		currentGain := math.Max(change, 0)
+		currentLoss := math.Abs(math.Min(change, 0))
+		avgGain = (avgGain*float64(period-1) + currentGain) / float64(period)
+		avgLoss = (avgLoss*float64(period-1) + currentLoss) / float64(period)
+	}
+
+	if avgLoss == 0 {
+		return 100.0
+	}
+	rs := avgGain / avgLoss
+	return 100.0 - (100.0 / (1.0 + rs))
+}
+
+// CalculateStochastic calculates the Stochastic Oscillator (%K and %D), with optional Slow Stochastic smoothing.
+// Uses Fast Stochastic by default; enables Slow if use_slow_stochastic is true.
+func CalculateStochastic(bars []utilities.OHLCVBar, cfg utilities.AppConfig) (percentK, percentD float64) {
+	kPeriod := cfg.Indicators.StochasticK
+	dPeriod := cfg.Indicators.StochasticD
+	slowPeriod := cfg.Indicators.StochasticSlowPeriod
+	useSlow := cfg.Indicators.UseSlowStochastic
+
 	if len(bars) < kPeriod {
 		return 0, 0
 	}
 
-	// For %K
-	segment := bars[len(bars)-kPeriod:]
-	lowestLow := segment[0].Low
-	highestHigh := segment[0].High
-	for _, bar := range segment {
-		if bar.Low < lowestLow {
-			lowestLow = bar.Low
-		}
-		if bar.High > highestHigh {
-			highestHigh = bar.High
-		}
-	}
-	currentClose := segment[len(segment)-1].Close
-	percentK = ((currentClose - lowestLow) / (highestHigh - lowestLow)) * 100
-
-	// For %D: SMA of %K over dPeriod (need historical %K if dPeriod >1)
-	// Simplified: If dPeriod==1, %D = %K; else compute full series if needed
-	// For now, assume simple %D as SMA of last dPeriod closes as proxy (expand for accuracy)
-	if dPeriod > 1 {
-		kSeries := make([]float64, 0, len(bars)-kPeriod+1)
-		for i := kPeriod - 1; i < len(bars); i++ {
-			subSegment := bars[i-kPeriod+1 : i+1]
-			subLow := subSegment[0].Low
-			subHigh := subSegment[0].High
-			for _, b := range subSegment {
-				if b.Low < subLow {
-					subLow = b.Low
-				}
-				if b.High > subHigh {
-					subHigh = b.High
-				}
+	// Calculate Fast %K series
+	kSeries := make([]float64, 0, len(bars)-kPeriod+1)
+	for i := kPeriod - 1; i < len(bars); i++ {
+		subSegment := bars[i-kPeriod+1 : i+1]
+		subLow := subSegment[0].Low
+		subHigh := subSegment[0].High
+		for _, bar := range subSegment {
+			if bar.Low < subLow {
+				subLow = bar.Low
 			}
-			k := ((bars[i].Close - subLow) / (subHigh - subLow)) * 100
-			kSeries = append(kSeries, k)
+			if bar.High > subHigh {
+				subHigh = bar.High
+			}
 		}
+		currentClose := bars[i].Close
+		k := ((currentClose - subLow) / (subHigh - subLow)) * 100
+		kSeries = append(kSeries, k)
+	}
+
+	// Determine %K based on mode
+	if len(kSeries) == 0 {
+		return 0, 0
+	}
+	var slowKSeries []float64
+	if useSlow && len(kSeries) >= slowPeriod {
+		slowKSeries = make([]float64, 0, len(kSeries)-slowPeriod+1)
+		for i := slowPeriod - 1; i < len(kSeries); i++ {
+			sum := 0.0
+			for j := 0; j < slowPeriod; j++ {
+				sum += kSeries[i-j]
+			}
+			slowKSeries = append(slowKSeries, sum/float64(slowPeriod))
+		}
+		kSeries = slowKSeries // Replace with Slow %K
+	}
+	percentK = kSeries[len(kSeries)-1] // Latest %K (Fast or Slow)
+
+	// Calculate %D: SMA of %K (or Slow %K) over dPeriod
+	if dPeriod > 1 && len(kSeries) >= dPeriod {
 		dSegment := kSeries[len(kSeries)-dPeriod:]
 		sumD := 0.0
 		for _, k := range dSegment {
@@ -425,13 +553,14 @@ func CalculateIndicators(bars []utilities.OHLCVBar, cfg utilities.AppConfig) (
 	lowerBB float64,
 	stochK float64,
 	stochD float64,
+	vwap float64,
 ) {
 	indicatorCfg := cfg.Indicators
 	closePrices := ExtractCloses(bars)
 
-	rsi = CalculateRSI(bars, indicatorCfg.RSIPeriod)
+	rsi = CalculateWilderRSI(bars, indicatorCfg.RSIPeriod)
 	stochRSI = CalculateStochRSI(bars, indicatorCfg.RSIPeriod, indicatorCfg.StochRSIPeriod)
-	_, _, macdHist = CalculateMACD(closePrices, indicatorCfg.MACDFastPeriod, indicatorCfg.MACDSlowPeriod, indicatorCfg.MACDSignalPeriod)
+	_, _, macdHist, _, _, _ = CalculateMACD(closePrices, indicatorCfg.MACDFastPeriod, indicatorCfg.MACDSlowPeriod, indicatorCfg.MACDSignalPeriod)
 	obv = CalculateOBV(bars)
 	volumeSpike = CheckVolumeSpike(bars, indicatorCfg.VolumeSpikeFactor, indicatorCfg.VolumeLookbackPeriod)
 
@@ -444,11 +573,12 @@ func CalculateIndicators(bars []utilities.OHLCVBar, cfg utilities.AppConfig) (
 	)
 
 	// New: Bollinger Bands (using defaults or add config if needed)
-	upperBB, lowerBB = CalculateBollingerBands(bars, 20, 2.0) // Standard 20-period, 2 stdDev
+	upperBB, lowerBB = CalculateBollingerBands(bars, cfg) // Standard 20-period, 2 stdDev
 
 	// New: Stochastic Oscillator (using config periods; assume added to IndicatorsConfig)
-	stochK, stochD = CalculateStochastic(bars, indicatorCfg.StochasticK, indicatorCfg.StochasticD) // e.g., 14,3
+	stochK, stochD = CalculateStochastic(bars, cfg)
+	vwap = CalculateVWAP(bars, 20)
 
 	// Explicitly return all named variables to resolve the "unused variable" error.
-	return rsi, stochRSI, macdHist, obv, volumeSpike, bearishHuntReversal, upperBB, lowerBB, stochK, stochD
+	return rsi, stochRSI, macdHist, obv, volumeSpike, bearishHuntReversal, upperBB, lowerBB, stochK, stochD, vwap
 }
