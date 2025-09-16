@@ -36,6 +36,7 @@ type DataProvider interface {
 	GetTrendingSearches(ctx context.Context) ([]TrendingCoin, error)
 	GetGainersAndLosers(ctx context.Context, quoteCurrency string, topN int) (gainers []MarketData, losers []MarketData, err error)
 	GetCoinIDsBySymbol(ctx context.Context, sym string) ([]string, error)
+	GetAllCoinIDsBySymbol(ctx context.Context, symbol string) ([]string, error)
 }
 type CrossExchangeTicker struct {
 	ExchangeName string

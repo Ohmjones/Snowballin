@@ -253,6 +253,36 @@ func (c *Client) GetAllTickersForAsset(ctx context.Context, coinID string) ([]da
 	return tickers, nil
 }
 
+// GetAllCoinIDsBySymbol fetches all CoinGecko IDs matching a symbol.
+func (c *Client) GetAllCoinIDsBySymbol(ctx context.Context, symbol string) ([]string, error) {
+	url := fmt.Sprintf("%s/coins/list?include_platform=false", c.BaseURL)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.APIKey != "" {
+		req.Header.Set("X-Cg-Pro-Api-Key", c.APIKey)
+	}
+
+	var coins []cgCoinListEntry
+	if err := utils.DoJSONRequest(c.HTTPClient, req, c.cgCfg.MaxRetries, time.Duration(c.cgCfg.RetryDelaySec)*time.Second, &coins); err != nil {
+		return nil, fmt.Errorf("coingecko: failed to fetch coin list: %w", err)
+	}
+
+	var ids []string
+	loSym := strings.ToLower(symbol)
+	for _, coin := range coins {
+		if strings.EqualFold(coin.Symbol, loSym) {
+			ids = append(ids, coin.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("coingecko: no IDs found for symbol %s", symbol)
+	}
+
+	return ids, nil
+}
+
 // PrimeCache ensures the coin ID map is populated before trading begins.
 func (c *Client) PrimeCache(ctx context.Context) error {
 	c.logger.LogInfo("CoinGecko Client: Priming cache by fetching initial coin ID map...")

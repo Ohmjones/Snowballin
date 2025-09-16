@@ -207,42 +207,49 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 
 // findPreciseCmcID gets the CMC ID by cross-referencing market cap data to avoid ambiguity.
 func (m *AssetMapper) findPreciseCmcID(ctx context.Context, symbol string, cgMarketCap float64) (string, string, error) {
-	// Step 1: Use the CMC client's own GetCoinID method to resolve the numerical ID.
-	// This will correctly handle the symbol_overrides from the config.
-	cmcID, err := m.coinmarketcap.GetCoinID(ctx, symbol)
+	// Step 1: Fetch all matching IDs for the symbol using CMC's map endpoint (returns array for multiple matches)
+	// Assume CMC package has GetAllCoinIDsBySymbol or similar; if not, implement via HTTP
+	cmcIDs, err := m.coinmarketcap.GetAllCoinIDsBySymbol(ctx, symbol) // New method needed; see below
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get CMC numerical ID for symbol %s: %w", symbol, err)
+		return "", "", fmt.Errorf("failed to get all CMC IDs for symbol %s: %w", symbol, err)
+	}
+	if len(cmcIDs) == 0 {
+		return "", "", fmt.Errorf("no CMC IDs found for symbol %s", symbol)
 	}
 
-	// Step 2: Call GetMarketData with the correct numerical ID.
-	cmcMarketData, err := m.coinmarketcap.GetMarketData(ctx, []string{cmcID}, "USD")
+	// Step 2: Get market data for ALL matching IDs
+	cmcMarketData, err := m.coinmarketcap.GetMarketData(ctx, cmcIDs, "USD")
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get CMC market data for ID %s: %w", cmcID, err)
+		return "", "", fmt.Errorf("failed to get CMC market data for IDs [%s]: %w", strings.Join(cmcIDs, ","), err)
 	}
 	if len(cmcMarketData) == 0 {
-		return "", "", fmt.Errorf("no market data returned from CMC for ID %s", cmcID)
+		return "", "", fmt.Errorf("no market data returned from CMC for IDs [%s]", strings.Join(cmcIDs, ","))
 	}
 
-	// The rest of the function remains the same, as the data returned is now correct.
-	if len(cmcMarketData) == 1 {
-		return cmcMarketData[0].ID, cmcMarketData[0].Image, nil
-	}
-
-	m.logger.LogWarn("Multiple CMC results for symbol '%s'. Comparing market caps for precision.", symbol)
+	m.logger.LogWarn("Multiple CMC results for symbol '%s' (%d candidates). Comparing market caps for precision.", symbol, len(cmcMarketData))
 	const marketCapTolerance = 0.15 // 15% difference
 
+	var bestMatch *dataprovider.MarketData
+	minDifference := math.MaxFloat64
 	for _, data := range cmcMarketData {
 		if cgMarketCap == 0 || data.MarketCap == 0 {
-			continue // Avoid division by zero if a provider has no market cap data
+			continue // Avoid division by zero
 		}
 		difference := math.Abs(data.MarketCap - cgMarketCap)
-		if (difference / cgMarketCap) < marketCapTolerance {
-			m.logger.LogInfo("Precise match found for %s on CMC: ID %s (Market Cap Match)", symbol, data.ID)
-			return data.ID, data.Image, nil
+		relativeDiff := difference / cgMarketCap
+		if relativeDiff < marketCapTolerance && relativeDiff < minDifference {
+			minDifference = relativeDiff
+			bestMatch = &data
+			m.logger.LogDebug("CMC candidate for %s: ID %s, MarketCap %f, Relative Diff %f", symbol, data.ID, data.MarketCap, relativeDiff)
 		}
 	}
 
-	return "", "", fmt.Errorf("no precise match found on CMC for %s after comparing market caps", symbol)
+	if bestMatch == nil {
+		return "", "", fmt.Errorf("no precise match found on CMC for %s after comparing market caps", symbol)
+	}
+
+	m.logger.LogInfo("Precise match found for %s on CMC: ID %s (Market Cap Match)", symbol, bestMatch.ID)
+	return bestMatch.ID, bestMatch.Image, nil
 }
 
 // downloadIcon fetches an image from a URL and saves it locally.

@@ -436,6 +436,26 @@ func (c *Client) GetCoinIDsBySymbol(ctx context.Context, sym string) ([]string, 
 	// Return the single ID in a slice to match the interface signature.
 	return []string{id}, nil
 }
+
+// GetAllCoinIDsBySymbol fetches all matching IDs for a symbol using /v1/cryptocurrency/map
+func (c *Client) GetAllCoinIDsBySymbol(ctx context.Context, symbol string) ([]string, error) {
+	params := url.Values{}
+	params.Add("symbol", strings.ToUpper(symbol))
+
+	var response cmcMapResponse
+	if err := c.makeAPICall(ctx, "/v1/cryptocurrency/map", params, &response); err != nil {
+		return nil, err
+	}
+	if response.Status.ErrorCode != 0 {
+		return nil, fmt.Errorf("CMC API error: %s", response.Status.ErrorMessage)
+	}
+
+	ids := make([]string, len(response.Data))
+	for i, entry := range response.Data {
+		ids[i] = strconv.Itoa(entry.ID)
+	}
+	return ids, nil
+}
 func (c *Client) GetCoinID(ctx context.Context, commonAssetSymbol string) (string, error) {
 	// --- START OF FIX ---
 	// Step 1: Check for a manual override first.
