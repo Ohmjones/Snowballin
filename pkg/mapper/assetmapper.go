@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -62,14 +63,18 @@ func (m *AssetMapper) GetIdentity(ctx context.Context, commonSymbol string) (*da
 	return m.discoverAndMapAsset(ctx, upperSymbol)
 }
 
-// discoverAndMapAsset orchestrates asset identification using Kraken as the primary source.
+// discoverAndMapAsset orchestrates the multi-provider identification process.
 func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol string) (*dataprovider.AssetIdentity, error) {
-	// RESILIENCY CHECK: Ensure Kraken is configured
+	// --- RESILIENCY CHECK: Ensure essential providers are configured ---
+	if m.coingecko == nil {
+		return nil, errors.New("cannot discover new asset identity: CoinGecko data provider is not configured")
+	}
 	if m.kraken == nil {
 		return nil, errors.New("cannot discover new asset identity: Kraken client is not configured")
 	}
+	// --- END CHECK ---
 
-	// Step 1: Get all asset pair details from Kraken (source of truth)
+	// Step 1: Get all asset pair details from Kraken (our source of truth)
 	krakenPairs, err := m.kraken.GetAssetPairsAPI(ctx, "")
 	if err != nil {
 		return nil, fmt.Errorf("mapper: failed to get asset pairs from Kraken: %w", err)
@@ -77,41 +82,126 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 
 	var targetKrakenPair *kraken.AssetPairInfo
 	var krakenAssetName string
-	for name, pair := range krakenPairs {
-		commonBaseName, err := m.kraken.GetCommonAssetName(ctx, pair.Base)
-		if err != nil {
-			continue
+
+	// Determine preferred quote based on config (e.g., "usd" -> "ZUSD", "usdt" -> "USDT")
+	preferredQuote := ""
+	fallbackQuotes := []string{"ZUSD", "USDT"}
+	if strings.EqualFold(m.cfg.Kraken.QuoteCurrency, "usd") {
+		preferredQuote = "ZUSD"
+	} else if strings.EqualFold(m.cfg.Kraken.QuoteCurrency, "usdt") {
+		preferredQuote = "USDT"
+	} else {
+		return nil, fmt.Errorf("mapper: unsupported quote_currency '%s' in config", m.cfg.Kraken.QuoteCurrency)
+	}
+	m.logger.LogDebug("mapper: Preferred quote for %s: %s (from config quote_currency: %s)", commonSymbol, preferredQuote, m.cfg.Kraken.QuoteCurrency)
+
+	// Helper to find pair with specific quote
+	findPairWithQuote := func(quote string) bool {
+		for name, pair := range krakenPairs {
+			commonBaseName, err := m.kraken.GetCommonAssetName(ctx, pair.Base)
+			if err != nil {
+				continue
+			}
+			if strings.EqualFold(commonBaseName, commonSymbol) && strings.EqualFold(pair.Quote, quote) {
+				p := pair
+				targetKrakenPair = &p
+				krakenAssetName = name
+				return true
+			}
 		}
-		if strings.EqualFold(commonBaseName, commonSymbol) && (strings.EqualFold(pair.Quote, "ZUSD") || strings.EqualFold(pair.Quote, "USDT")) {
-			p := pair
-			targetKrakenPair = &p
-			krakenAssetName = name
-			break
+		return false
+	}
+
+	// First: Try preferred quote
+	if !findPairWithQuote(preferredQuote) {
+		// Second: Try fallbacks
+		found := false
+		for _, fallbackQuote := range fallbackQuotes {
+			if fallbackQuote != preferredQuote && findPairWithQuote(fallbackQuote) {
+				found = true
+				m.logger.LogWarn("mapper: Preferred quote not found for %s; falling back to %s (%s)", commonSymbol, fallbackQuote, krakenAssetName)
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("mapper: could not find a matching USD/USDT asset pair for '%s' on Kraken", commonSymbol)
+		}
+	} else {
+		m.logger.LogInfo("mapper: Preferred quote match found for %s: %s", commonSymbol, krakenAssetName)
+	}
+
+	// Step 2: Get all potential CoinGecko IDs for the common symbol.
+	cgIDs, err := m.coingecko.GetCoinIDsBySymbol(ctx, commonSymbol)
+	if err != nil {
+		return nil, fmt.Errorf("mapper: failed to get CoinGecko IDs for '%s': %w", commonSymbol, err)
+	}
+
+	// Step 3: Get market data for ALL potential CoinGecko IDs to filter by market cap and volume.
+	cgMarketData, err := m.coingecko.GetMarketData(ctx, cgIDs, "USD")
+	if err != nil {
+		return nil, fmt.Errorf("mapper: failed to get market data for CoinGecko IDs [%s]: %w", strings.Join(cgIDs, ","), err)
+	}
+
+	// Step 4: Find the best match by cross-referencing with Kraken data and market cap rank.
+	var candidates []dataprovider.MarketData
+	for _, cgCoin := range cgMarketData {
+		if strings.EqualFold(cgCoin.Symbol, commonSymbol) && cgCoin.MarketCapRank > 0 && cgCoin.MarketCapRank <= m.cfg.Trading.DynamicAssetScanTopN {
+			candidates = append(candidates, cgCoin)
 		}
 	}
 
-	if targetKrakenPair == nil {
-		return nil, fmt.Errorf("mapper: could not find a matching USD/USDT asset pair for '%s' on Kraken", commonSymbol)
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("mapper: could not find a confident match for '%s' on CoinGecko after cross-referencing", commonSymbol)
 	}
 
-	// Step 2: Create identity without external providers
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].MarketCapRank < candidates[j].MarketCapRank
+	})
+	matchedCgCoin := &candidates[0]
+
+	// Step 5: Use the verified CoinGecko data to find the precise CoinMarketCap ID.
+	var cmcID, cmcLogoURL string
+	if m.coinmarketcap != nil {
+		var cmcErr error
+		cmcID, cmcLogoURL, cmcErr = m.findPreciseCmcID(ctx, commonSymbol, matchedCgCoin.MarketCap)
+		if cmcErr != nil {
+			m.logger.LogWarn("mapper: could not resolve CoinMarketCap ID for '%s': %v", commonSymbol, cmcErr)
+			cmcID = "N/A"
+		}
+	} else {
+		m.logger.LogInfo("mapper: CoinMarketCap provider not configured, skipping ID resolution for '%s'.", commonSymbol)
+		cmcID = "N/A"
+	}
+
+	// Step 6: Download the icon
+	iconURL := matchedCgCoin.Image
+	if iconURL == "" {
+		iconURL = cmcLogoURL
+	}
+	iconPath, err := m.downloadIcon(ctx, matchedCgCoin.ID, iconURL)
+	if err != nil {
+		m.logger.LogWarn("mapper: failed to download icon for '%s': %v", commonSymbol, err)
+		iconPath = ""
+	}
+
+	// Step 7: Assemble the complete identity object
 	newIdentity := &dataprovider.AssetIdentity{
 		CommonSymbol:    commonSymbol,
 		KrakenAsset:     krakenAssetName,
 		KrakenWsName:    targetKrakenPair.WSName,
-		CoinGeckoID:     "N/A",
-		CoinMarketCapID: "N/A",
-		IconPath:        "",
+		CoinGeckoID:     matchedCgCoin.ID,
+		CoinMarketCapID: cmcID,
+		IconPath:        iconPath,
 		LastUpdated:     time.Now(),
 	}
 
-	// Step 3: Save to the database
+	// Step 8: Save to the database
 	if err := m.db.SaveAssetIdentity(newIdentity); err != nil {
 		return nil, fmt.Errorf("mapper: failed to save asset identity for '%s': %w", commonSymbol, err)
 	}
 
 	m.identityCache.Store(commonSymbol, newIdentity)
-	m.logger.LogInfo("Successfully mapped asset using Kraken: %s (CG: %s, CMC: %s)", commonSymbol, newIdentity.CoinGeckoID, newIdentity.CoinMarketCapID)
+	m.logger.LogInfo("Successfully discovered and mapped new asset: %s (CG: %s, CMC: %s)", commonSymbol, newIdentity.CoinGeckoID, newIdentity.CoinMarketCapID)
 	return newIdentity, nil
 }
 

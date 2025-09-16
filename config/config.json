@@ -28,12 +28,7 @@
   "coinmarketcap": {
     "base_url": "https://pro-api.coinmarketcap.com",
     "api_key": "",
-    "symbol_overrides": {
-      "BTC": "1",
-      "ETH": "1027",
-      "SOL": "5426",
-      "XRP": "52"
-    },
+    "symbol_overrides": {},
     "quote_currency": "USD",
     "request_timeout_sec": 10,
     "max_retries": 3,
