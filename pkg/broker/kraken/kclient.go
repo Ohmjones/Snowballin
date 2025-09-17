@@ -1,10 +1,10 @@
+// File: pkg/broker/kraken/kclient.go
 package kraken
 
 import (
 	"Snowballin/pkg/broker"
 	"Snowballin/utilities"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -17,12 +17,17 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// PairDetail holds essential formatting and limit information for a specific trading pair.
+// This data is cached within the client to avoid repeated API calls for static information.
 type PairDetail struct {
 	PairDecimals int
 	LotDecimals  int
 	OrderMin     string
 }
 
+// Client manages all low-level communication with the Kraken API.
+// It handles request signing, rate limiting, and mapping between Kraken's asset names
+// and the application's common asset names (e.g., "XBT" vs "BTC").
 type Client struct {
 	BaseURL        string
 	APIKey         string
@@ -32,27 +37,59 @@ type Client struct {
 	logger         *utilities.Logger
 	nonceGenerator *utilities.KrakenNonceGenerator
 	cfg            *utilities.KrakenConfig
-	dataMu         sync.RWMutex
+	dataMu         sync.RWMutex // Protects all map caches below
 
-	assetInfoMap        map[string]AssetInfo
+	// assetInfoMap caches raw asset details from the /Assets endpoint, keyed by Kraken's asset name (e.g., "XXBT").
+	assetInfoMap map[string]AssetInfo
+	// commonToKrakenAsset maps a common uppercase asset name (e.g., "BTC") to Kraken's primary asset name (e.g., "XXBT").
 	commonToKrakenAsset map[string]string
 
-	pairInfoMap           map[string]AssetPairInfo
-	pairDetailsCache      map[string]PairDetail
+	// pairInfoMap caches raw pair details from the /AssetPairs endpoint, keyed by Kraken's primary pair name (e.g., "XBTUSD").
+	pairInfoMap map[string]AssetPairInfo
+	// pairDetailsCache stores curated PairDetail structs for quick access to formatting rules.
+	pairDetailsCache map[string]PairDetail
+	// commonToTradeablePair maps a common pair name (e.g., "BTC/USD") to Kraken's altname or primary name used for trading.
 	commonToTradeablePair map[string]string
-	commonToPrimaryPair   map[string]string
-	commonToKrakenPair    map[string]string
-	krakenToCommonPair    map[string]string
+	// commonToPrimaryPair maps a common pair name (e.g., "BTC/USD") to Kraken's unique, non-altname pair identifier.
+	commonToPrimaryPair map[string]string
+	// commonToKrakenPair maps a common pair name (e.g., "BTC/USD") to the Kraken pair name.
+	commonToKrakenPair map[string]string
+	// krakenToCommonPair maps a Kraken pair name (primary or altname) back to the common "BASE/QUOTE" format.
+	krakenToCommonPair map[string]string
 }
 
-func getCommonAssetName(info AssetInfo) string {
-	altname := info.Altname
-	if altname == "XBT" {
-		return "BTC"
+// NewClient initializes and returns a new Kraken API client.
+// It requires configuration, an HTTP client, and a logger to operate.
+func NewClient(appCfg *utilities.KrakenConfig, HTTPClient *http.Client, logger *utilities.Logger) *Client {
+	return &Client{
+		BaseURL:               appCfg.BaseURL,
+		APIKey:                appCfg.APIKey,
+		APISecret:             appCfg.APISecret,
+		HTTPClient:            &http.Client{Timeout: time.Duration(appCfg.RequestTimeoutSec) * time.Second},
+		limiter:               rate.NewLimiter(rate.Limit(1), 3),
+		logger:                logger,
+		nonceGenerator:        utilities.NewNonceCounter(),
+		cfg:                   appCfg,
+		assetInfoMap:          make(map[string]AssetInfo),
+		commonToKrakenAsset:   make(map[string]string),
+		pairInfoMap:           make(map[string]AssetPairInfo),
+		commonToKrakenPair:    make(map[string]string),
+		krakenToCommonPair:    make(map[string]string),
+		commonToPrimaryPair:   make(map[string]string),
+		commonToTradeablePair: make(map[string]string),
+		pairDetailsCache:      make(map[string]PairDetail),
 	}
-	return strings.Split(altname, ".")[0]
 }
 
+// getCommonAssetName is a helper to derive a common symbol from Kraken's AssetInfo.
+// It primarily parses the altname, removing suffixes like ".S".
+func getCommonAssetName(info AssetInfo) string {
+	// Handles assets like "ETH2.S" -> "ETH2" or "SOL" -> "SOL"
+	return strings.Split(info.Altname, ".")[0]
+}
+
+// RefreshAssets fetches the latest asset data from Kraken and rebuilds the internal asset maps.
+// This is crucial for translating between common names and Kraken's specific names.
 func (c *Client) RefreshAssets(ctx context.Context) error {
 	c.logger.LogInfo("Kraken Client: Refreshing assets info...")
 	var resp struct {
@@ -70,37 +107,58 @@ func (c *Client) RefreshAssets(ctx context.Context) error {
 	defer c.dataMu.Unlock()
 
 	c.assetInfoMap = make(map[string]AssetInfo)
-	c.commonToKrakenAsset = make(map[string]string)
 
 	for krakenName, info := range resp.Result {
 		c.assetInfoMap[krakenName] = info
-	}
-
-	for krakenName, info := range resp.Result {
-		commonName := getCommonAssetName(info)
-		if commonName != "" {
-			c.commonToKrakenAsset[strings.ToUpper(commonName)] = krakenName
-			if info.Altname != "" && info.Altname != krakenName {
-				c.assetInfoMap[info.Altname] = info
-			}
+		if info.Altname != "" && info.Altname != krakenName {
+			c.assetInfoMap[info.Altname] = info // Also map by altname for easier lookup
 		}
 	}
 
-	c.logger.LogInfo("Kraken Client: Refreshed and mapped %d assets with all aliases.", len(resp.Result))
+	c.logger.LogInfo("Kraken Client: Refreshed and cached %d assets.", len(resp.Result))
 	return nil
 }
 
-func (c *Client) RefreshAssetPairs(ctx context.Context) error {
-	c.logger.LogInfo("Kraken Client: Refreshing asset pairs info...")
-	var resp struct {
+// RefreshAssetPairs fetches asset pair data from Kraken and builds the pair translation maps.
+// It uses a two-stage fetch: first, it gets all pairs to learn the canonical primary names,
+// then it resolves the user's configured common pairs against that canonical data.
+// This allows it to programmatically learn all mappings without any hardcoding.
+func (c *Client) RefreshAssetPairs(ctx context.Context, configuredPairs []string) error {
+	if len(configuredPairs) == 0 {
+		return errors.New("RefreshAssetPairs requires at least one configured pair to build mappings")
+	}
+	c.logger.LogInfo("Kraken Client: Refreshing asset pairs using %v...", configuredPairs)
+
+	// STAGE 1: Discovery - Fetch ALL pairs to learn canonical primary names.
+	var allPairsResp struct {
 		Error  []string                 `json:"error"`
 		Result map[string]AssetPairInfo `json:"result"`
 	}
-	if err := c.callPublic(ctx, "/0/public/AssetPairs", nil, &resp); err != nil {
-		return err
+	if err := c.callPublic(ctx, "/0/public/AssetPairs", nil, &allPairsResp); err != nil {
+		return fmt.Errorf("failed to call AssetPairs for discovery: %w", err)
 	}
-	if len(resp.Error) > 0 {
-		return errors.New(strings.Join(resp.Error, ", "))
+	if len(allPairsResp.Error) > 0 {
+		return fmt.Errorf("AssetPairs discovery API error: %s", strings.Join(allPairsResp.Error, ", "))
+	}
+
+	// Build a lookup map from "BaseQuote" -> "PrimaryName" (e.g., "XXBTZUSD" -> "XBTUSD")
+	baseQuoteToPrimaryName := make(map[string]string)
+	for primaryName, pairInfo := range allPairsResp.Result {
+		lookupKey := pairInfo.Base + pairInfo.Quote
+		baseQuoteToPrimaryName[lookupKey] = primaryName
+	}
+
+	// STAGE 2: Resolution - Fetch specific data for configured pairs to get links.
+	var resolvedPairsResp struct {
+		Error  []string                 `json:"error"`
+		Result map[string]AssetPairInfo `json:"result"`
+	}
+	params := url.Values{"pair": {strings.Join(configuredPairs, ",")}}
+	if err := c.callPublic(ctx, "/0/public/AssetPairs", params, &resolvedPairsResp); err != nil {
+		return fmt.Errorf("failed to call AssetPairs for resolution: %w", err)
+	}
+	if len(resolvedPairsResp.Error) > 0 {
+		return fmt.Errorf("AssetPairs resolution API error: %s", strings.Join(resolvedPairsResp.Error, ", "))
 	}
 
 	c.dataMu.Lock()
@@ -110,47 +168,55 @@ func (c *Client) RefreshAssetPairs(ctx context.Context) error {
 		return errors.New("asset map not initialized, call RefreshAssets first")
 	}
 
-	c.pairInfoMap = resp.Result
+	// Reset all maps before rebuilding
+	c.pairInfoMap = allPairsResp.Result // Store the full map
 	c.commonToTradeablePair = make(map[string]string)
 	c.commonToPrimaryPair = make(map[string]string)
 	c.krakenToCommonPair = make(map[string]string)
 	c.pairDetailsCache = make(map[string]PairDetail)
 	c.commonToKrakenPair = make(map[string]string)
+	c.commonToKrakenAsset = make(map[string]string)
 
-	for primaryPairName, pairInfo := range resp.Result {
-		baseInfo, baseOk := c.assetInfoMap[pairInfo.Base]
-		quoteInfo, quoteOk := c.assetInfoMap[pairInfo.Quote]
-		if !baseOk || !quoteOk {
+	// STAGE 3: Build Maps using resolved data and the canonical lookup map
+	for commonPairKey, resolvedPairInfo := range resolvedPairsResp.Result {
+		parts := strings.Split(commonPairKey, "/")
+		if len(parts) != 2 {
+			c.logger.LogWarn("Invalid common pair format in API response, skipping: %s", commonPairKey)
 			continue
 		}
+		commonBase, commonQuote := parts[0], parts[1]
 
-		commonBase := getCommonAssetName(baseInfo)
-		commonQuote := getCommonAssetName(quoteInfo)
-		if commonBase == "" || commonQuote == "" {
-			continue
+		// Map common asset names to Kraken's internal base names (e.g., "BTC" -> "XXBT")
+		c.commonToKrakenAsset[commonBase] = resolvedPairInfo.Base
+		c.commonToKrakenAsset[commonQuote] = resolvedPairInfo.Quote
+
+		// Find the true primary name using the lookup map created in Stage 1
+		lookupKey := resolvedPairInfo.Base + resolvedPairInfo.Quote
+		primaryPairName, ok := baseQuoteToPrimaryName[lookupKey]
+		if !ok {
+			c.logger.LogWarn("Could not find primary name for pair %s, falling back to altname", commonPairKey)
+			primaryPairName = resolvedPairInfo.Altname // Fallback, should be rare
 		}
 
-		commonPairKey := fmt.Sprintf("%s/%s", commonBase, commonQuote)
-		tradeablePairName := pairInfo.Altname
-		if tradeablePairName == "" {
-			tradeablePairName = primaryPairName
-		}
-
+		// Populate all translation maps with the resolved and canonical data
 		c.commonToPrimaryPair[commonPairKey] = primaryPairName
-		c.commonToTradeablePair[commonPairKey] = tradeablePairName
+		c.commonToTradeablePair[commonPairKey] = resolvedPairInfo.Altname
 		c.commonToKrakenPair[commonPairKey] = primaryPairName
 		c.krakenToCommonPair[primaryPairName] = commonPairKey
-		if tradeablePairName != primaryPairName {
-			c.krakenToCommonPair[tradeablePairName] = commonPairKey
+		if resolvedPairInfo.Altname != primaryPairName {
+			c.krakenToCommonPair[resolvedPairInfo.Altname] = commonPairKey
 		}
 
-		c.pairDetailsCache[tradeablePairName] = PairDetail{
-			PairDecimals: pairInfo.PairDecimals,
-			LotDecimals:  pairInfo.LotDecimals,
-			OrderMin:     pairInfo.OrderMin,
+		c.pairDetailsCache[primaryPairName] = PairDetail{
+			PairDecimals: resolvedPairInfo.PairDecimals,
+			LotDecimals:  resolvedPairInfo.LotDecimals,
+			OrderMin:     resolvedPairInfo.OrderMin,
+		}
+		if resolvedPairInfo.Altname != primaryPairName {
+			c.pairDetailsCache[resolvedPairInfo.Altname] = c.pairDetailsCache[primaryPairName]
 		}
 	}
-	c.logger.LogInfo("Kraken Client: Refreshed %d asset pairs and built comprehensive translation maps.", len(c.pairInfoMap))
+	c.logger.LogInfo("Kraken Client: Refreshed and built canonical maps for %d configured pairs.", len(c.commonToKrakenPair))
 	return nil
 }
 
@@ -175,6 +241,8 @@ func (c *Client) GetAssetPairsAPI(ctx context.Context, pair string) (map[string]
 	return resp.Result, nil
 }
 
+// ParseOHLCV converts a raw Kraken OHLCV array into a standardized utilities.OHLCVBar struct.
+// Kraken's format is typically [time, open, high, low, close, vwap, volume, count].
 func (c *Client) ParseOHLCV(kBar []interface{}) (utilities.OHLCVBar, error) {
 	if len(kBar) < 7 {
 		return utilities.OHLCVBar{}, errors.New("invalid OHLCV bar format")
@@ -189,11 +257,12 @@ func (c *Client) ParseOHLCV(kBar []interface{}) (utilities.OHLCVBar, error) {
 		return utilities.OHLCVBar{}, fmt.Errorf("error parsing OHLCV values: ts=%v, o=%v, h=%v, l=%v, c=%v, v=%v", errTs, errO, errH, errL, errC, errV)
 	}
 	return utilities.OHLCVBar{
-		Timestamp: int64(ts) * 1000, // Convert to milliseconds
+		Timestamp: int64(ts) * 1000, // Convert Unix seconds to milliseconds
 		Open:      open, High: high, Low: low, Close: closeVal, Volume: volume,
 	}, nil
 }
 
+// ParseOrderBook converts a raw Kraken order book response into the standardized broker.OrderBookData struct.
 func (c *Client) ParseOrderBook(rawOrderBook KrakenAPIRawOrderBook, commonPair string) (broker.OrderBookData, error) {
 	bids := make([]broker.OrderBookLevel, len(rawOrderBook.Bids))
 	for i, b := range rawOrderBook.Bids {
@@ -223,13 +292,32 @@ func (c *Client) ParseOrderBook(rawOrderBook KrakenAPIRawOrderBook, commonPair s
 	}, nil
 }
 
-func (c *Client) ParseTicker(tickerInfo TickerInfo, pair string) broker.TickerData {
-	lastPrice, _ := strconv.ParseFloat(tickerInfo.LastTradeClosed[0], 64)
-	highPrice, _ := strconv.ParseFloat(tickerInfo.High[1], 64)
-	lowPrice, _ := strconv.ParseFloat(tickerInfo.Low[1], 64)
-	volume, _ := strconv.ParseFloat(tickerInfo.Volume[1], 64)
-	bidPrice, _ := strconv.ParseFloat(tickerInfo.Bid[0], 64)
-	askPrice, _ := strconv.ParseFloat(tickerInfo.Ask[0], 64)
+// ParseTicker converts a raw Kraken TickerInfo struct into the standardized broker.TickerData struct.
+func (c *Client) ParseTicker(tickerInfo TickerInfo, pair string) (broker.TickerData, error) {
+	lastPrice, err := strconv.ParseFloat(tickerInfo.LastTradeClosed[0], 64)
+	if err != nil {
+		return broker.TickerData{}, fmt.Errorf("failed to parse last price: %w", err)
+	}
+	highPrice, err := strconv.ParseFloat(tickerInfo.High[1], 64)
+	if err != nil {
+		return broker.TickerData{}, fmt.Errorf("failed to parse high price: %w", err)
+	}
+	lowPrice, err := strconv.ParseFloat(tickerInfo.Low[1], 64)
+	if err != nil {
+		return broker.TickerData{}, fmt.Errorf("failed to parse low price: %w", err)
+	}
+	volume, err := strconv.ParseFloat(tickerInfo.Volume[1], 64)
+	if err != nil {
+		return broker.TickerData{}, fmt.Errorf("failed to parse volume: %w", err)
+	}
+	bidPrice, err := strconv.ParseFloat(tickerInfo.Bid[0], 64)
+	if err != nil {
+		return broker.TickerData{}, fmt.Errorf("failed to parse bid price: %w", err)
+	}
+	askPrice, err := strconv.ParseFloat(tickerInfo.Ask[0], 64)
+	if err != nil {
+		return broker.TickerData{}, fmt.Errorf("failed to parse ask price: %w", err)
+	}
 
 	return broker.TickerData{
 		Pair:      pair,
@@ -240,42 +328,11 @@ func (c *Client) ParseTicker(tickerInfo TickerInfo, pair string) broker.TickerDa
 		Bid:       bidPrice,
 		Ask:       askPrice,
 		Timestamp: time.Now(),
-	}
+	}, nil
 }
 
-func (c *Client) ParseOrder(orderID string, krakenOrder KrakenOrderInfo, commonPair string) broker.Order {
-	price, _ := strconv.ParseFloat(krakenOrder.Price, 64)
-	volume, _ := strconv.ParseFloat(krakenOrder.Volume, 64)
-	filledVolume, _ := strconv.ParseFloat(krakenOrder.VolExec, 64)
-	fee, _ := strconv.ParseFloat(krakenOrder.Fee, 64)
-	cost, _ := strconv.ParseFloat(krakenOrder.Cost, 64)
-
-	var avgFillPrice float64
-	if filledVolume > 0 {
-		avgFillPrice = cost / filledVolume
-	}
-
-	openTime := time.Unix(int64(krakenOrder.Opentm), 0)
-	closeTime := time.Unix(int64(krakenOrder.Closetm), 0)
-
-	return broker.Order{
-		ID:            orderID,
-		Pair:          commonPair,
-		Side:          krakenOrder.Descr.Type,
-		Type:          krakenOrder.Descr.OrderType,
-		Status:        krakenOrder.Status,
-		Price:         price,
-		RequestedVol:  volume,
-		ExecutedVol:   filledVolume,
-		AvgFillPrice:  avgFillPrice,
-		Cost:          cost,
-		Fee:           fee,
-		TimePlaced:    openTime,
-		TimeCompleted: closeTime,
-		Reason:        krakenOrder.Reason,
-	}
-}
-
+// GetAssetInfo retrieves cached asset information for a given Kraken asset name.
+// It will trigger a refresh from the API if the asset is not found in the cache.
 func (c *Client) GetAssetInfo(ctx context.Context, krakenAssetName string) (AssetInfo, error) {
 	c.dataMu.RLock()
 	info, ok := c.assetInfoMap[krakenAssetName]
@@ -297,6 +354,8 @@ func (c *Client) GetAssetInfo(ctx context.Context, krakenAssetName string) (Asse
 	return info, nil
 }
 
+// GetKrakenAssetName translates a common asset name (e.g., "BTC") to its Kraken equivalent (e.g., "XXBT").
+// Triggers a cache refresh if the name is not found.
 func (c *Client) GetKrakenAssetName(ctx context.Context, commonAssetName string) (string, error) {
 	c.dataMu.RLock()
 	krakenName, ok := c.commonToKrakenAsset[strings.ToUpper(commonAssetName)]
@@ -306,20 +365,13 @@ func (c *Client) GetKrakenAssetName(ctx context.Context, commonAssetName string)
 		return krakenName, nil
 	}
 
-	c.logger.LogWarn("Kraken asset for '%s' not found, refreshing...", commonAssetName)
-	if err := c.RefreshAssets(ctx); err != nil {
-		return "", err
-	}
-
-	c.dataMu.RLock()
-	defer c.dataMu.RUnlock()
-	krakenName, ok = c.commonToKrakenAsset[strings.ToUpper(commonAssetName)]
-	if !ok {
-		return "", fmt.Errorf("kraken asset name for '%s' not found after refresh", commonAssetName)
-	}
-	return krakenName, nil
+	// The map is now built on startup based on configured pairs.
+	// A miss here indicates a logic error or a request for an unconfigured asset.
+	return "", fmt.Errorf("kraken asset name for '%s' not found in map; ensure it is part of the initial configured pairs", commonAssetName)
 }
 
+// GetPrimaryKrakenPairName translates a common pair name ("BTC/USD") to Kraken's primary, non-aliased pair name ("XBTUSD").
+// This is useful for API endpoints that require the primary pair name.
 func (c *Client) GetPrimaryKrakenPairName(ctx context.Context, commonPair string) (string, error) {
 	c.dataMu.RLock()
 	krakenPair, ok := c.commonToPrimaryPair[commonPair]
@@ -329,122 +381,60 @@ func (c *Client) GetPrimaryKrakenPairName(ctx context.Context, commonPair string
 		return krakenPair, nil
 	}
 
-	c.logger.LogWarn("Kraken primary pair for '%s' not found, refreshing assets and pairs...", commonPair)
-	if err := c.RefreshAssets(ctx); err != nil {
-		return "", fmt.Errorf("failed to refresh assets while looking for pair %s: %w", commonPair, err)
-	}
-	if err := c.RefreshAssetPairs(ctx); err != nil {
-		return "", fmt.Errorf("failed to refresh pairs while looking for pair %s: %w", commonPair, err)
-	}
-
-	c.dataMu.RLock()
-	defer c.dataMu.RUnlock()
-	krakenPair, ok = c.commonToPrimaryPair[commonPair]
-	if !ok {
-		return "", fmt.Errorf("primary pair %s not found after refresh", commonPair)
-	}
-	return krakenPair, nil
+	return "", fmt.Errorf("primary kraken pair for '%s' not found in map; ensure it is part of the initial configured pairs", commonPair)
 }
 
+// GetTradeableKrakenPairName returns the Kraken pair name (e.g., SOLUSD) for a common pair like "SOL/USD".
+// This name can be either the `altname` or the primary name, suitable for placing orders.
 func (c *Client) GetTradeableKrakenPairName(ctx context.Context, commonPair string) (string, error) {
 	c.dataMu.RLock()
-	pair, ok := c.commonToTradeablePair[commonPair]
+	pairID, ok := c.commonToTradeablePair[commonPair]
 	c.dataMu.RUnlock()
 	if ok {
-		return pair, nil
+		return pairID, nil
 	}
 
-	c.logger.LogWarn("Kraken tradeable pair for '%s' not found, refreshing assets and pairs...", commonPair)
-	if err := c.RefreshAssets(ctx); err != nil {
-		return "", err
-	}
-	if err := c.RefreshAssetPairs(ctx); err != nil {
-		return "", err
-	}
-
-	c.dataMu.RLock()
-	defer c.dataMu.RUnlock()
-	pair, ok = c.commonToTradeablePair[commonPair]
-	if !ok {
-		return "", fmt.Errorf("tradeable pair for %s not found after refresh", commonPair)
-	}
-	return pair, nil
+	return "", fmt.Errorf("tradeable kraken pair for %s not found in map; ensure it is part of the initial configured pairs", commonPair)
 }
 
-func NewClient(appCfg *utilities.KrakenConfig, HTTPClient *http.Client, logger *utilities.Logger) *Client {
-	return &Client{
-		BaseURL:               appCfg.BaseURL,
-		APIKey:                appCfg.APIKey,
-		APISecret:             appCfg.APISecret,
-		HTTPClient:            &http.Client{Timeout: time.Duration(appCfg.RequestTimeoutSec) * time.Second},
-		limiter:               rate.NewLimiter(rate.Limit(1), 3),
-		logger:                logger,
-		nonceGenerator:        utilities.NewNonceCounter(),
-		cfg:                   appCfg,
-		assetInfoMap:          make(map[string]AssetInfo),
-		commonToKrakenAsset:   make(map[string]string),
-		pairInfoMap:           make(map[string]AssetPairInfo),
-		commonToKrakenPair:    make(map[string]string),
-		krakenToCommonPair:    make(map[string]string),
-		commonToPrimaryPair:   make(map[string]string),
-		commonToTradeablePair: make(map[string]string),
-		pairDetailsCache:      make(map[string]PairDetail),
-	}
-}
-
+// GetCommonPairName translates a Kraken pair name (e.g., "XBTUSD") back to its common "BASE/QUOTE" format ("BTC/USD").
 func (c *Client) GetCommonPairName(ctx context.Context, krakenPair string) (string, error) {
 	c.dataMu.RLock()
-	defer c.dataMu.RUnlock()
 	commonPair, ok := c.krakenToCommonPair[krakenPair]
+	c.dataMu.RUnlock()
 	if !ok {
 		return "", fmt.Errorf("common pair name for kraken pair %s not found in map", krakenPair)
 	}
 	return commonPair, nil
 }
 
+// GetCommonAssetName translates a Kraken asset name (e.g., "XXBT") to its common equivalent ("BTC").
+// It handles various Kraken naming conventions and triggers a cache refresh if needed.
 func (c *Client) GetCommonAssetName(ctx context.Context, krakenAssetName string) (string, error) {
 	sanitizedName := strings.Split(krakenAssetName, ".")[0]
 
 	c.dataMu.RLock()
-	assetInfo, ok := c.assetInfoMap[sanitizedName]
-	if !ok {
-		var found bool
-		for _, info := range c.assetInfoMap {
-			if info.Altname == sanitizedName {
-				assetInfo = info
-				found = true
-				break
-			}
-		}
-		if !found {
+	// Reverse lookup: find which common name maps to this kraken name
+	for common, kraken := range c.commonToKrakenAsset {
+		if kraken == sanitizedName {
 			c.dataMu.RUnlock()
-			c.logger.LogWarn("Common name for Kraken asset '%s' (sanitized to '%s') not found, refreshing...", krakenAssetName, sanitizedName)
-			if err := c.RefreshAssets(ctx); err != nil {
-				return "", fmt.Errorf("failed to refresh assets while getting common name for %s: %w", krakenAssetName, err)
-			}
-			c.dataMu.RLock()
-			var refreshedFound bool
-			assetInfo, refreshedFound = c.assetInfoMap[sanitizedName]
-			if !refreshedFound {
-				for _, info := range c.assetInfoMap {
-					if info.Altname == sanitizedName {
-						assetInfo = info
-						refreshedFound = true
-						break
-					}
-				}
-			}
-			if !refreshedFound {
-				c.dataMu.RUnlock()
-				return "", fmt.Errorf("common asset name for Kraken asset %s not found even after refresh", krakenAssetName)
-			}
+			return common, nil
 		}
 	}
 	c.dataMu.RUnlock()
 
-	return getCommonAssetName(assetInfo), nil
+	// Fallback to iterating assets if needed, though the primary map should be sufficient
+	c.dataMu.RLock()
+	assetInfo, ok := c.assetInfoMap[sanitizedName]
+	c.dataMu.RUnlock()
+	if ok {
+		return getCommonAssetName(assetInfo), nil
+	}
+
+	return "", fmt.Errorf("could not resolve common asset name for Kraken asset %s", krakenAssetName)
 }
 
+// GetOrderBookAPI fetches the raw order book data from Kraken's public API.
 func (c *Client) GetOrderBookAPI(ctx context.Context, krakenPairName string, depth int) (KrakenAPIRawOrderBook, error) {
 	params := url.Values{
 		"pair":  {krakenPairName},
@@ -460,14 +450,15 @@ func (c *Client) GetOrderBookAPI(ctx context.Context, krakenPairName string, dep
 	if len(resp.Error) > 0 {
 		return KrakenAPIRawOrderBook{}, errors.New(strings.Join(resp.Error, ", "))
 	}
-	orderBook, ok := resp.Result[krakenPairName]
-	if !ok {
-		return KrakenAPIRawOrderBook{}, fmt.Errorf("order book data for pair %s not found in Kraken response", krakenPairName)
+	// The key in the result might be the primary name, even if we query by an alias
+	for _, orderBook := range resp.Result {
+		return orderBook, nil // Return the first (and only) order book in the response
 	}
-	return orderBook, nil
+	return KrakenAPIRawOrderBook{}, fmt.Errorf("order book data for pair %s not found in Kraken response", krakenPairName)
 }
 
-func (c *Client) GetOHLCVAPI(ctx context.Context, krakenPairName string, intervalMinutes string, sinceTimestamp int64, countBars int) ([][]interface{}, error) {
+// GetOHLCVAPI fetches raw OHLCV data from Kraken's public API.
+func (c *Client) GetOHLCVAPI(ctx context.Context, krakenPairName string, intervalMinutes string, sinceTimestamp int64) ([][]interface{}, error) {
 	params := url.Values{
 		"pair":     {krakenPairName},
 		"interval": {intervalMinutes},
@@ -489,26 +480,23 @@ func (c *Client) GetOHLCVAPI(ctx context.Context, krakenPairName string, interva
 		return nil, fmt.Errorf("kraken OHLC API error: %s", strings.Join(resp.Error, ", "))
 	}
 
-	pairData, ok := resp.Result[krakenPairName]
-	if !ok {
-		return [][]interface{}{}, nil
-	}
-
-	ohlcvSlice, ok := pairData.([][]interface{})
-	if !ok {
-		rawPairData, _ := json.Marshal(pairData)
-		if err := json.Unmarshal(rawPairData, &ohlcvSlice); err != nil {
-			return nil, fmt.Errorf("unexpected type for ohlcv data for pair %s: %T", krakenPairName, pairData)
+	// The key in the result might be the primary name, even if we query by an alias
+	for _, pairData := range resp.Result {
+		if ohlcvSlice, ok := pairData.([][]interface{}); ok {
+			return ohlcvSlice, nil
 		}
+		// Handle case where Kraken returns an empty array `[]`
+		if _, ok := pairData.([]interface{}); ok && len(pairData.([]interface{})) == 0 {
+			return [][]interface{}{}, nil
+		}
+		return nil, fmt.Errorf("unexpected type for ohlcv data for pair %s: %T", krakenPairName, pairData)
 	}
 
-	if sinceTimestamp == 0 && countBars > 0 && len(ohlcvSlice) > countBars {
-		ohlcvSlice = ohlcvSlice[len(ohlcvSlice)-countBars:]
-	}
-
-	return ohlcvSlice, nil
+	return [][]interface{}{}, nil // No data for this pair, return empty slice
 }
 
+// GetPairDetail retrieves cached formatting and limit details for a given Kraken pair.
+// Triggers a refresh if the details are not found in the cache.
 func (c *Client) GetPairDetail(ctx context.Context, krakenPair string) (PairDetail, error) {
 	c.dataMu.RLock()
 	detail, ok := c.pairDetailsCache[krakenPair]
@@ -518,38 +506,33 @@ func (c *Client) GetPairDetail(ctx context.Context, krakenPair string) (PairDeta
 		return detail, nil
 	}
 
-	if err := c.RefreshAssetPairs(ctx); err != nil {
-		return PairDetail{}, err
-	}
-
-	c.dataMu.RLock()
-	defer c.dataMu.RUnlock()
-	detail, ok = c.pairDetailsCache[krakenPair]
-	if !ok {
-		return PairDetail{}, fmt.Errorf("pair detail %s not found after refresh", krakenPair)
-	}
-	return detail, nil
+	return PairDetail{}, fmt.Errorf("pair detail for %s not found in map; ensure it is part of the initial configured pairs", krakenPair)
 }
 
-func (c *Client) AddOrderAPI(ctx context.Context, params url.Values) (string, error) {
+// AddOrderAPI submits a new order to Kraken's private API.
+func (c *Client) AddOrderAPI(ctx context.Context, params url.Values) (string, string, error) {
 	var resp struct {
 		Error  []string `json:"error"`
 		Result struct {
+			Descr struct {
+				Order string `json:"order"`
+			} `json:"descr"`
 			Txid []string `json:"txid"`
 		} `json:"result"`
 	}
 	if err := c.callPrivate(ctx, "/0/private/AddOrder", params, &resp); err != nil {
-		return "", err
+		return "", "", err
 	}
 	if len(resp.Error) > 0 {
-		return "", errors.New(strings.Join(resp.Error, ", "))
+		return "", "", errors.New(strings.Join(resp.Error, ", "))
 	}
 	if len(resp.Result.Txid) == 0 {
-		return "", errors.New("Kraken AddOrder returned no transaction ID")
+		return "", "", errors.New("Kraken AddOrder returned no transaction ID")
 	}
-	return resp.Result.Txid[0], nil
+	return resp.Result.Txid[0], resp.Result.Descr.Order, nil
 }
 
+// CancelOrderAPI cancels an existing order on Kraken's private API.
 func (c *Client) CancelOrderAPI(ctx context.Context, orderID string) error {
 	params := url.Values{"txid": {orderID}}
 	var resp struct {
@@ -564,6 +547,7 @@ func (c *Client) CancelOrderAPI(ctx context.Context, orderID string) error {
 	return nil
 }
 
+// QueryOrdersAPI retrieves details for one or more orders from Kraken's private API.
 func (c *Client) QueryOrdersAPI(ctx context.Context, txids string) (map[string]KrakenOrderInfo, error) {
 	params := url.Values{"txid": {txids}, "trades": {"true"}}
 	var resp struct {
@@ -579,6 +563,7 @@ func (c *Client) QueryOrdersAPI(ctx context.Context, txids string) (map[string]K
 	return resp.Result, nil
 }
 
+// GetBalancesAPI retrieves all account balances from Kraken's private API.
 func (c *Client) GetBalancesAPI(ctx context.Context) (map[string]string, error) {
 	var resp struct {
 		Error  []string          `json:"error"`
@@ -593,12 +578,12 @@ func (c *Client) GetBalancesAPI(ctx context.Context) (map[string]string, error) 
 	return resp.Result, nil
 }
 
+// GetTickerAPI fetches ticker information for one or more pairs from Kraken's public API.
 func (c *Client) GetTickerAPI(ctx context.Context, krakenPairNames string) (map[string]TickerInfo, error) {
 	var resp struct {
 		Error  []string              `json:"error"`
 		Result map[string]TickerInfo `json:"result"`
 	}
-	// The 'pair' parameter can be a comma-separated list of pairs
 	params := url.Values{"pair": {krakenPairNames}}
 	if err := c.callPublic(ctx, "/0/public/Ticker", params, &resp); err != nil {
 		return nil, err
@@ -612,6 +597,7 @@ func (c *Client) GetTickerAPI(ctx context.Context, krakenPairNames string) (map[
 	return resp.Result, nil
 }
 
+// QueryTradesAPI retrieves historical trade data from Kraken's private API.
 func (c *Client) QueryTradesAPI(ctx context.Context, params url.Values) (map[string]KrakenTradeInfo, int64, error) {
 	var resp struct {
 		Error  []string `json:"error"`
@@ -630,6 +616,8 @@ func (c *Client) QueryTradesAPI(ctx context.Context, params url.Values) (map[str
 	return resp.Result.Trades, last, nil
 }
 
+// callPrivate handles making authenticated POST requests to private Kraken API endpoints.
+// It includes logic for nonce generation, request signing, and retries with exponential backoff on rate limit errors.
 func (c *Client) callPrivate(ctx context.Context, apiPath string, data url.Values, target interface{}) error {
 	if c.APIKey == "" || c.APISecret == "" {
 		return errors.New("kraken: API key or secret not configured")
@@ -637,10 +625,9 @@ func (c *Client) callPrivate(ctx context.Context, apiPath string, data url.Value
 
 	var lastErr error
 	maxRetries := 4
-	backoff := 2 * time.Second // Initial wait time of 2 seconds
+	backoff := 2 * time.Second
 
 	for i := 0; i < maxRetries; i++ {
-		// --- The core request logic is now inside the retry loop ---
 		nonce := c.nonceGenerator.Nonce()
 		nonceStr := strconv.FormatUint(nonce, 10)
 		if data == nil {
@@ -656,7 +643,6 @@ func (c *Client) callPrivate(ctx context.Context, apiPath string, data url.Value
 		fullURL := c.BaseURL + apiPath
 		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, strings.NewReader(data.Encode()))
 		if reqErr != nil {
-			// This is a non-retriable error
 			return fmt.Errorf("kraken: create private request for %s: %w", apiPath, reqErr)
 		}
 
@@ -667,35 +653,29 @@ func (c *Client) callPrivate(ctx context.Context, apiPath string, data url.Value
 		}
 		c.logger.LogDebug("Kraken callPrivate: URL=%s, Nonce=%s, Attempt=%d", fullURL, nonceStr, i+1)
 
-		// Your DoJSONRequest is fine for handling the request and decoding.
-		// We will inspect the error it returns.
-		lastErr = utilities.DoJSONRequest(c.HTTPClient, req, 0, 0, target) // We set retries to 0 here because we are handling it now.
+		lastErr = utilities.DoJSONRequest(c.HTTPClient, req, 0, 0, target)
 
-		// --- Resilient Retry Logic ---
 		if lastErr != nil {
-			// Check if the error is the specific rate limit error.
 			if strings.Contains(lastErr.Error(), "EAPI:Rate limit exceeded") {
 				c.logger.LogWarn("Rate limit exceeded on %s. Waiting %v before retrying... (Attempt %d/%d)", apiPath, backoff, i+1, maxRetries)
 				select {
 				case <-time.After(backoff):
-					backoff *= 2 // Double the wait time for the next attempt.
-					continue     // Go to the next iteration of the loop to retry.
+					backoff *= 2 // Exponential backoff
+					continue
 				case <-ctx.Done():
 					return ctx.Err()
 				}
 			}
-			// For any other error, fail immediately.
 			return fmt.Errorf("kraken private call to %s failed: %w", apiPath, lastErr)
 		}
 
-		// If the call was successful (no error), we're done.
 		return nil
 	}
 
-	// If we've exited the loop because of too many retries, return the last known error.
 	return fmt.Errorf("API call to %s failed after %d retries: %w", apiPath, maxRetries, lastErr)
 }
 
+// callPublic handles making GET requests to public Kraken API endpoints.
 func (c *Client) callPublic(ctx context.Context, path string, params url.Values, target interface{}) error {
 	endpoint := c.BaseURL + path
 	if params != nil && len(params) > 0 {
@@ -712,6 +692,7 @@ func (c *Client) callPublic(ctx context.Context, path string, params url.Values,
 	return utilities.DoJSONRequest(c.HTTPClient, req, 2, 2*time.Second, target)
 }
 
+// QueryTradeVolumeAPI retrieves user's trade volume and fee tier information from Kraken.
 func (c *Client) QueryTradeVolumeAPI(ctx context.Context, params url.Values) (*TradeVolumeResult, error) {
 	var resp TradeVolumeResponse
 	if err := c.callPrivate(ctx, "/0/private/TradeVolume", params, &resp); err != nil {

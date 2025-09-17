@@ -10,7 +10,7 @@ import (
 // Broker defines the interface for interacting with a cryptocurrency exchange.
 type Broker interface {
 	// PlaceOrder submits a new order to the exchange.
-	PlaceOrder(ctx context.Context, assetPair, side, orderType string, volume, price, stopPrice float64, clientOrderID string) (string, error)
+	PlaceOrder(ctx context.Context, assetPair, side, orderType string, volume, price, stopPrice float64, clientOrderID string) (string, error, string)
 
 	// CancelOrder cancels an existing order by its ID.
 	CancelOrder(ctx context.Context, orderID string) error

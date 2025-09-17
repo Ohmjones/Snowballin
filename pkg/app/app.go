@@ -237,8 +237,8 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 	// 1. Create the underlying Kraken Client first. This instance will be shared.
 	krakenClient := krakenBroker.NewClient(&cfg.Kraken, sharedHTTPClient, logger)
 
-	// 2. Pass the client into the Adapter.
-	krakenAdapter, krakenErr := krakenBroker.NewAdapter(&cfg.Kraken, krakenClient, logger, sqliteCache)
+	// 2. Pass the client and configured asset pairs into the Adapter.
+	krakenAdapter, krakenErr := krakenBroker.NewAdapter(&cfg.Kraken, cfg.Trading.AssetPairs, krakenClient, logger, sqliteCache)
 	if krakenErr != nil {
 		return fmt.Errorf("pre-flight check failed: could not initialize Kraken adapter: %w", krakenErr)
 	}
@@ -649,8 +649,8 @@ func reapStaleOrders(ctx context.Context, state *TradingState) {
 		if err != nil {
 			continue
 		}
-		if order.Status == "open" && time.Since(order.TimePlaced) > maxAge {
-			state.logger.LogWarn("Reaper: Order %s for %s is stale (age: %s). Cancelling.", orderID, order.Pair, time.Since(order.TimePlaced))
+		if order.Status == "open" && time.Since(order.CreatedAt) > maxAge {
+			state.logger.LogWarn("Reaper: Order %s for %s is stale (age: %s). Cancelling.", orderID, order.Pair, time.Since(order.CreatedAt))
 			err := state.broker.CancelOrder(ctx, orderID)
 			if err != nil {
 				state.logger.LogError("Reaper: Failed to cancel stale order %s: %v", orderID, err)
@@ -684,8 +684,8 @@ func processPendingOrders(ctx context.Context, state *TradingState) {
 			continue
 		}
 
-		if strings.EqualFold(order.Status, "partially filled") && order.ExecutedVol > 0 {
-			state.logger.LogWarn("PendingOrders: Order %s for %s is PARTIALLY FILLED (%.4f / %.4f).", orderID, order.Pair, order.ExecutedVol, order.RequestedVol)
+		if strings.EqualFold(order.Status, "partially filled") && order.FilledVolume > 0 {
+			state.logger.LogWarn("PendingOrders: Order %s for %s is PARTIALLY FILLED (%.4f / %.4f).", orderID, order.Pair, order.FilledVolume, order.Volume)
 			state.stateMutex.Lock()
 			assetPair, isPending := state.pendingOrders[orderID]
 			if isPending {
@@ -705,14 +705,14 @@ func processPendingOrders(ctx context.Context, state *TradingState) {
 					state.stateMutex.Unlock()
 					continue
 				}
-				remainingVol := order.RequestedVol - order.ExecutedVol
-				newPrice := strategy.HandlePartialFills(order.RequestedVol, order.ExecutedVol, order.Price, atr, 1.5)
+				remainingVol := order.Volume - order.FilledVolume
+				newPrice := strategy.HandlePartialFills(order.Volume, order.FilledVolume, order.Price, atr, 1.5)
 
 				if err := state.broker.CancelOrder(ctx, orderID); err != nil {
 					state.logger.LogError("PendingOrders: Failed to cancel partially filled order %s before re-placing: %v", orderID, err)
 				}
 
-				newOrderID, placeErr := state.broker.PlaceOrder(ctx, assetPair, order.Side, "limit", remainingVol, newPrice, 0, "")
+				newOrderID, placeErr, _ := state.broker.PlaceOrder(ctx, assetPair, order.Side, "limit", remainingVol, newPrice, 0, "")
 				if placeErr != nil {
 					state.logger.LogError("PendingOrders: Failed to place new order for remainder of partial fill: %v", placeErr)
 				} else {
@@ -762,12 +762,12 @@ func updatePositionFromFill(state *TradingState, order broker.Order, assetPair s
 	if strings.EqualFold(order.Side, "buy") {
 		position, hasPosition := state.openPositions[assetPair]
 		if !hasPosition {
-			baseOrderSizeInQuote := order.Price * order.ExecutedVol
+			baseOrderSizeInQuote := order.Price * order.FilledVolume
 			newPosition := &utilities.Position{
 				AssetPair:          assetPair,
-				EntryTimestamp:     order.TimeCompleted,
-				AveragePrice:       order.Price,
-				TotalVolume:        order.ExecutedVol,
+				EntryTimestamp:     order.UpdatedAt,
+				AveragePrice:       order.AvgFillPrice,
+				TotalVolume:        order.FilledVolume,
 				BaseOrderPrice:     order.Price,
 				FilledSafetyOrders: 0,
 				IsDcaActive:        true,
@@ -784,8 +784,8 @@ func updatePositionFromFill(state *TradingState, order broker.Order, assetPair s
 		} else {
 			oldVolume := position.TotalVolume
 			oldAvgPrice := position.AveragePrice
-			newVolume := order.ExecutedVol
-			newPrice := order.Price
+			newVolume := order.FilledVolume
+			newPrice := order.AvgFillPrice
 			position.TotalVolume += newVolume
 			position.AveragePrice = ((oldAvgPrice * oldVolume) + (newPrice * newVolume)) / position.TotalVolume
 			position.FilledSafetyOrders++
@@ -800,7 +800,7 @@ func updatePositionFromFill(state *TradingState, order broker.Order, assetPair s
 		}
 	} else { // Sell order
 		if pos, ok := state.openPositions[assetPair]; ok {
-			if math.Abs(pos.TotalVolume-order.ExecutedVol) < 1e-8 {
+			if math.Abs(pos.TotalVolume-order.FilledVolume) < 1e-8 {
 				// Get the reason for the sell, which was stored when the order was placed.
 				// We can safely access the map because the parent function holds the lock.
 				reason, hasReason := state.sellReasons[order.ID]
@@ -809,7 +809,7 @@ func updatePositionFromFill(state *TradingState, order broker.Order, assetPair s
 				}
 
 				// Calculate profit, accounting for fees.
-				totalBuyCost := (pos.AveragePrice * pos.TotalVolume) * (1 + state.makerFeeRate)
+				totalBuyCost := (pos.AveragePrice * pos.TotalVolume)
 				netProceeds := order.Cost // The 'cost' of a sell order is the proceeds.
 				profit := netProceeds - totalBuyCost
 				profitPercent := (profit / totalBuyCost) * 100
@@ -822,9 +822,9 @@ func updatePositionFromFill(state *TradingState, order broker.Order, assetPair s
 				delete(state.sellReasons, order.ID) // Clean up the reasons map.
 				_ = state.cache.DeletePosition(assetPair)
 			} else {
-				profit := (order.Price - pos.AveragePrice) * order.ExecutedVol
-				pos.TotalVolume -= order.ExecutedVol
-				state.discordClient.NotifyOrderFilled(order, fmt.Sprintf("💰 Partial Take-Profit Hit\nSold %.4f %s for a profit of %.2f %s. Trailing stop is now active on the remainder.", order.ExecutedVol, strings.Split(pos.AssetPair, "/")[0], profit, state.config.Trading.QuoteCurrency))
+				profit := (order.AvgFillPrice - pos.AveragePrice) * order.FilledVolume
+				pos.TotalVolume -= order.FilledVolume
+				state.discordClient.NotifyOrderFilled(order, fmt.Sprintf("💰 Partial Take-Profit Hit\nSold %.4f %s for a profit of %.2f %s. Trailing stop is now active on the remainder.", order.FilledVolume, strings.Split(pos.AssetPair, "/")[0], profit, state.config.Trading.QuoteCurrency))
 				_ = state.cache.SavePosition(pos)
 			}
 		}
@@ -1071,7 +1071,7 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 			}
 			// --- END: Balance Check ---
 
-			orderID, placeErr := state.broker.PlaceOrder(ctx, pos.AssetPair, "buy", "limit", orderSizeInBase, orderPrice, 0, "")
+			orderID, placeErr, _ := state.broker.PlaceOrder(ctx, pos.AssetPair, "buy", "limit", orderSizeInBase, orderPrice, 0, "")
 			if placeErr != nil {
 				state.logger.LogError("ManagePosition [%s]: Failed to place add-on buy order: %v", pos.AssetPair, placeErr)
 			} else {
@@ -1107,7 +1107,7 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 	exitSignal, shouldExit := stratInstance.GenerateExitSignal(ctx, *consolidatedData, *cfg)
 	if shouldExit && exitSignal.Direction == "sell" {
 		state.logger.LogWarn("!!! [SELL] signal for %s (Strategy Exit). Reason: %s. Placing market sell order.", pos.AssetPair, exitSignal.Reason)
-		orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
+		orderID, err, _ := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
 		if err != nil {
 			state.logger.LogError("ManagePosition [%s]: Failed to place market sell order for strategy exit: %v", pos.AssetPair, err)
 		} else {
@@ -1134,7 +1134,7 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 		trailingStopPrice := pos.PeakPriceSinceTP * (1.0 - (cfg.Trading.TrailingStopDeviation / 100.0))
 		if currentPrice <= trailingStopPrice {
 			state.logger.LogInfo("ManagePosition [%s]: TRAILING STOP-LOSS HIT at %.2f (Peak was %.2f). Placing market sell order.", pos.AssetPair, currentPrice, pos.PeakPriceSinceTP)
-			orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
+			orderID, err, _ := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
 			if err != nil {
 				//...
 			} else {
@@ -1154,7 +1154,7 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 			if partialSellPercent > 0 && partialSellPercent < 1.0 {
 				volumeToSell := pos.TotalVolume * partialSellPercent
 				state.logger.LogInfo("ManagePosition [%s]: HYBRID TAKE-PROFIT HIT at %.2f. Selling %.2f%% of position.", pos.AssetPair, currentPrice, cfg.Trading.TakeProfitPartialSellPercent)
-				orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", volumeToSell, 0, 0, "")
+				orderID, err, _ := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", volumeToSell, 0, 0, "")
 				if err != nil {
 					state.logger.LogError("ManagePosition [%s]: Failed to place partial market sell order: %v", pos.AssetPair, err)
 					return
@@ -1173,7 +1173,7 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 			return
 		} else {
 			state.logger.LogInfo("ManagePosition [%s]: TAKE-PROFIT HIT at %.2f. Placing market sell order (trailing stop disabled).", pos.AssetPair, currentPrice)
-			orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
+			orderID, err, _ := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
 			if err != nil {
 				//...
 			} else {
@@ -1245,7 +1245,7 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 			// --- END: Balance Check ---
 
 			state.logger.LogInfo("ManagePosition [%s]: Price condition met for Safety Order #%d. Placing limit buy.", pos.AssetPair, nextSONumber)
-			orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "buy", "limit", orderSizeInBase, strategicSafetyPrice, 0, "")
+			orderID, err, _ := state.broker.PlaceOrder(ctx, pos.AssetPair, "buy", "limit", orderSizeInBase, strategicSafetyPrice, 0, "")
 			if err != nil {
 				state.logger.LogError("ManagePosition [%s]: Failed to place safety order: %v", pos.AssetPair, err)
 			} else {
@@ -1419,7 +1419,6 @@ func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair 
 }
 
 // seekEntryOpportunity evaluates signals to open a new position.
-// This is the corrected version of the function.
 func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair string, signals []strategy.StrategySignal, consolidatedData *strategy.ConsolidatedMarketPicture, cfg *utilities.AppConfig) {
 	for _, sig := range signals {
 		if strings.EqualFold(sig.Direction, "buy") || strings.EqualFold(sig.Direction, "predictive_buy") {
@@ -1456,7 +1455,6 @@ func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair st
 			// Check for a buy signal and then apply the SMA filter
 			if strings.EqualFold(sig.Direction, "buy") {
 				// Extract close prices for SMA calculation.
-				// You'll need to define a SMA period in your config.json, let's use a 50-period SMA as an example.
 				closePrices := strategy.ExtractCloses(primaryBars)
 				sma50 := strategy.CalculateSMA(closePrices, 50)
 
@@ -1483,97 +1481,181 @@ func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair st
 				continue
 			}
 
-			// --- CORRECTED: Pre-flight balance check ---
+			// --- Pre-flight balance check ---
 			orderTotalValue := orderSizeInBase * orderPrice
 			quoteCurrency := cfg.Trading.QuoteCurrency
 
-			// Use the specific GetBalance function for efficiency and correctness.
 			balance, balanceErr := state.broker.GetBalance(ctx, quoteCurrency)
 			if balanceErr != nil {
 				state.logger.LogError("SeekEntry [%s]: Could not verify account balance for '%s' before placing order: %v. Aborting.", assetPair, quoteCurrency, balanceErr)
-				continue // Skip to the next signal
+				continue
 			}
 
-			// The 'balance' object has a 'Total' field. We assume Total is the available balance for trading.
 			availableQuoteBalance := balance.Total
-
 			if orderTotalValue > availableQuoteBalance {
 				state.logger.LogWarn("SeekEntry [%s]: Insufficient funds to place buy order. Required: ~%.2f %s, Available: %.2f %s. The order will be skipped.",
 					assetPair, orderTotalValue, quoteCurrency, availableQuoteBalance, quoteCurrency)
-				continue // Skip this signal and avoid the PlaceOrder call
+				continue
 			}
 			// --- END: Pre-flight balance check ---
 
-			orderID, placeErr := state.broker.PlaceOrder(ctx, assetPair, "buy", "limit", orderSizeInBase, orderPrice, 0, "")
+			// Generate clientOrderID for tracking
+			clientOrderID := fmt.Sprintf("SNOW-%s-%d", assetPair, time.Now().UnixNano())
+
+			// Log order parameters
+			state.logger.LogDebug("SeekEntry [%s]: Placing order with type=limit, volume=%.8f, price=%.2f, stopPrice=%.2f, clientOrderID=%s",
+				assetPair, orderSizeInBase, orderPrice, 0.0, clientOrderID)
+
+			// Place order
+			orderID, placeErr, apiResponse := state.broker.PlaceOrder(ctx, assetPair, "buy", "limit", orderSizeInBase, orderPrice, 0, clientOrderID)
+
+			// Prepare DB entry
+			status := "pending"
+			responseForDB := apiResponse
 			if placeErr != nil {
+				status = "rejected"
+				responseForDB = placeErr.Error() // Log the error message as the API response
 				state.logger.LogError("SeekEntry [%s]: Place order failed: %v", assetPair, placeErr)
-			} else {
-				state.logger.LogInfo("SeekEntry [%s]: Placed order ID %s at %.2f. Now tracking.", assetPair, orderID, orderPrice)
-
-				// --- Unified Discord Notification ---
-				baseAsset := strings.Split(assetPair, "/")[0]
-				quoteAsset := strings.Split(assetPair, "/")[1]
-				var message string
-
-				if strings.EqualFold(sig.Direction, "predictive_buy") {
-					message = fmt.Sprintf("🧠 **Predictive Buy Order Placed**\n**Pair:** %s\n**Size:** `%.4f %s`\n**Price:** `%.2f %s`\n**Order ID:** `%s`\n**Reason:** %s",
-						assetPair, orderSizeInBase, baseAsset, orderPrice, quoteAsset, orderID, sig.Reason)
-				} else { // This handles the standard 'buy' signal
-					message = fmt.Sprintf("✅ **Buy Order Placed**\n**Pair:** %s\n**Size:** `%.4f %s`\n**Price:** `%.2f %s`\n**Order ID:** `%s`\n**Reason:** %s",
-						assetPair, orderSizeInBase, baseAsset, orderPrice, quoteAsset, orderID, sig.Reason)
-				}
-				state.discordClient.SendMessage(message)
-				// --- End Unified Discord Notification ---
-
-				state.stateMutex.Lock()
-				state.pendingOrders[orderID] = assetPair
-				_ = state.cache.SavePendingOrder(orderID, assetPair)
-				state.stateMutex.Unlock()
 			}
+
+			// Insert into orders table using the new cache method
+			err := state.cache.LogOrder(orderID, assetPair, "buy", "limit", clientOrderID, status, responseForDB, orderSizeInBase, orderPrice, 0.0)
+			if err != nil {
+				state.logger.LogError("SeekEntry [%s]: Failed to log order to database: %v", assetPair, err)
+			} else {
+				state.logger.LogDebug("SeekEntry [%s]: Order logged to database with status %s", assetPair, status)
+			}
+
+			if placeErr != nil {
+				continue
+			}
+
+			// Verify order status
+			order, getErr := state.broker.GetOrderStatus(ctx, orderID)
+			if getErr != nil {
+				state.logger.LogError("SeekEntry [%s]: Failed to verify order %s status: %v", assetPair, orderID, getErr)
+			} else {
+				state.logger.LogInfo("SeekEntry [%s]: Order %s status: %s, type: %s, price: %.2f, volume: %.8f",
+					assetPair, orderID, order.Status, order.Type, order.Price, order.Volume)
+				// Update DB with verified status using the new cache method
+				updateErr := state.cache.UpdateOrderStatus(orderID, order.Status, fmt.Sprintf("%s (verified)", apiResponse))
+				if updateErr != nil {
+					state.logger.LogError("SeekEntry [%s]: Failed to update order status in database: %v", assetPair, updateErr)
+				}
+			}
+
+			state.logger.LogInfo("SeekEntry [%s]: Placed order ID %s at %.2f. Now tracking.", assetPair, orderID, orderPrice)
+
+			// --- Unified Discord Notification ---
+			baseAsset := strings.Split(assetPair, "/")[0]
+			quoteAsset := strings.Split(assetPair, "/")[1]
+			var message string
+
+			if strings.EqualFold(sig.Direction, "predictive_buy") {
+				message = fmt.Sprintf("🧠 **Predictive Buy Order Placed**\n**Pair:** %s\n**Size:** `%.4f %s`\n**Price:** `%.2f %s`\n**Order ID:** `%s`\n**Reason:** %s",
+					assetPair, orderSizeInBase, baseAsset, orderPrice, quoteAsset, orderID, sig.Reason)
+			} else {
+				message = fmt.Sprintf("✅ **Buy Order Placed**\n**Pair:** %s\n**Size:** `%.4f %s`\n**Price:** `%.2f %s`\n**Order ID:** `%s`\n**Reason:** %s",
+					assetPair, orderSizeInBase, baseAsset, orderPrice, quoteAsset, orderID, sig.Reason)
+			}
+			state.discordClient.SendMessage(message)
+			// --- End Unified Discord Notification ---
+
+			state.stateMutex.Lock()
+			state.pendingOrders[orderID] = assetPair
+			_ = state.cache.SavePendingOrder(orderID, assetPair)
+			state.stateMutex.Unlock()
+
 			break // Exit after processing the first valid buy signal
 		}
 	}
 }
+
 func liquidateAllPositions(ctx context.Context, state *TradingState, reason string) {
+	// Acquire a lock to ensure thread-safe access to TradingState's openPositions and pendingOrders.
 	state.stateMutex.Lock()
 	defer state.stateMutex.Unlock()
 
+	// Check if there are any open positions to liquidate.
 	if len(state.openPositions) == 0 {
 		state.logger.LogInfo("CircuitBreaker: Triggered, but no open positions to liquidate.")
 		return
 	}
 
+	// Notify via Discord that the circuit breaker has been triggered.
 	state.discordClient.SendMessage(fmt.Sprintf("🚨 **CIRCUIT BREAKER TRIGGERED** 🚨\n**Reason:** %s\nAttempting to liquidate all open positions.", reason))
 
+	// Create a snapshot of asset pairs to avoid modifying the map while iterating.
 	assetPairsToLiquidate := make([]string, 0, len(state.openPositions))
 	for assetPair := range state.openPositions {
 		assetPairsToLiquidate = append(assetPairsToLiquidate, assetPair)
 	}
 
+	// Iterate through each asset pair to liquidate its position.
 	for _, assetPair := range assetPairsToLiquidate {
-		position := state.openPositions[assetPair]
+		// Defensively check if the position still exists to avoid nil pointer issues.
+		position, ok := state.openPositions[assetPair]
+		if !ok || position == nil {
+			continue // Skip if the position was removed concurrently.
+		}
+
+		// Proceed with liquidation only if the position has a non-zero volume.
 		if position.TotalVolume > 0 {
 			state.logger.LogWarn("CircuitBreaker: Liquidating position for %s (Volume: %f)", assetPair, position.TotalVolume)
-			_, err := state.broker.PlaceOrder(ctx, assetPair, "sell", "market", position.TotalVolume, 0, 0, "")
-			if err != nil {
-				state.logger.LogError("CircuitBreaker: Failed to place liquidation order for %s: %v. Manual check required.", assetPair, err)
+
+			// Generate a unique client-side order ID for tracking this liquidation.
+			clientOrderID := fmt.Sprintf("LIQ-%s-%d", strings.ReplaceAll(assetPair, "/", ""), time.Now().UnixNano())
+
+			// Place a market sell order to liquidate the entire position.
+			orderID, apiResponse, err := state.broker.PlaceOrder(ctx, assetPair, "sell", "market", position.TotalVolume, 0, 0, clientOrderID)
+
+			// Initialize variables for logging the order to the database.
+			status := "pending"
+			var responseForDB string
+
+			// Handle the result of the PlaceOrder call.
+			if err != "" {
+				// If the order placement failed, mark it as rejected and log the error.
+				status = "rejected"
+				responseForDB = err // Use the error message directly, as err is a string.
+				state.logger.LogError("CircuitBreaker: Failed to place liquidation order for %s: %v", assetPair, err)
 				state.discordClient.SendMessage(fmt.Sprintf("🔥 **LIQUIDATION FAILED for %s! Manual intervention required!** Error: %v", assetPair, err))
 			} else {
-				state.logger.LogInfo("CircuitBreaker: Liquidation order successfully placed for %s.", assetPair)
+				// If successful, serialize the apiResponse (interface{}) to a string for database storage.
+				// Since apiResponse is an interface{}, we attempt to marshal it to JSON.
+				responseForDB = fmt.Sprintf("%v", apiResponse) // Fallback to string representation if needed.
+				state.logger.LogInfo("CircuitBreaker: Liquidation order successfully placed for %s with ID %s.", assetPair, orderID)
 				state.discordClient.SendMessage(fmt.Sprintf("✅ Liquidation order placed for %s.", assetPair))
 			}
+
+			// Log the order to the database, including its status and response.
+			logErr := state.cache.LogOrder(orderID, assetPair, "sell", "market", clientOrderID, status, responseForDB, position.TotalVolume, 0, 0)
+			if logErr != nil {
+				state.logger.LogError("CircuitBreaker: CRITICAL - Failed to log liquidation order to DB for %s: %v", assetPair, logErr)
+			}
 		}
+
+		// Remove the position from the in-memory state and database.
 		delete(state.openPositions, assetPair)
-		_ = state.cache.DeletePosition(assetPair)
+		if err := state.cache.DeletePosition(assetPair); err != nil {
+			state.logger.LogError("CircuitBreaker: Failed to delete position for %s from database: %v", assetPair, err)
+		}
+
+		// Cancel any pending buy orders associated with this asset pair.
 		for orderID, pair := range state.pendingOrders {
 			if pair == assetPair {
-				_ = state.broker.CancelOrder(ctx, orderID)
+				if err := state.broker.CancelOrder(ctx, orderID); err != nil {
+					state.logger.LogError("CircuitBreaker: Failed to cancel pending order %s for %s: %v", orderID, assetPair, err)
+				}
 				delete(state.pendingOrders, orderID)
-				_ = state.cache.DeletePendingOrder(orderID)
+				if err := state.cache.DeletePendingOrder(orderID); err != nil {
+					state.logger.LogError("CircuitBreaker: Failed to delete pending order %s from database: %v", orderID, err)
+				}
 			}
 		}
 	}
 }
+
 func calculateFeeAwareTakeProfitPrice(pos *utilities.Position, state *TradingState, totalBuyCostWithFees float64) float64 {
 	targetProfitRate := state.config.Trading.TakeProfitPercentage / 100.0
 

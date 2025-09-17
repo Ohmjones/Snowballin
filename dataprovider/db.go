@@ -10,8 +10,9 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3" // SQLite driver
 	"os"
+
+	_ "github.com/mattn/go-sqlite3" // SQLite driver
 )
 
 // SQLiteCache now includes the application's logger for consistent logging.
@@ -125,11 +126,31 @@ func (s *SQLiteCache) InitSchema() error {
 		coinmarketcap_id TEXT NOT NULL,
 		icon_path TEXT,
 		last_updated INTEGER NOT NULL
-	);`
-	if _, err := s.db.Exec(schema); err != nil {
-		s.logger.LogError("Failed to execute database schema: %v", err)
-		return fmt.Errorf("failed to execute database schema: %w", err)
+	);
+	CREATE TABLE IF NOT EXISTS orders (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		order_id TEXT NOT NULL,
+		asset_pair TEXT NOT NULL,
+		side TEXT NOT NULL,
+		order_type TEXT NOT NULL,
+		volume REAL NOT NULL,
+		price REAL,
+		stop_price REAL,
+		client_order_id TEXT,
+		status TEXT, -- e.g., 'pending', 'open', 'rejected', 'canceled'
+		api_response TEXT, -- JSON string of Kraken API response or error
+		created_at INTEGER NOT NULL -- Unix timestamp
+	);
+	CREATE INDEX IF NOT EXISTS idx_orders_pair_time ON orders (asset_pair, created_at);
+	CREATE INDEX IF NOT EXISTS idx_orders_id ON orders (order_id);
+`
+	// Execute the schema (existing code)
+	_, err := s.db.Exec(schema)
+	if err != nil {
+		s.logger.LogError("Failed to initialize database schema: %v", err)
+		return fmt.Errorf("failed to initialize schema: %w", err)
 	}
+
 	s.logger.LogInfo("Database schema initialized successfully.")
 	return nil
 }
@@ -349,6 +370,34 @@ func (s *SQLiteCache) CleanupOldBars(provider string, olderThan time.Time) error
 
 func (s *SQLiteCache) Close() error {
 	return s.db.Close()
+}
+
+// LogOrder inserts a new order record into the database.
+func (s *SQLiteCache) LogOrder(orderID, assetPair, side, orderType, clientOrderID, status, apiResponse string, volume, price, stopPrice float64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Use an empty string for a nil orderID which can happen on a failed placement
+	if orderID == "" {
+		orderID = fmt.Sprintf("FAILED-%d", time.Now().UnixNano())
+	}
+
+	query := `
+		INSERT INTO orders (order_id, asset_pair, side, order_type, volume, price, stop_price, client_order_id, status, api_response, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	_, err := s.db.Exec(query, orderID, assetPair, side, orderType, volume, price, stopPrice, clientOrderID, status, apiResponse, time.Now().Unix())
+	return err
+}
+
+// UpdateOrderStatus updates the status and API response of an existing order.
+func (s *SQLiteCache) UpdateOrderStatus(orderID, status, apiResponse string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := "UPDATE orders SET status = ?, api_response = ? WHERE order_id = ?"
+	_, err := s.db.Exec(query, status, apiResponse, orderID)
+	return err
 }
 
 func (s *SQLiteCache) StartScheduledCleanup(interval time.Duration, provider string) {
