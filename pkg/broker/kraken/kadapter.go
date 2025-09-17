@@ -147,25 +147,39 @@ func (a *Adapter) GetBalance(ctx context.Context, currency string) (broker.Balan
 
 // GetLastNOHLCVBars retrieves the last N OHLCV bars for a trading pair from cache or API.
 // Critical for technical indicators and volatility assessments.
+// Parameters:
+//   - ctx: Context for handling cancellation and timeouts.
+//   - pair: The trading pair (e.g., "BTC/USD").
+//   - intervalMinutes: The timeframe (e.g., "1h", "4h", "1d").
+//   - nBars: The number of bars to retrieve.
+//
+// Returns:
+//   - A slice of OHLCVBar structs containing the requested data.
+//   - An error if the operation fails.
 func (a *Adapter) GetLastNOHLCVBars(ctx context.Context, pair string, intervalMinutes string, nBars int) ([]utilities.OHLCVBar, error) {
 	const cacheProvider = "kraken"
 	cacheKey := fmt.Sprintf("%s-%s", strings.ReplaceAll(pair, "/", "-"), intervalMinutes)
 
+	// Convert the interval to Kraken's format (e.g., "1h" to "60").
 	interval, err := utilities.ConvertTFToKrakenInterval(intervalMinutes)
 	if err != nil {
 		return nil, fmt.Errorf("invalid interval format: %w", err)
 	}
 
+	// Parse the interval as a duration for cache lookup (e.g., "60" -> 60 minutes).
 	intervalDuration, err := time.ParseDuration(interval + "m")
 	if err != nil {
 		return nil, fmt.Errorf("could not parse interval to duration: %w", err)
 	}
 
+	// Calculate the lookback period to ensure we fetch enough bars.
 	lookbackDuration := time.Duration(nBars+5) * intervalDuration
 	startTime := time.Now().Add(-lookbackDuration)
 
+	// Check the cache for existing bars.
 	cachedBars, err := a.cache.GetBars(cacheProvider, cacheKey, startTime.UnixMilli(), time.Now().UnixMilli())
 	if err == nil && len(cachedBars) >= nBars {
+		// Verify the cache is fresh (within 2x the interval duration).
 		if time.Since(time.UnixMilli(cachedBars[len(cachedBars)-1].Timestamp)) < (2 * intervalDuration) {
 			a.logger.LogInfo("kadapter GetLastNOHLCVBars [%s]: Cache hit. Returning %d bars.", pair, nBars)
 			if len(cachedBars) > nBars {
@@ -175,28 +189,42 @@ func (a *Adapter) GetLastNOHLCVBars(ctx context.Context, pair string, intervalMi
 		}
 	}
 
+	// Cache miss or stale data; fetch from the Kraken API.
 	a.logger.LogInfo("kadapter GetLastNOHLCVBars [%s]: Cache miss or insufficient data. Fetching from API.", pair)
+
+	// Get the Kraken-specific pair name (e.g., "BTC/USD" -> "XXBTZUSD").
 	krakenPair, err := a.client.GetPrimaryKrakenPairName(ctx, pair)
 	if err != nil {
 		return nil, fmt.Errorf("GetLastNOHLCVBars: failed to get Kraken pair name for %s: %w", pair, err)
 	}
 
+	// Calculate the since timestamp for the API call.
 	sinceTimestamp := time.Now().Add(-lookbackDuration).Unix()
+
+	// Fetch OHLCV data from the Kraken API.
 	krakenBars, err := a.client.GetOHLCVAPI(ctx, krakenPair, interval, sinceTimestamp)
 	if err != nil {
 		return nil, fmt.Errorf("GetLastNOHLCVBars: API call failed: %w", err)
 	}
 
+	// Parse the returned bars into OHLCVBar structs.
 	var bars []utilities.OHLCVBar
-	for _, kBar := range krakenBars {
+	for i, kBar := range krakenBars {
 		parsedBar, parseErr := a.client.ParseOHLCV(kBar)
 		if parseErr != nil {
-			a.logger.LogWarn("GetLastNOHLCVBars: Failed to parse OHLCV bar: %v", parseErr)
+			// Log the parsing error but continue processing other bars to avoid complete failure.
+			a.logger.LogWarn("GetLastNOHLCVBars [%s]: Failed to parse OHLCV bar at index %d: %v", pair, i, parseErr)
 			continue
 		}
 		bars = append(bars, parsedBar)
 	}
 
+	// Check if we have any valid bars after parsing.
+	if len(bars) == 0 {
+		return nil, fmt.Errorf("GetLastNOHLCVBars: no valid OHLCV bars parsed for pair %s", pair)
+	}
+
+	// Sort bars by timestamp to ensure ascending order.
 	utilities.SortBarsByTimestamp(bars)
 
 	// Save the newly fetched bars to the cache one by one.
@@ -207,10 +235,13 @@ func (a *Adapter) GetLastNOHLCVBars(ctx context.Context, pair string, intervalMi
 		}
 	}
 
+	// Return the last N bars, trimming if necessary.
 	if len(bars) > nBars {
 		bars = bars[len(bars)-nBars:]
 	}
 
+	// Log success and return the bars.
+	a.logger.LogInfo("kadapter GetLastNOHLCVBars [%s]: Successfully fetched and parsed %d bars.", pair, len(bars))
 	return bars, nil
 }
 
