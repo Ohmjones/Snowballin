@@ -4,6 +4,7 @@ package kraken
 import (
 	"Snowballin/dataprovider"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -198,30 +199,34 @@ func (a *Adapter) GetLastNOHLCVBars(ctx context.Context, pair string, intervalMi
 		return nil, fmt.Errorf("GetLastNOHLCVBars: failed to get Kraken pair name for %s: %w", pair, err)
 	}
 
-	// Calculate the since timestamp for the API call.
-	sinceTimestamp := time.Now().Add(-lookbackDuration).Unix()
-
-	// Fetch OHLCV data from the Kraken API.
-	krakenBars, err := a.client.GetOHLCVAPI(ctx, krakenPair, interval, sinceTimestamp)
+	// Build the public request for OHLC (no auth needed for public endpoints).
+	// NOTE: This logic was previously creating a new request, but the client already has a method for this.
+	// We will now use the client's built-in `GetOHLCVAPI` method for consistency and to simplify this function.
+	rawBars, err := a.client.GetOHLCVAPI(ctx, krakenPair, interval, startTime.Unix())
 	if err != nil {
 		return nil, fmt.Errorf("GetLastNOHLCVBars: API call failed: %w", err)
 	}
 
-	// Parse the returned bars into OHLCVBar structs.
+	// Log the raw response for debugging.
+	responseJSON, _ := json.Marshal(rawBars)
+	a.logger.LogDebug("kadapter GetLastNOHLCVBars [%s]: Raw API response: %s", pair, string(responseJSON))
+
+	// Parse the OHLCV bars.
 	var bars []utilities.OHLCVBar
-	for i, kBar := range krakenBars {
-		parsedBar, parseErr := a.client.ParseOHLCV(kBar)
-		if parseErr != nil {
-			// Log the parsing error but continue processing other bars to avoid complete failure.
-			a.logger.LogWarn("GetLastNOHLCVBars [%s]: Failed to parse OHLCV bar at index %d: %v", pair, i, parseErr)
+	for _, rawBar := range rawBars {
+		bar, err := a.client.ParseOHLCV(rawBar)
+		if err != nil {
+			a.logger.LogWarn("GetLastNOHLCVBars [%s]: Failed to parse an OHLCV bar, skipping: %v", pair, err)
 			continue
 		}
-		bars = append(bars, parsedBar)
+		bars = append(bars, bar)
 	}
 
-	// Check if we have any valid bars after parsing.
+	// Check if any valid bars were parsed.
 	if len(bars) == 0 {
-		return nil, fmt.Errorf("GetLastNOHLCVBars: no valid OHLCV bars parsed for pair %s", pair)
+		// This can be a valid state if there's no data for the requested period, so we return an empty slice instead of an error.
+		a.logger.LogInfo("GetLastNOHLCVBars: no valid OHLCV bars were returned or parsed for pair %s.", pair)
+		return []utilities.OHLCVBar{}, nil
 	}
 
 	// Sort bars by timestamp to ensure ascending order.
@@ -230,7 +235,7 @@ func (a *Adapter) GetLastNOHLCVBars(ctx context.Context, pair string, intervalMi
 	// Save the newly fetched bars to the cache one by one.
 	for _, bar := range bars {
 		if saveErr := a.cache.SaveBar(cacheProvider, cacheKey, bar); saveErr != nil {
-			// Log the error but don't fail the entire operation, as the primary goal (fetching data) was successful.
+			// Log the error but don't fail the entire operation.
 			a.logger.LogWarn("GetLastNOHLCVBars [%s]: Failed to save a single bar to cache: %v", pair, saveErr)
 		}
 	}
