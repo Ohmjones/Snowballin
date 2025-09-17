@@ -74,14 +74,14 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 	}
 	// --- END CHECK ---
 
-	// Step 1: Get all asset pair details from Kraken (our source of truth)
+	// Step 1: Get all asset pair details from Kraken
 	krakenPairs, err := m.kraken.GetAssetPairsAPI(ctx, "")
 	if err != nil {
 		return nil, fmt.Errorf("mapper: failed to get asset pairs from Kraken: %w", err)
 	}
 
 	var targetKrakenPair *kraken.AssetPairInfo
-	var krakenAssetName string
+	var krakenAssetName string // Will store base asset, e.g., "SOL"
 
 	// Determine preferred quote based on config (e.g., "usd" -> "ZUSD", "usdt" -> "USDT")
 	preferredQuote := ""
@@ -97,7 +97,7 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 
 	// Helper to find pair with specific quote
 	findPairWithQuote := func(quote string) bool {
-		for name, pair := range krakenPairs {
+		for _, pair := range krakenPairs {
 			commonBaseName, err := m.kraken.GetCommonAssetName(ctx, pair.Base)
 			if err != nil {
 				continue
@@ -105,7 +105,7 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 			if strings.EqualFold(commonBaseName, commonSymbol) && strings.EqualFold(pair.Quote, quote) {
 				p := pair
 				targetKrakenPair = &p
-				krakenAssetName = name
+				krakenAssetName = pair.Base // Use base asset code, e.g., "SOL" instead of "SOLUSD"
 				return true
 			}
 		}
@@ -187,8 +187,8 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 	// Step 7: Assemble the complete identity object
 	newIdentity := &dataprovider.AssetIdentity{
 		CommonSymbol:    commonSymbol,
-		KrakenAsset:     krakenAssetName,
-		KrakenWsName:    targetKrakenPair.WSName,
+		KrakenAsset:     krakenAssetName,         // Now uses base asset, e.g., "SOL"
+		KrakenWsName:    targetKrakenPair.WSName, // Pair name, e.g., "SOL/USD"
 		CoinGeckoID:     matchedCgCoin.ID,
 		CoinMarketCapID: cmcID,
 		IconPath:        iconPath,
