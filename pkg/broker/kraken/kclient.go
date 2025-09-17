@@ -480,19 +480,30 @@ func (c *Client) GetOHLCVAPI(ctx context.Context, krakenPairName string, interva
 		return nil, fmt.Errorf("kraken OHLC API error: %s", strings.Join(resp.Error, ", "))
 	}
 
-	// The key in the result might be the primary name, even if we query by an alias
-	for _, pairData := range resp.Result {
-		if ohlcvSlice, ok := pairData.([][]interface{}); ok {
+	// The Kraken API response includes the pair data and a "last" timestamp key.
+	// We must iterate through the keys to find the pair data and explicitly skip the "last" key.
+	for key, data := range resp.Result {
+		// Skip the 'last' timestamp entry, which is not OHLCV data.
+		if key == "last" {
+			continue
+		}
+
+		// The actual OHLC data is under a key that is the kraken pair name.
+		if ohlcvSlice, ok := data.([][]interface{}); ok {
 			return ohlcvSlice, nil
 		}
-		// Handle case where Kraken returns an empty array `[]`
-		if _, ok := pairData.([]interface{}); ok && len(pairData.([]interface{})) == 0 {
+
+		// Handle the case where Kraken returns an empty array `[]` for a valid pair with no data in the requested range.
+		if emptySlice, ok := data.([]interface{}); ok && len(emptySlice) == 0 {
 			return [][]interface{}{}, nil
 		}
-		return nil, fmt.Errorf("unexpected type for ohlcv data for pair %s: %T", krakenPairName, pairData)
+
+		// If we are processing a key that isn't 'last' and it doesn't match the expected data types, it's an unexpected structure.
+		c.logger.LogWarn("GetOHLCVAPI: Unexpected data type encountered in response for key '%s': %T", key, data)
 	}
 
-	return [][]interface{}{}, nil // No data for this pair, return empty slice
+	// If the loop completes without returning, it means no valid OHLCV key was found for the requested pair.
+	return nil, fmt.Errorf("no OHLCV data found for pair %s in API response", krakenPairName)
 }
 
 // GetPairDetail retrieves cached formatting and limit details for a given Kraken pair.
