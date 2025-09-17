@@ -480,30 +480,45 @@ func (c *Client) GetOHLCVAPI(ctx context.Context, krakenPairName string, interva
 		return nil, fmt.Errorf("kraken OHLC API error: %s", strings.Join(resp.Error, ", "))
 	}
 
-	// The Kraken API response includes the pair data and a "last" timestamp key.
-	// We must iterate through the keys to find the pair data and explicitly skip the "last" key.
 	for key, data := range resp.Result {
-		// Skip the 'last' timestamp entry, which is not OHLCV data.
 		if key == "last" {
 			continue
 		}
 
-		// The actual OHLC data is under a key that is the kraken pair name.
-		if ohlcvSlice, ok := data.([][]interface{}); ok {
-			return ohlcvSlice, nil
+		// First, assert that the data is a slice of interfaces.
+		iSlice, ok := data.([]interface{})
+		if !ok {
+			c.logger.LogWarn("GetOHLCVAPI: data for key '%s' is not a slice, it's a %T. Skipping.", key, data)
+			continue
 		}
 
-		// Handle the case where Kraken returns an empty array `[]` for a valid pair with no data in the requested range.
-		if emptySlice, ok := data.([]interface{}); ok && len(emptySlice) == 0 {
+		// If the slice is empty, it's valid and means no new data. Return an empty result.
+		if len(iSlice) == 0 {
 			return [][]interface{}{}, nil
 		}
 
-		// If we are processing a key that isn't 'last' and it doesn't match the expected data types, it's an unexpected structure.
-		c.logger.LogWarn("GetOHLCVAPI: Unexpected data type encountered in response for key '%s': %T", key, data)
+		// Now, validate the structure by checking if the *first element* is also a slice.
+		// This confirms the expected slice-of-slices structure (e.g., [[...], [...]]).
+		_, isSliceOfSlices := iSlice[0].([]interface{})
+		if !isSliceOfSlices {
+			c.logger.LogWarn("GetOHLCVAPI: data for key '%s' is a slice, but not a slice of slices. First element is %T. Skipping.", key, iSlice[0])
+			continue
+		}
+
+		// If all checks pass, manually and safely construct the [][]interface{} to return.
+		ohlcvSlice := make([][]interface{}, len(iSlice))
+		for i, v := range iSlice {
+			if innerSlice, ok := v.([]interface{}); ok {
+				ohlcvSlice[i] = innerSlice
+			} else {
+				// This safeguard handles malformed data where not all elements are slices.
+				return nil, fmt.Errorf("inconsistent data in OHLCV response for key %s; element %d is not a slice", key, i)
+			}
+		}
+		return ohlcvSlice, nil
 	}
 
-	// If the loop completes without returning, it means no valid OHLCV key was found for the requested pair.
-	return nil, fmt.Errorf("no OHLCV data found for pair %s in API response", krakenPairName)
+	return nil, fmt.Errorf("no valid OHLCV data found for pair %s in API response", krakenPairName)
 }
 
 // GetPairDetail retrieves cached formatting and limit details for a given Kraken pair.
