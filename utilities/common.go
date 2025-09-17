@@ -426,28 +426,41 @@ type WithdrawalConfig struct {
 
 // --- Standalone Functions (Alphabetized) ---
 
-// ConvertTFToKrakenInterval converts a standard timeframe string (e.g., "1h") to Kraken's format ("60").
 func ConvertTFToKrakenInterval(tf string) (string, error) {
-	switch strings.ToLower(tf) {
-	case "1m":
-		return "1", nil
-	case "5m":
-		return "5", nil
-	case "15m":
-		return "15", nil
-	case "30m":
-		return "30", nil
-	case "1h":
-		return "60", nil
-	case "4h":
-		return "240", nil
-	case "1d":
-		return "1440", nil
-	case "1w":
-		return "10080", nil
-	default:
-		return "", fmt.Errorf("unsupported timeframe for Kraken interval conversion: %s", tf)
+	// Map of standard timeframes to Kraken intervals
+	intervalMap := map[string]string{
+		"1m":  "1",
+		"5m":  "5",
+		"15m": "15",
+		"30m": "30",
+		"1h":  "60",
+		"4h":  "240",
+		"1d":  "1440",
+		"1w":  "10080",
 	}
+
+	// Check if the input is a standard timeframe
+	if interval, ok := intervalMap[strings.ToLower(tf)]; ok {
+		return interval, nil
+	}
+
+	// Defensive check: if the input is already a Kraken interval, return it unchanged
+	validKrakenIntervals := map[string]bool{
+		"1":     true,
+		"5":     true,
+		"15":    true,
+		"30":    true,
+		"60":    true,
+		"240":   true,
+		"1440":  true,
+		"10080": true,
+	}
+	if validKrakenIntervals[tf] {
+		return tf, nil // Return the Kraken interval as-is to prevent re-conversion errors
+	}
+
+	// If the timeframe is unsupported, return an error
+	return "", fmt.Errorf("unsupported timeframe for Kraken interval conversion: %s", tf)
 }
 
 // DoJSONRequest performs an HTTP request, retries on transient errors, and unmarshals a JSON response.
