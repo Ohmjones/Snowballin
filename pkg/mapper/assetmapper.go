@@ -66,13 +66,15 @@ func (m *AssetMapper) GetIdentity(ctx context.Context, commonSymbol string) (*da
 // discoverAndMapAsset orchestrates the multi-provider identification process.
 func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol string) (*dataprovider.AssetIdentity, error) {
 	// --- RESILIENCY CHECK: Ensure essential providers are configured ---
-	if m.coingecko == nil {
-		return nil, errors.New("cannot discover new asset identity: CoinGecko data provider is not configured")
-	}
 	if m.kraken == nil {
 		return nil, errors.New("cannot discover new asset identity: Kraken client is not configured")
 	}
 	// --- END CHECK ---
+
+	krakenAltname, err := m.kraken.GetKrakenAltname(ctx, commonSymbol)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get Kraken altname for %s: %w", commonSymbol, err)
+	}
 
 	// Step 1: Get all asset pair details from Kraken
 	krakenPairs, err := m.kraken.GetAssetPairsAPI(ctx, "")
@@ -102,10 +104,10 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 			if err != nil {
 				continue
 			}
-			if strings.EqualFold(commonBaseName, commonSymbol) && strings.EqualFold(pair.Quote, quote) {
+			if strings.EqualFold(commonBaseName, krakenAltname) && strings.EqualFold(pair.Quote, quote) {
 				p := pair
 				targetKrakenPair = &p
-				krakenAssetName = pair.Base // Use base asset code, e.g., "SOL" instead of "SOLUSD"
+				krakenAssetName = pair.Base // Use base asset code, e.g., "SOL"
 				return true
 			}
 		}
@@ -130,57 +132,82 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 		m.logger.LogInfo("mapper: Preferred quote match found for %s: %s", commonSymbol, krakenAssetName)
 	}
 
-	// Step 2: Get all potential CoinGecko IDs for the common symbol.
-	cgIDs, err := m.coingecko.GetCoinIDsBySymbol(ctx, commonSymbol)
-	if err != nil {
-		return nil, fmt.Errorf("mapper: failed to get CoinGecko IDs for '%s': %w", commonSymbol, err)
-	}
-
-	// Step 3: Get market data for ALL potential CoinGecko IDs to filter by market cap and volume.
-	cgMarketData, err := m.coingecko.GetMarketData(ctx, cgIDs, "USD")
-	if err != nil {
-		return nil, fmt.Errorf("mapper: failed to get market data for CoinGecko IDs [%s]: %w", strings.Join(cgIDs, ","), err)
-	}
-
-	// Step 4: Find the best match by cross-referencing with Kraken data and market cap rank.
-	var candidates []dataprovider.MarketData
-	for _, cgCoin := range cgMarketData {
-		if strings.EqualFold(cgCoin.Symbol, commonSymbol) && cgCoin.MarketCapRank > 0 && cgCoin.MarketCapRank <= m.cfg.Trading.DynamicAssetScanTopN {
-			candidates = append(candidates, cgCoin)
+	// Step 2-4: CoinGecko discovery (optional)
+	var coinGeckoID string
+	var cgMarketCap float64
+	var cgImage string
+	if m.coingecko != nil {
+		m.logger.LogInfo("mapper: Using CoinGecko for discovery of %s...", commonSymbol)
+		cgIDs, err := m.coingecko.GetCoinIDsBySymbol(ctx, commonSymbol)
+		if err != nil {
+			return nil, fmt.Errorf("mapper: failed to get CoinGecko IDs for '%s': %w", commonSymbol, err)
 		}
+
+		cgMarketData, err := m.coingecko.GetMarketData(ctx, cgIDs, "USD")
+		if err != nil {
+			return nil, fmt.Errorf("mapper: failed to get market data for CoinGecko IDs [%s]: %w", strings.Join(cgIDs, ","), err)
+		}
+
+		var candidates []dataprovider.MarketData
+		for _, cgCoin := range cgMarketData {
+			if strings.EqualFold(cgCoin.Symbol, commonSymbol) && cgCoin.MarketCapRank > 0 && cgCoin.MarketCapRank <= m.cfg.Trading.DynamicAssetScanTopN {
+				candidates = append(candidates, cgCoin)
+			}
+		}
+
+		if len(candidates) == 0 {
+			return nil, fmt.Errorf("mapper: could not find a confident match for '%s' on CoinGecko after cross-referencing", commonSymbol)
+		}
+
+		sort.Slice(candidates, func(i, j int) bool {
+			return candidates[i].MarketCapRank < candidates[j].MarketCapRank
+		})
+		matchedCgCoin := &candidates[0]
+
+		coinGeckoID = matchedCgCoin.ID
+		cgImage = matchedCgCoin.Image
+		cgMarketCap = matchedCgCoin.MarketCap
+	} else {
+		m.logger.LogInfo("mapper: Skipping CoinGecko discovery for %s as not configured.", commonSymbol)
+		coinGeckoID = ""
+		cgImage = ""
+		cgMarketCap = 0
 	}
 
-	if len(candidates) == 0 {
-		return nil, fmt.Errorf("mapper: could not find a confident match for '%s' on CoinGecko after cross-referencing", commonSymbol)
-	}
-
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].MarketCapRank < candidates[j].MarketCapRank
-	})
-	matchedCgCoin := &candidates[0]
-
-	// Step 5: Use the verified CoinGecko data to find the precise CoinMarketCap ID.
+	// Step 5: Use the verified CoinGecko data to find the precise CoinMarketCap ID (optional).
 	var cmcID, cmcLogoURL string
 	if m.coinmarketcap != nil {
 		var cmcErr error
-		cmcID, cmcLogoURL, cmcErr = m.findPreciseCmcID(ctx, commonSymbol, matchedCgCoin.MarketCap)
+		cmcID, cmcLogoURL, cmcErr = m.findPreciseCmcID(ctx, commonSymbol, cgMarketCap)
 		if cmcErr != nil {
 			m.logger.LogWarn("mapper: could not resolve CoinMarketCap ID for '%s': %v", commonSymbol, cmcErr)
 			cmcID = "N/A"
+			cmcLogoURL = ""
 		}
 	} else {
 		m.logger.LogInfo("mapper: CoinMarketCap provider not configured, skipping ID resolution for '%s'.", commonSymbol)
 		cmcID = "N/A"
+		cmcLogoURL = ""
 	}
 
-	// Step 6: Download the icon
-	iconURL := matchedCgCoin.Image
+	// Step 6: Download the icon (if available)
+	iconURL := cgImage
 	if iconURL == "" {
 		iconURL = cmcLogoURL
 	}
-	iconPath, err := m.downloadIcon(ctx, matchedCgCoin.ID, iconURL)
-	if err != nil {
-		m.logger.LogWarn("mapper: failed to download icon for '%s': %v", commonSymbol, err)
+	var iconPath string
+	if iconURL != "" {
+		coinID := coinGeckoID
+		if coinID == "" {
+			coinID = cmcID
+		}
+		var err error
+		iconPath, err = m.downloadIcon(ctx, coinID, iconURL)
+		if err != nil {
+			m.logger.LogWarn("mapper: failed to download icon for '%s': %v", commonSymbol, err)
+			iconPath = ""
+		}
+	} else {
 		iconPath = ""
 	}
 
@@ -189,7 +216,7 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 		CommonSymbol:    commonSymbol,
 		KrakenAsset:     krakenAssetName,         // Now uses base asset, e.g., "SOL"
 		KrakenWsName:    targetKrakenPair.WSName, // Pair name, e.g., "SOL/USD"
-		CoinGeckoID:     matchedCgCoin.ID,
+		CoinGeckoID:     coinGeckoID,
 		CoinMarketCapID: cmcID,
 		IconPath:        iconPath,
 		LastUpdated:     time.Now(),
@@ -227,6 +254,25 @@ func (m *AssetMapper) findPreciseCmcID(ctx context.Context, symbol string, cgMar
 	}
 
 	m.logger.LogWarn("Multiple CMC results for symbol '%s' (%d candidates). Comparing market caps for precision.", symbol, len(cmcMarketData))
+
+	if cgMarketCap == 0 {
+		// No CG data; select the candidate with the highest market cap
+		var maxCap float64 = 0
+		var bestMatch *dataprovider.MarketData
+		for _, data := range cmcMarketData {
+			if data.MarketCap > maxCap {
+				maxCap = data.MarketCap
+				bestMatch = &data
+			}
+		}
+		if bestMatch == nil {
+			return "", "", fmt.Errorf("no market data available for %s", symbol)
+		}
+		m.logger.LogInfo("Precise match found for %s on CMC: ID %s (Highest Market Cap, no CG reference)", symbol, bestMatch.ID)
+		return bestMatch.ID, bestMatch.Image, nil
+	}
+
+	// With CG reference: use tolerance comparison
 	const marketCapTolerance = 0.15 // 15% difference
 
 	var bestMatch *dataprovider.MarketData
