@@ -748,8 +748,8 @@ func (c *Client) callPrivate(ctx context.Context, apiPath string, data url.Value
 	}
 
 	var lastErr error
-	maxRetries := 4
-	backoff := 2 * time.Second
+	maxRetries := c.cfg.MaxRetries
+	backoff := time.Duration(c.cfg.RetryDelaySec) * time.Second
 
 	for i := 0; i < maxRetries; i++ {
 		nonce := c.nonceGenerator.Nonce()
@@ -813,7 +813,7 @@ func (c *Client) callPublic(ctx context.Context, path string, params url.Values,
 	}
 	req.Header.Set("User-Agent", "SnowballinBot/1.0")
 
-	return utilities.DoJSONRequest(c.HTTPClient, req, 2, 2*time.Second, target)
+	return utilities.DoJSONRequest(c.HTTPClient, req, c.cfg.MaxRetries, time.Duration(c.cfg.RetryDelaySec)*time.Second, target)
 }
 
 // QueryTradeVolumeAPI retrieves user's trade volume and fee tier information from Kraken.
