@@ -157,7 +157,7 @@ type cgTickersResponse struct {
 	Tickers []cgTicker `json:"tickers"`
 }
 
-// Updated NewClient function in cgclient.go
+// Updated NewClient function in coingecko.go
 func NewClient(appCfg *utils.AppConfig, logger *utils.Logger, cache *dataprovider.SQLiteCache) (*Client, error) {
 	if appCfg == nil {
 		return nil, errors.New("CoinGecko client: AppConfig cannot be nil")
@@ -819,7 +819,7 @@ func (c *Client) GetTrendingSearches(ctx context.Context) ([]dataprovider.Trendi
 	return dpTrending, nil
 }
 
-// In coingecko/cgclient.go, add a placeholder implementation to satisfy the interface.
+// In coingecko/coingecko.go, add a placeholder implementation to satisfy the interface.
 func (c *Client) GetGainersAndLosers(ctx context.Context, quoteCurrency string, topN int) ([]dataprovider.MarketData, []dataprovider.MarketData, error) {
 	// CoinGecko API is not ideal for this specific "top 100 gainers" query compared to CMC.
 	// We will rely on CMC for this feature.
@@ -827,7 +827,7 @@ func (c *Client) GetGainersAndLosers(ctx context.Context, quoteCurrency string, 
 	return nil, nil, nil
 }
 
-// In cgclient.go
+// In coingecko.go
 func ConvertCoinGeckoMarketData(data cgMarketData) (utils.OHLCVBar, error) {
 	// --- FIX: Handle empty LastUpdated string gracefully ---
 	if data.LastUpdated == "" {

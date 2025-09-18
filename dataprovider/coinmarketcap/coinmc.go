@@ -1,4 +1,4 @@
-// File: dataprovider/coinmarketcap/cmclient.go
+// File: dataprovider/coinmarketcap/coinmc.go
 package coinmarketcap
 
 import (
