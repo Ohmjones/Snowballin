@@ -299,11 +299,33 @@ func (c *Client) GetCommonPairName(ctx context.Context, krakenPair string) (stri
 	return "", fmt.Errorf("no common pair for Kraken pair %s", krakenPair)
 }
 
-// GetCommonAssetName reverse-maps a Kraken asset to common (placeholder; use altname logic).
+// GetCommonAssetName reverse-maps a Kraken asset (e.g., "XBT", "ZUSD") to its common symbol ("BTC", "USD").
 func (c *Client) GetCommonAssetName(ctx context.Context, krakenAsset string) (string, error) {
-	// Simplified: For now, assume reverse lookup not needed; extend if required.
-	// This is pruned; use full assets if necessary later.
-	return krakenAsset, nil // Fallback
+	c.dataMu.RLock()
+	defer c.dataMu.RUnlock()
+
+	// First, do a direct check in case the krakenAsset is already a common name
+	if _, ok := c.commonToKrakenAsset[krakenAsset]; ok {
+		return krakenAsset, nil
+	}
+
+	// Perform a reverse lookup on the map
+	for common, kraken := range c.commonToKrakenAsset {
+		if kraken == krakenAsset {
+			return common, nil
+		}
+	}
+
+	// Fallback for assets not in the primary map (e.g., historical or minor assets)
+	// ZUSD -> USD is a common case.
+	if strings.HasPrefix(krakenAsset, "Z") || strings.HasPrefix(krakenAsset, "X") {
+		trimmed := krakenAsset[1:]
+		if _, ok := c.commonToKrakenAsset[trimmed]; ok {
+			return trimmed, nil
+		}
+	}
+
+	return "", fmt.Errorf("no common asset found for Kraken asset %s", krakenAsset)
 }
 
 // GetKrakenAssetAltName returns altname for common asset (internal helper).

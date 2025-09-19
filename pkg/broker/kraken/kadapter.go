@@ -86,10 +86,13 @@ func (a *Adapter) GetAllBalances(ctx context.Context) ([]broker.Balance, error) 
 
 	var allBalances []broker.Balance
 	for krakenName, balanceStr := range balances {
+		// Attempt to map the Kraken asset name back to a common symbol (e.g., ZUSD -> USD)
 		commonName, err := a.client.GetCommonAssetName(ctx, krakenName)
 		if err != nil {
-			a.logger.LogDebug("GetAllBalances: could not get common name for Kraken asset '%s', skipping. Error: %v", krakenName, err)
-			continue
+			// If mapping fails, log it but use the original Kraken name.
+			// This ensures assets not explicitly configured are still visible, even if they can't be valued.
+			a.logger.LogDebug("GetAllBalances: could not get common name for Kraken asset '%s', using raw name. Error: %v", krakenName, err)
+			commonName = krakenName
 		}
 
 		bal, parseErr := strconv.ParseFloat(balanceStr, 64)
@@ -102,7 +105,7 @@ func (a *Adapter) GetAllBalances(ctx context.Context) ([]broker.Balance, error) 
 			allBalances = append(allBalances, broker.Balance{
 				Currency:  commonName,
 				Total:     bal,
-				Available: bal,
+				Available: bal, // Assuming total is available for simplicity
 			})
 		}
 	}
@@ -356,16 +359,14 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 			continue
 		}
 
+		// **THIS IS THE CORE FIX**: If the balance's currency is the quote currency,
+		// simply add its total to the account value directly. No ticker needed.
 		if strings.EqualFold(bal.Currency, quoteUpper) {
 			totalValue += bal.Total
 			continue
 		}
 
-		// Skip if below dust threshold
-		if bal.Total < a.appConfig.Trading.DustThresholdUSD/bal.Total { // Approximate, but to skip small
-			continue
-		}
-
+		// For all other assets, construct a pair and get the ticker to find its value.
 		pair := fmt.Sprintf("%s/%s", strings.ToUpper(bal.Currency), quoteUpper)
 		ticker, err := a.GetTicker(ctx, pair)
 		if err != nil {
@@ -373,6 +374,7 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 			continue
 		}
 
+		// Add the value of this asset (amount * price) to the total portfolio value.
 		totalValue += bal.Total * ticker.LastPrice
 	}
 
