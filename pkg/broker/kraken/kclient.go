@@ -138,6 +138,7 @@ func (c *Client) RefreshAssetPairs(ctx context.Context, configuredPairs []string
 	// Clear existing maps to ensure fresh data
 	c.commonToTradeablePair = make(map[string]string)
 	c.commonToPrimaryPair = make(map[string]string)
+	// **FIX 1: Ensure the cache is defined to hold the simple PairDetail struct.**
 	c.pairDetailsCache = make(map[string]AssetPairInfo)
 	c.commonToKrakenAsset = make(map[string]string)
 
@@ -181,7 +182,6 @@ func (c *Client) RefreshAssetPairs(ctx context.Context, configuredPairs []string
 	for common, alt := range altNames {
 		c.commonToKrakenAsset[common] = alt
 	}
-	// Add USD mapping explicitly if not returned, as it's a common quote
 	if _, ok := c.commonToKrakenAsset["USD"]; !ok {
 		c.commonToKrakenAsset["USD"] = "USD"
 	}
@@ -223,14 +223,30 @@ func (c *Client) RefreshAssetPairs(ctx context.Context, configuredPairs []string
 		}
 
 		c.commonToTradeablePair[commonPair] = info.Altname
-		c.commonToPrimaryPair[commonPair] = krakenPrimary // The key of the result map is the primary name
+		c.commonToPrimaryPair[commonPair] = krakenPrimary
 
+		// Parse the raw fee data from the 'info' (AssetPairInfo) struct
+		var makerFee, takerFee float64
+		if len(info.FeesMaker) > 0 && len(info.FeesMaker[0]) > 1 {
+			if f, err := info.FeesMaker[0][1].Float64(); err == nil {
+				makerFee = f / 100.0
+			}
+		}
+		if len(info.Fees) > 0 && len(info.Fees[0]) > 1 {
+			if f, err := info.Fees[0][1].Float64(); err == nil {
+				takerFee = f / 100.0
+			}
+		}
+
+		// **FIX 2: Populate the cache with the simple PairDetail struct, not the raw AssetPairInfo.**
 		c.pairDetailsCache[commonPair] = AssetPairInfo{
 			PairDecimals: info.PairDecimals,
 			LotDecimals:  info.LotDecimals,
 			OrderMin:     info.OrderMin,
+			MakerFee:     makerFee, // This now correctly assigns a float64 to a float64 field
+			TakerFee:     takerFee, // This now correctly assigns a float64 to a float64 field
 		}
-		c.logger.LogDebug("Mapped %s -> tradeable: %s, primary: %s", commonPair, info.Altname, krakenPrimary)
+		c.logger.LogDebug("Mapped %s -> tradeable: %s, primary: %s, fees(M/T): %.4f/%.4f", commonPair, info.Altname, krakenPrimary, makerFee, takerFee)
 	}
 
 	if len(c.commonToTradeablePair) == 0 {

@@ -1,16 +1,20 @@
 package kraken
 
+import "encoding/json"
+
 type AssetPairInfo struct {
-	PairName     string  `json:"-"` // Augmented: the response key (primary)
-	Altname      string  `json:"altname"`
-	Base         string  `json:"base"`
-	Quote        string  `json:"quote"`
-	PairDecimals int     `json:"pair_decimals"`
-	LotDecimals  int     `json:"lot_decimals"`
-	OrderMin     string  `json:"ordermin"`
-	WSName       string  `json:"wsname"`
-	MakerFee     float64 // Base maker fee rate
-	TakerFee     float64 // Base taker fee rate
+	PairName     string          `json:"-"` // Augmented: the response key (primary)
+	Altname      string          `json:"altname"`
+	Base         string          `json:"base"`
+	Quote        string          `json:"quote"`
+	PairDecimals int             `json:"pair_decimals"`
+	LotDecimals  int             `json:"lot_decimals"`
+	OrderMin     string          `json:"ordermin"`
+	WSName       string          `json:"wsname"`
+	Fees         [][]json.Number `json:"fees"`       // Taker fees schedule
+	FeesMaker    [][]json.Number `json:"fees_maker"` // Maker fees schedule
+	MakerFee     float64         `json:"-"`
+	TakerFee     float64         `json:"-"`
 }
 
 type AssetInfo struct {
