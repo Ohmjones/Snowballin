@@ -197,11 +197,13 @@ func modulateConfigBySentiment(originalConfig utilities.TradingConfig, fngValue 
 	// Return the original, unmodified config if sentiment is neutral.
 	return originalConfig
 }
+
 func getCurrentFNG() dataprovider.FearGreedIndex {
 	fngMutex.RLock()
 	defer fngMutex.RUnlock()
 	return currentFNG
 }
+
 func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger) error {
 	if len(cfg.Trading.AssetPairs) == 0 {
 		return errors.New("pre-flight check failed: no asset_pairs configured in config.json")
@@ -238,7 +240,7 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 	krakenClient := krakenBroker.NewClient(&cfg.Kraken, sharedHTTPClient, logger)
 
 	// 2. Pass the client and configured asset pairs into the Adapter.
-	krakenAdapter, krakenErr := krakenBroker.NewAdapter(&cfg.Kraken, cfg.Trading.AssetPairs, krakenClient, logger, sqliteCache)
+	krakenAdapter, krakenErr := krakenBroker.NewAdapter(cfg, cfg.Trading.AssetPairs, krakenClient, logger, sqliteCache)
 	if krakenErr != nil {
 		return fmt.Errorf("pre-flight check failed: could not initialize Kraken adapter: %w", krakenErr)
 	}
@@ -512,6 +514,7 @@ func Run(ctx context.Context, cfg *utilities.AppConfig, logger *utilities.Logger
 		}
 	}
 }
+
 func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, assetPair string, actualBalance float64, tradeHistory []broker.Trade) (*utilities.Position, error) {
 	state.logger.LogWarn("Reconstruction: Attempting to reconstruct orphaned position for %s. Target balance: %f", assetPair, actualBalance)
 
@@ -627,6 +630,7 @@ func ReconstructOrphanedPosition(ctx context.Context, state *TradingState, asset
 
 	return reconstructedPosition, nil
 }
+
 func reapStaleOrders(ctx context.Context, state *TradingState) {
 	state.stateMutex.RLock()
 	if len(state.pendingOrders) == 0 {
@@ -661,6 +665,7 @@ func reapStaleOrders(ctx context.Context, state *TradingState) {
 		}
 	}
 }
+
 func processPendingOrders(ctx context.Context, state *TradingState) {
 	state.stateMutex.RLock()
 	if len(state.pendingOrders) == 0 {
@@ -685,7 +690,7 @@ func processPendingOrders(ctx context.Context, state *TradingState) {
 		}
 
 		if strings.EqualFold(order.Status, "partially filled") && order.FilledVolume > 0 {
-			state.logger.LogWarn("PendingOrders: Order %s for %s is PARTIALLY FILLED (%.4f / %.4f).", orderID, order.Pair, order.FilledVolume, order.Volume)
+			state.logger.LogWarn("PendingOrders: Order %s for %s is PARTIALLY FILLED (%.4f / %.4f).", orderID, order.FilledVolume, order.Volume)
 			state.stateMutex.Lock()
 			assetPair, isPending := state.pendingOrders[orderID]
 			if isPending {
@@ -712,7 +717,7 @@ func processPendingOrders(ctx context.Context, state *TradingState) {
 					state.logger.LogError("PendingOrders: Failed to cancel partially filled order %s before re-placing: %v", orderID, err)
 				}
 
-				newOrderID, placeErr, _ := state.broker.PlaceOrder(ctx, assetPair, order.Side, "limit", remainingVol, newPrice, 0, "")
+				newOrderID, placeErr := state.broker.PlaceOrder(ctx, assetPair, order.Side, "limit", remainingVol, newPrice, 0, "")
 				if placeErr != nil {
 					state.logger.LogError("PendingOrders: Failed to place new order for remainder of partial fill: %v", placeErr)
 				} else {
@@ -758,6 +763,7 @@ func processPendingOrders(ctx context.Context, state *TradingState) {
 		}
 	}
 }
+
 func updatePositionFromFill(state *TradingState, order broker.Order, assetPair string) {
 	if strings.EqualFold(order.Side, "buy") {
 		position, hasPosition := state.openPositions[assetPair]
@@ -815,7 +821,7 @@ func updatePositionFromFill(state *TradingState, order broker.Order, assetPair s
 				profitPercent := (profit / totalBuyCost) * 100
 
 				// Send the notification with the reason included.
-				state.discordClient.NotifyOrderFilled(order, fmt.Sprintf("💰 **Position Closed**\n**Reason: %s**\nNet Profit: `%.2f %s` (`%.2f%%`)", reason, profit, state.config.Trading.QuoteCurrency, profitPercent))
+				state.discordClient.NotifyOrderFilled(order, fmt.Sprintf("💰 **Position Closed**\n**Reason:** %s\nNet Profit: `%.2f %s` (`%.2f%%`)", reason, profit, state.config.Trading.QuoteCurrency, profitPercent))
 
 				// Clean up the state.
 				delete(state.openPositions, assetPair)
@@ -830,6 +836,7 @@ func updatePositionFromFill(state *TradingState, order broker.Order, assetPair s
 		}
 	}
 }
+
 func processTradingCycle(ctx context.Context, state *TradingState) {
 	state.logger.LogInfo("-------------------- New Trading Cycle --------------------")
 
@@ -1035,6 +1042,7 @@ func processTradingCycle(ctx context.Context, state *TradingState) {
 		}
 	}
 }
+
 func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities.Position, signals []strategy.StrategySignal, consolidatedData *strategy.ConsolidatedMarketPicture, cfg *utilities.AppConfig) {
 	state.logger.LogInfo("ManagePosition [%s]: Managing position. AvgPrice: %.2f, Vol: %.8f, SOs: %d, TP: %.2f",
 		pos.AssetPair, pos.AveragePrice, pos.TotalVolume, pos.FilledSafetyOrders, pos.CurrentTakeProfit)
@@ -1071,7 +1079,7 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 			}
 			// --- END: Balance Check ---
 
-			orderID, placeErr, _ := state.broker.PlaceOrder(ctx, pos.AssetPair, "buy", "limit", orderSizeInBase, orderPrice, 0, "")
+			orderID, placeErr := state.broker.PlaceOrder(ctx, pos.AssetPair, "buy", "limit", orderSizeInBase, orderPrice, 0, "")
 			if placeErr != nil {
 				state.logger.LogError("ManagePosition [%s]: Failed to place add-on buy order: %v", pos.AssetPair, placeErr)
 			} else {
@@ -1107,7 +1115,7 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 	exitSignal, shouldExit := stratInstance.GenerateExitSignal(ctx, *consolidatedData, *cfg)
 	if shouldExit && exitSignal.Direction == "sell" {
 		state.logger.LogWarn("!!! [SELL] signal for %s (Strategy Exit). Reason: %s. Placing market sell order.", pos.AssetPair, exitSignal.Reason)
-		orderID, err, _ := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
+		orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
 		if err != nil {
 			state.logger.LogError("ManagePosition [%s]: Failed to place market sell order for strategy exit: %v", pos.AssetPair, err)
 		} else {
@@ -1134,7 +1142,7 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 		trailingStopPrice := pos.PeakPriceSinceTP * (1.0 - (cfg.Trading.TrailingStopDeviation / 100.0))
 		if currentPrice <= trailingStopPrice {
 			state.logger.LogInfo("ManagePosition [%s]: TRAILING STOP-LOSS HIT at %.2f (Peak was %.2f). Placing market sell order.", pos.AssetPair, currentPrice, pos.PeakPriceSinceTP)
-			orderID, err, _ := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
+			orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
 			if err != nil {
 				//...
 			} else {
@@ -1154,7 +1162,7 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 			if partialSellPercent > 0 && partialSellPercent < 1.0 {
 				volumeToSell := pos.TotalVolume * partialSellPercent
 				state.logger.LogInfo("ManagePosition [%s]: HYBRID TAKE-PROFIT HIT at %.2f. Selling %.2f%% of position.", pos.AssetPair, currentPrice, cfg.Trading.TakeProfitPartialSellPercent)
-				orderID, err, _ := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", volumeToSell, 0, 0, "")
+				orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", volumeToSell, 0, 0, "")
 				if err != nil {
 					state.logger.LogError("ManagePosition [%s]: Failed to place partial market sell order: %v", pos.AssetPair, err)
 					return
@@ -1173,7 +1181,7 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 			return
 		} else {
 			state.logger.LogInfo("ManagePosition [%s]: TAKE-PROFIT HIT at %.2f. Placing market sell order (trailing stop disabled).", pos.AssetPair, currentPrice)
-			orderID, err, _ := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
+			orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "sell", "market", pos.TotalVolume, 0, 0, "")
 			if err != nil {
 				//...
 			} else {
@@ -1245,7 +1253,7 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 			// --- END: Balance Check ---
 
 			state.logger.LogInfo("ManagePosition [%s]: Price condition met for Safety Order #%d. Placing limit buy.", pos.AssetPair, nextSONumber)
-			orderID, err, _ := state.broker.PlaceOrder(ctx, pos.AssetPair, "buy", "limit", orderSizeInBase, strategicSafetyPrice, 0, "")
+			orderID, err := state.broker.PlaceOrder(ctx, pos.AssetPair, "buy", "limit", orderSizeInBase, strategicSafetyPrice, 0, "")
 			if err != nil {
 				state.logger.LogError("ManagePosition [%s]: Failed to place safety order: %v", pos.AssetPair, err)
 			} else {
@@ -1261,6 +1269,7 @@ func manageOpenPosition(ctx context.Context, state *TradingState, pos *utilities
 		}
 	}
 }
+
 func gatherConsolidatedData(ctx context.Context, state *TradingState, assetPair string, portfolioValue float64) (*strategy.ConsolidatedMarketPicture, error) {
 	// --- 1. Get the unified Asset Identity from the mapper ---
 	baseAssetSymbol := strings.Split(assetPair, "/")[0]
@@ -1507,11 +1516,11 @@ func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair st
 				assetPair, orderSizeInBase, orderPrice, 0.0, clientOrderID)
 
 			// Place order
-			orderID, placeErr, apiResponse := state.broker.PlaceOrder(ctx, assetPair, "buy", "limit", orderSizeInBase, orderPrice, 0, clientOrderID)
+			orderID, placeErr := state.broker.PlaceOrder(ctx, assetPair, "buy", "limit", orderSizeInBase, orderPrice, 0, clientOrderID)
 
 			// Prepare DB entry
 			status := "pending"
-			responseForDB := apiResponse
+			responseForDB := ""
 			if placeErr != nil {
 				status = "rejected"
 				responseForDB = placeErr.Error() // Log the error message as the API response
@@ -1538,7 +1547,7 @@ func seekEntryOpportunity(ctx context.Context, state *TradingState, assetPair st
 				state.logger.LogInfo("SeekEntry [%s]: Order %s status: %s, type: %s, price: %.2f, volume: %.8f",
 					assetPair, orderID, order.Status, order.Type, order.Price, order.Volume)
 				// Update DB with verified status using the new cache method
-				updateErr := state.cache.UpdateOrderStatus(orderID, order.Status, fmt.Sprintf("%s (verified)", apiResponse))
+				updateErr := state.cache.UpdateOrderStatus(orderID, order.Status, fmt.Sprintf("%s (verified)", orderID))
 				if updateErr != nil {
 					state.logger.LogError("SeekEntry [%s]: Failed to update order status in database: %v", assetPair, updateErr)
 				}
@@ -1607,23 +1616,22 @@ func liquidateAllPositions(ctx context.Context, state *TradingState, reason stri
 			clientOrderID := fmt.Sprintf("LIQ-%s-%d", strings.ReplaceAll(assetPair, "/", ""), time.Now().UnixNano())
 
 			// Place a market sell order to liquidate the entire position.
-			orderID, apiResponse, err := state.broker.PlaceOrder(ctx, assetPair, "sell", "market", position.TotalVolume, 0, 0, clientOrderID)
+			orderID, err := state.broker.PlaceOrder(ctx, assetPair, "sell", "market", position.TotalVolume, 0, 0, clientOrderID)
 
 			// Initialize variables for logging the order to the database.
 			status := "pending"
 			var responseForDB string
 
 			// Handle the result of the PlaceOrder call.
-			if err != "" {
+			if err != nil {
 				// If the order placement failed, mark it as rejected and log the error.
 				status = "rejected"
-				responseForDB = err // Use the error message directly, as err is a string.
+				responseForDB = err.Error() // Use the error message directly.
 				state.logger.LogError("CircuitBreaker: Failed to place liquidation order for %s: %v", assetPair, err)
 				state.discordClient.SendMessage(fmt.Sprintf("🔥 **LIQUIDATION FAILED for %s! Manual intervention required!** Error: %v", assetPair, err))
 			} else {
 				// If successful, serialize the apiResponse (interface{}) to a string for database storage.
-				// Since apiResponse is an interface{}, we attempt to marshal it to JSON.
-				responseForDB = fmt.Sprintf("%v", apiResponse) // Fallback to string representation if needed.
+				responseForDB = orderID // The orderID itself can be used for logging.
 				state.logger.LogInfo("CircuitBreaker: Liquidation order successfully placed for %s with ID %s.", assetPair, orderID)
 				state.discordClient.SendMessage(fmt.Sprintf("✅ Liquidation order placed for %s.", assetPair))
 			}
@@ -1734,6 +1742,7 @@ func (s *TradingState) GetDashboardData(ctx context.Context) web.DashboardData {
 		TotalUnrealizedPL: totalPL,
 	}
 }
+
 func (s *TradingState) GetAssetDetailData(assetPair string) (web.AssetDetailData, error) {
 	s.stateMutex.RLock()
 	var positionCopy *utilities.Position

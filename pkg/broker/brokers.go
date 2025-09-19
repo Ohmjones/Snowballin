@@ -1,4 +1,3 @@
-// File: pkg/broker/brokers.go
 package broker
 
 import (
@@ -10,7 +9,7 @@ import (
 // Broker defines the interface for interacting with a cryptocurrency exchange.
 type Broker interface {
 	// PlaceOrder submits a new order to the exchange.
-	PlaceOrder(ctx context.Context, assetPair, side, orderType string, volume, price, stopPrice float64, clientOrderID string) (string, error, string)
+	PlaceOrder(ctx context.Context, assetPair, side, orderType string, volume, price, stopPrice float64, clientOrderID string) (string, error)
 
 	// CancelOrder cancels an existing order by its ID.
 	CancelOrder(ctx context.Context, orderID string) error
@@ -23,7 +22,7 @@ type Broker interface {
 	GetAllBalances(ctx context.Context) ([]Balance, error)
 
 	// GetAccountValue retrieves the total portfolio value in the specified quote currency.
-	GetAccountValue(ctx context.Context, quoteCurrency string) (float64, error) // <<< NEW METHOD
+	GetAccountValue(ctx context.Context, quoteCurrency string) (float64, error)
 
 	// GetTicker retrieves ticker data for a specific trading pair.
 	GetTicker(ctx context.Context, pair string) (TickerData, error)
@@ -34,11 +33,11 @@ type Broker interface {
 	// GetTrades retrieves the trade history for a specific trading pair.
 	// The 'pair' parameter is the common pair name (e.g., "BTC/USD").
 	// The 'since' parameter can be used to limit trades. If zero, fetch all/default.
-	GetTrades(ctx context.Context, pair string, since time.Time) ([]Trade, error) // <<< MODIFIED GetTrades signature slightly for clarity
+	GetTrades(ctx context.Context, pair string, since time.Time) ([]Trade, error)
 
 	// GetOrderBook retrieves the order book for a specific trading pair.
 	// The 'pair' parameter is the common pair name (e.g., "BTC/USD").
-	GetOrderBook(ctx context.Context, pair string, depth int) (OrderBookData, error) // <<< NEW METHOD (from 1.c)
+	GetOrderBook(ctx context.Context, pair string, depth int) (OrderBookData, error)
 
 	// GetLastNOHLCVBars retrieves the last N OHLCV bars for a specific trading pair and interval.
 	// The 'pair' parameter is the common pair name (e.g., "BTC/USD").
@@ -46,18 +45,9 @@ type Broker interface {
 	GetLastNOHLCVBars(ctx context.Context, pair string, intervalMinutes string, nBars int) ([]utilities.OHLCVBar, error)
 
 	// RefreshAssetInfo ensures that the adapter's underlying client has the latest asset and pair information.
-	RefreshAssetInfo(ctx context.Context) error // <<< NEW METHOD (from 1.d alternative)
+	RefreshAssetInfo(ctx context.Context) error
 
 	GetTradeFees(ctx context.Context, commonPair string) (makerFee float64, takerFee float64, err error)
-}
-
-type OHLCVBar struct { // Duplicating from utilities for now to avoid import cycle if pkg/broker cannot import utilities
-	Timestamp int64   `json:"timestamp"`
-	Open      float64 `json:"open"`
-	High      float64 `json:"high"`
-	Low       float64 `json:"low"`
-	Close     float64 `json:"close"`
-	Volume    float64 `json:"volume"`
 }
 
 // OrderParams defines the parameters required to place a new order.
@@ -95,12 +85,6 @@ type Order struct {
 	TimePlaced    time.Time
 	TimeCompleted time.Time
 	RequestedVol  float64
-
-	// Fields below seem to be from a different context or older version based on your screenshot
-	// OrderType     interface{} // Not in screenshot errors
-	// ExecutedVol   interface{} // Not in screenshot errors
-	// TimePlaced    time.Time   // Not in screenshot errors
-	// TimeCompleted time.Time // Not in screenshot errors
 }
 
 // TickerData contains current market ticker information for a trading pair.

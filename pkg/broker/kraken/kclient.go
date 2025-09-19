@@ -1,4 +1,3 @@
-// File: pkg/broker/kraken/kclient.go
 package kraken
 
 import (
@@ -162,10 +161,7 @@ func (c *Client) RefreshAssetPairs(ctx context.Context, configuredPairs []string
 	c.logger.LogInfo("Kraken Client: Refreshing asset pairs using %v...", configuredPairs)
 
 	// STAGE 1: Discovery - Fetch ALL pairs to learn canonical primary names.
-	var allPairsResp struct {
-		Error  []string                 `json:"error"`
-		Result map[string]AssetPairInfo `json:"result"`
-	}
+	var allPairsResp AssetPairsResponse
 	if err := c.callPublic(ctx, "/0/public/AssetPairs", nil, &allPairsResp); err != nil {
 		return fmt.Errorf("failed to call AssetPairs for discovery: %w", err)
 	}
@@ -181,10 +177,7 @@ func (c *Client) RefreshAssetPairs(ctx context.Context, configuredPairs []string
 	}
 
 	// STAGE 2: Resolution - Fetch specific data for configured pairs to get links.
-	var resolvedPairsResp struct {
-		Error  []string                 `json:"error"`
-		Result map[string]AssetPairInfo `json:"result"`
-	}
+	var resolvedPairsResp AssetPairsResponse
 	params := url.Values{"pair": {strings.Join(configuredPairs, ",")}}
 	if err := c.callPublic(ctx, "/0/public/AssetPairs", params, &resolvedPairsResp); err != nil {
 		return fmt.Errorf("failed to call AssetPairs for resolution: %w", err)
@@ -252,20 +245,15 @@ func (c *Client) RefreshAssetPairs(ctx context.Context, configuredPairs []string
 	return nil
 }
 
-// GetAssetPairsAPI fetches the raw asset pair information from the public Kraken API.
+// GetAssetPairsAPI fetches asset pair information for one or all pairs.
 func (c *Client) GetAssetPairsAPI(ctx context.Context, pair string) (map[string]AssetPairInfo, error) {
 	params := url.Values{}
 	if pair != "" {
 		params.Set("pair", pair)
 	}
-
-	var resp struct {
-		Error  []string                 `json:"error"`
-		Result map[string]AssetPairInfo `json:"result"`
-	}
-
+	var resp AssetPairsResponse
 	if err := c.callPublic(ctx, "/0/public/AssetPairs", params, &resp); err != nil {
-		return nil, fmt.Errorf("GetAssetPairsAPI: API call failed: %w", err)
+		return nil, fmt.Errorf("GetAssetPairsAPI: callPublic failed: %w", err)
 	}
 	if len(resp.Error) > 0 {
 		return nil, fmt.Errorf("GetAssetPairsAPI: API error: %s", strings.Join(resp.Error, ", "))
@@ -325,40 +313,45 @@ func (c *Client) ParseOrderBook(rawOrderBook KrakenAPIRawOrderBook, commonPair s
 }
 
 // ParseTicker converts a raw Kraken TickerInfo struct into the standardized broker.TickerData struct.
-func (c *Client) ParseTicker(tickerInfo TickerInfo, pair string) (broker.TickerData, error) {
-	lastPrice, err := strconv.ParseFloat(tickerInfo.LastTradeClosed[0], 64)
+func (c *Client) ParseTicker(info TickerInfo, commonPair string) (broker.TickerData, error) {
+	askPrice, err := strconv.ParseFloat(info.Ask[0], 64)
 	if err != nil {
-		return broker.TickerData{}, fmt.Errorf("failed to parse last price: %w", err)
+		return broker.TickerData{}, fmt.Errorf("ParseTicker: failed to parse ask price: %w", err)
 	}
-	highPrice, err := strconv.ParseFloat(tickerInfo.High[1], 64)
+	bidPrice, err := strconv.ParseFloat(info.Bid[0], 64)
 	if err != nil {
-		return broker.TickerData{}, fmt.Errorf("failed to parse high price: %w", err)
+		return broker.TickerData{}, fmt.Errorf("ParseTicker: failed to parse bid price: %w", err)
 	}
-	lowPrice, err := strconv.ParseFloat(tickerInfo.Low[1], 64)
+	lastPrice, err := strconv.ParseFloat(info.LastTradeClosed[0], 64)
 	if err != nil {
-		return broker.TickerData{}, fmt.Errorf("failed to parse low price: %w", err)
+		return broker.TickerData{}, fmt.Errorf("ParseTicker: failed to parse last price: %w", err)
 	}
-	volume, err := strconv.ParseFloat(tickerInfo.Volume[1], 64)
+	volume24h, err := strconv.ParseFloat(info.Volume[1], 64)
 	if err != nil {
-		return broker.TickerData{}, fmt.Errorf("failed to parse volume: %w", err)
+		return broker.TickerData{}, fmt.Errorf("ParseTicker: failed to parse 24h volume: %w", err)
 	}
-	bidPrice, err := strconv.ParseFloat(tickerInfo.Bid[0], 64)
+	high24h, err := strconv.ParseFloat(info.High[1], 64)
 	if err != nil {
-		return broker.TickerData{}, fmt.Errorf("failed to parse bid price: %w", err)
+		return broker.TickerData{}, fmt.Errorf("ParseTicker: failed to parse 24h high: %w", err)
 	}
-	askPrice, err := strconv.ParseFloat(tickerInfo.Ask[0], 64)
+	low24h, err := strconv.ParseFloat(info.Low[1], 64)
 	if err != nil {
-		return broker.TickerData{}, fmt.Errorf("failed to parse ask price: %w", err)
+		return broker.TickerData{}, fmt.Errorf("ParseTicker: failed to parse 24h low: %w", err)
+	}
+	open24h, err := strconv.ParseFloat(info.OpenPrice, 64)
+	if err != nil {
+		return broker.TickerData{}, fmt.Errorf("ParseTicker: failed to parse 24h open: %w", err)
 	}
 
 	return broker.TickerData{
-		Pair:      pair,
-		LastPrice: lastPrice,
-		High:      highPrice,
-		Low:       lowPrice,
-		Volume:    volume,
-		Bid:       bidPrice,
+		Pair:      commonPair,
 		Ask:       askPrice,
+		Bid:       bidPrice,
+		LastPrice: lastPrice,
+		Volume:    volume24h,
+		High:      high24h,
+		Low:       low24h,
+		Open:      open24h,
 		Timestamp: time.Now(),
 	}, nil
 }
@@ -619,6 +612,23 @@ func (c *Client) GetOHLCVAPI(ctx context.Context, krakenPairName string, interva
 	return nil, fmt.Errorf("no valid OHLCV data found for pair %s in API response", krakenPairName)
 }
 
+// RefreshPairs fetches the latest asset pair data for the configured pairs and rebuilds the internal pair maps.
+func (c *Client) RefreshPairs(ctx context.Context, configuredPairs []string) error {
+	c.logger.LogInfo("Kraken Client: Refreshing asset pairs using %v...", configuredPairs)
+	pairs, err := c.GetAssetPairsAPI(ctx, "")
+	if err != nil {
+		return fmt.Errorf("failed to refresh all asset pairs: %w", err)
+	}
+
+	c.dataMu.Lock()
+	c.buildPairMaps(pairs)
+	c.dataMu.Unlock()
+
+	// Fetch specific configured pairs if needed, but since we have all, perhaps filter.
+	c.logger.LogInfo("Kraken Client: Refreshed and built canonical maps for %d configured pairs.", len(configuredPairs))
+	return nil
+}
+
 // GetPairDetail retrieves cached formatting and limit details for a given Kraken pair.
 // Triggers a refresh if the details are not found in the cache.
 func (c *Client) GetPairDetail(ctx context.Context, krakenPair string) (PairDetail, error) {
@@ -634,7 +644,7 @@ func (c *Client) GetPairDetail(ctx context.Context, krakenPair string) (PairDeta
 }
 
 // AddOrderAPI submits a new order to Kraken's private API.
-func (c *Client) AddOrderAPI(ctx context.Context, params url.Values) (string, string, error) {
+func (c *Client) AddOrderAPI(ctx context.Context, params url.Values) (string, error) {
 	var resp struct {
 		Error  []string `json:"error"`
 		Result struct {
@@ -645,15 +655,15 @@ func (c *Client) AddOrderAPI(ctx context.Context, params url.Values) (string, st
 		} `json:"result"`
 	}
 	if err := c.callPrivate(ctx, "/0/private/AddOrder", params, &resp); err != nil {
-		return "", "", err
+		return "", err
 	}
 	if len(resp.Error) > 0 {
-		return "", "", errors.New(strings.Join(resp.Error, ", "))
+		return "", errors.New(strings.Join(resp.Error, ", "))
 	}
 	if len(resp.Result.Txid) == 0 {
-		return "", "", errors.New("Kraken AddOrder returned no transaction ID")
+		return "", errors.New("Kraken AddOrder returned no transaction ID")
 	}
-	return resp.Result.Txid[0], resp.Result.Descr.Order, nil
+	return resp.Result.Txid[0], nil
 }
 
 // CancelOrderAPI cancels an existing order on Kraken's private API.
@@ -703,20 +713,17 @@ func (c *Client) GetBalancesAPI(ctx context.Context) (map[string]string, error) 
 }
 
 // GetTickerAPI fetches ticker information for one or more pairs from Kraken's public API.
-func (c *Client) GetTickerAPI(ctx context.Context, krakenPairNames string) (map[string]TickerInfo, error) {
-	var resp struct {
-		Error  []string              `json:"error"`
-		Result map[string]TickerInfo `json:"result"`
+func (c *Client) GetTickerAPI(ctx context.Context, pair string) (map[string]TickerInfo, error) {
+	params := url.Values{}
+	if pair != "" {
+		params.Set("pair", pair)
 	}
-	params := url.Values{"pair": {krakenPairNames}}
+	var resp TickerResponse
 	if err := c.callPublic(ctx, "/0/public/Ticker", params, &resp); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("GetTickerAPI: callPublic failed: %w", err)
 	}
 	if len(resp.Error) > 0 {
-		return nil, errors.New(strings.Join(resp.Error, ", "))
-	}
-	if resp.Result == nil {
-		return nil, errors.New("Kraken GetTicker returned no result for the requested pair(s)")
+		return nil, fmt.Errorf("GetTickerAPI: API error: %s", strings.Join(resp.Error, ", "))
 	}
 	return resp.Result, nil
 }

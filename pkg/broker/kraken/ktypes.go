@@ -1,7 +1,5 @@
 package kraken
 
-// File: pkg/broker/kraken/types.go
-
 type AssetPairInfo struct {
 	Altname           string          `json:"altname"`
 	WSName            string          `json:"wsname"`
@@ -159,4 +157,16 @@ type TradeVolumeResult struct {
 	Volume    string                       `json:"volume"`
 	Fees      map[string]KrakenFeeTierInfo `json:"fees"`
 	FeesMaker map[string]KrakenFeeTierInfo `json:"fees_maker"`
+}
+
+// TickerResponse is the top-level response for the Ticker endpoint.
+type TickerResponse struct {
+	Error  []string              `json:"error"`
+	Result map[string]TickerInfo `json:"result"`
+}
+
+// AssetPairsResponse is the top-level response for the AssetPairs endpoint.
+type AssetPairsResponse struct {
+	Error  []string                 `json:"error"`
+	Result map[string]AssetPairInfo `json:"result"`
 }

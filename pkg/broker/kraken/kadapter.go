@@ -1,10 +1,8 @@
-// File: pkg/broker/kraken/kadapter.go
 package kraken
 
 import (
 	"Snowballin/dataprovider"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -21,7 +19,7 @@ import (
 // It handles common-to-Kraken translations, caching, and logging.
 // This struct implements the broker.Broker interface to ensure full compatibility with the DCA bot's requirements.
 type Adapter struct {
-	appConfig  *utilities.KrakenConfig   // Configuration for Kraken-specific settings
+	appConfig  *utilities.AppConfig      // Configuration for Kraken-specific settings
 	cache      *dataprovider.SQLiteCache // Cache for OHLCV, tickers, and fees
 	client     *Client                   // Underlying Kraken API client
 	logger     *utilities.Logger         // Logger for adapter operations
@@ -31,7 +29,7 @@ type Adapter struct {
 // NewAdapter creates a new Kraken Adapter instance.
 // It initializes with provided config, the list of configured asset pairs, the client, logger, and cache.
 // The assetPairs are required to correctly initialize the client's asset mapping.
-func NewAdapter(appCfg *utilities.KrakenConfig, assetPairs []string, client *Client, logger *utilities.Logger, cache *dataprovider.SQLiteCache) (*Adapter, error) {
+func NewAdapter(appCfg *utilities.AppConfig, assetPairs []string, client *Client, logger *utilities.Logger, cache *dataprovider.SQLiteCache) (*Adapter, error) {
 	if appCfg == nil {
 		return nil, errors.New("kraken adapter: AppConfig cannot be nil")
 	}
@@ -207,10 +205,6 @@ func (a *Adapter) GetLastNOHLCVBars(ctx context.Context, pair string, intervalMi
 		return nil, fmt.Errorf("GetLastNOHLCVBars: API call failed: %w", err)
 	}
 
-	// Log the raw response for debugging.
-	responseJSON, _ := json.Marshal(rawBars)
-	a.logger.LogDebug("kadapter GetLastNOHLCVBars [%s]: Raw API response: %s", pair, string(responseJSON))
-
 	// Parse the OHLCV bars.
 	var bars []utilities.OHLCVBar
 	for _, rawBar := range rawBars {
@@ -370,23 +364,23 @@ func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) (
 
 // PlaceOrder submits a new order to Kraken.
 // This is a core method for executing the trading strategy.
-func (a *Adapter) PlaceOrder(ctx context.Context, assetPair, side, orderType string, volume, price, stopPrice float64, clientOrderID string) (string, error, string) {
+func (a *Adapter) PlaceOrder(ctx context.Context, assetPair, side, orderType string, volume, price, stopPrice float64, clientOrderID string) (string, error) {
 	krakenPair, err := a.client.GetTradeableKrakenPairName(ctx, assetPair)
 	if err != nil {
-		return "", fmt.Errorf("PlaceOrder: failed to get Kraken pair name for %s: %w", assetPair, err), ""
+		return "", fmt.Errorf("PlaceOrder: failed to get Kraken pair name for %s: %w", assetPair, err)
 	}
 
 	pairDetail, err := a.client.GetPairDetail(ctx, krakenPair)
 	if err != nil {
-		return "", fmt.Errorf("PlaceOrder: could not get pair details for %s: %w", krakenPair, err), ""
+		return "", fmt.Errorf("PlaceOrder: could not get pair details for %s: %w", krakenPair, err)
 	}
 
 	minOrder, minErr := strconv.ParseFloat(pairDetail.OrderMin, 64)
 	if minErr != nil {
-		return "", fmt.Errorf("PlaceOrder: invalid min order for %s: %w", krakenPair, minErr), ""
+		return "", fmt.Errorf("PlaceOrder: invalid min order for %s: %w", krakenPair, minErr)
 	}
 	if volume < minOrder {
-		return "", fmt.Errorf("PlaceOrder: volume %.8f below min %.8f for %s", volume, minOrder, assetPair), ""
+		return "", fmt.Errorf("PlaceOrder: volume %.8f below min %.8f for %s", volume, minOrder, assetPair)
 	}
 
 	volumeStr := fmt.Sprintf("%."+strconv.Itoa(pairDetail.LotDecimals)+"f", volume)
@@ -410,17 +404,17 @@ func (a *Adapter) PlaceOrder(ctx context.Context, assetPair, side, orderType str
 	switch strings.ToLower(orderType) {
 	case "limit":
 		if priceStr == "" {
-			return "", errors.New("PlaceOrder: price required for limit order"), ""
+			return "", errors.New("PlaceOrder: price required for limit order")
 		}
 		params.Set("price", priceStr)
 	case "stop-loss":
 		if stopPriceStr == "" {
-			return "", errors.New("PlaceOrder: stopPrice required for stop-loss order"), ""
+			return "", errors.New("PlaceOrder: stopPrice required for stop-loss order")
 		}
 		params.Set("price", stopPriceStr)
 	case "stop-loss-limit":
 		if stopPriceStr == "" || priceStr == "" {
-			return "", errors.New("PlaceOrder: both price (limit) and stopPrice (trigger) required for stop-loss-limit"), ""
+			return "", errors.New("PlaceOrder: both price (limit) and stopPrice (trigger) required for stop-loss-limit")
 		}
 		params.Set("price", stopPriceStr) // trigger price
 		params.Set("price2", priceStr)    // limit price
@@ -430,27 +424,13 @@ func (a *Adapter) PlaceOrder(ctx context.Context, assetPair, side, orderType str
 		params.Set("userref", clientOrderID)
 	}
 
-	orderID, descr, err := a.client.AddOrderAPI(ctx, params)
+	orderID, err := a.client.AddOrderAPI(ctx, params)
 	if err != nil {
-		return "", fmt.Errorf("PlaceOrder: API call failed: %w", err), ""
+		return "", fmt.Errorf("PlaceOrder: API call failed: %w", err)
 	}
 
-	a.logger.LogInfo("PlaceOrder: Successfully placed order %s for %s (%s)", orderID, assetPair, descr)
-	return orderID, nil, descr
-}
-
-// RefreshAssetInfo refreshes asset and pair information from the Kraken API.
-// It is essential to call this on startup to ensure all mappings are correct.
-func (a *Adapter) RefreshAssetInfo(ctx context.Context) error {
-	a.logger.LogInfo("Adapter: Refreshing Kraken asset information...")
-	if err := a.client.RefreshAssets(ctx); err != nil {
-		return fmt.Errorf("adapter failed to refresh Kraken assets: %w", err)
-	}
-	if err := a.client.RefreshAssetPairs(ctx, a.assetPairs); err != nil {
-		return fmt.Errorf("adapter failed to refresh Kraken asset pairs: %w", err)
-	}
-	a.logger.LogInfo("Adapter: Kraken asset information refreshed.")
-	return nil
+	a.logger.LogInfo("PlaceOrder: Successfully placed order %s for %s", orderID, assetPair)
+	return orderID, nil
 }
 
 // GetOrderStatus retrieves the status of a specific order.
@@ -514,12 +494,21 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 		return 0, fmt.Errorf("GetAccountValue: failed to get balances: %w", err)
 	}
 
-	totalValue := 0.0
 	quoteUpper := strings.ToUpper(quoteCurrency)
+	totalValue := 0.0
 
 	for _, bal := range balances {
+		if bal.Total == 0 {
+			continue
+		}
+
 		if strings.EqualFold(bal.Currency, quoteUpper) {
 			totalValue += bal.Total
+			continue
+		}
+
+		// Skip if below dust threshold
+		if bal.Total < a.appConfig.Trading.DustThresholdUSD/bal.Total { // Approximate, but to skip small
 			continue
 		}
 
@@ -604,4 +593,25 @@ func (a *Adapter) GetTickers(ctx context.Context, pairs []string) (map[string]br
 	}
 
 	return result, nil
+}
+
+// RefreshAssetInfo refreshes asset and pair information from the Kraken API.
+// It is essential to call this on startup to ensure all mappings are correct.
+func (a *Adapter) RefreshAssetInfo(ctx context.Context) error {
+	a.logger.LogInfo("Adapter: Refreshing Kraken asset information...")
+	if err := a.client.RefreshAssets(ctx); err != nil {
+		return fmt.Errorf("adapter failed to refresh Kraken assets: %w", err)
+	}
+	if err := a.client.RefreshAssetPairs(ctx, a.assetPairs); err != nil {
+		return fmt.Errorf("adapter failed to refresh Kraken asset pairs: %w", err)
+	}
+	a.logger.LogInfo("Adapter: Kraken asset information refreshed.")
+	return nil
+}
+func (a *Adapter) GetPairDetail(ctx context.Context, krakenPair string) (PairDetail, error) {
+	detail, ok := a.client.pairDetailsCache[krakenPair]
+	if !ok {
+		return PairDetail{}, fmt.Errorf("pair detail for %s not found in map; ensure it is part of the initial configured pairs", krakenPair)
+	}
+	return detail, nil
 }
