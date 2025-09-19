@@ -469,6 +469,42 @@ func (c *Client) GetCommonPairName(ctx context.Context, krakenPair string) (stri
 	return commonPair, nil
 }
 
+// GetInternalAssetName retrieves the internal Kraken asset name (e.g., "XXBT") for a given altname/symbol (e.g., "XBT").
+func (c *Client) GetInternalAssetName(ctx context.Context, symbol string) (string, error) {
+	c.dataMu.RLock()
+	defer c.dataMu.RUnlock()
+
+	upperSym := strings.ToUpper(symbol)
+	internal, ok := c.commonToKrakenAsset[upperSym]
+	if !ok {
+		// Fallback: attempt a direct API query for the symbol to get the internal name
+		var resp struct {
+			Error  []string             `json:"error"`
+			Result map[string]AssetInfo `json:"result"`
+		}
+		params := url.Values{}
+		params.Set("asset", upperSym)
+		if err := c.callPublic(ctx, "/0/public/Assets", params, &resp); err != nil {
+			return "", fmt.Errorf("failed to query Assets API for symbol %s: %w", symbol, err)
+		}
+		if len(resp.Error) > 0 {
+			return "", fmt.Errorf("Assets API error for %s: %s", symbol, strings.Join(resp.Error, ", "))
+		}
+		if len(resp.Result) == 0 {
+			return "", fmt.Errorf("no asset info found for symbol %s", symbol)
+		}
+		// Take the first (and only) entry's key as internal
+		for k := range resp.Result {
+			internal = k
+			break
+		}
+		// Cache it for future use
+		c.commonToKrakenAsset[upperSym] = internal
+		c.assetInfoMap[internal] = resp.Result[internal]
+	}
+	return internal, nil
+}
+
 // GetCommonAssetName translates a Kraken asset name (e.g., "XXBT") to its common equivalent ("BTC").
 // It handles various Kraken naming conventions and triggers a cache refresh if needed.
 func (c *Client) GetCommonAssetName(ctx context.Context, krakenAssetName string) (string, error) {

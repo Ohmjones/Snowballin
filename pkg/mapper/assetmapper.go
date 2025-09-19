@@ -76,14 +76,11 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 		return nil, fmt.Errorf("failed to get Kraken altname for %s: %w", commonSymbol, err)
 	}
 
-	// Step 1: Get all asset pair details from Kraken
-	krakenPairs, err := m.kraken.GetAssetPairsAPI(ctx, "")
+	// Get internal base asset name (e.g., "XXBT" for "XBT")
+	internalBase, err := m.kraken.GetInternalAssetName(ctx, krakenAltname)
 	if err != nil {
-		return nil, fmt.Errorf("mapper: failed to get asset pairs from Kraken: %w", err)
+		return nil, fmt.Errorf("failed to get internal base asset for %s (altname: %s): %w", commonSymbol, krakenAltname, err)
 	}
-
-	var targetKrakenPair *kraken.AssetPairInfo
-	var krakenAssetName string // Will store base asset, e.g., "SOL"
 
 	// Determine preferred quote based on config (e.g., "usd" -> "ZUSD", "usdt" -> "USDT")
 	preferredQuote := ""
@@ -97,29 +94,43 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 	}
 	m.logger.LogDebug("mapper: Preferred quote for %s: %s (from config quote_currency: %s)", commonSymbol, preferredQuote, m.cfg.Kraken.QuoteCurrency)
 
-	// Helper to find pair with specific quote
-	findPairWithQuote := func(quote string) bool {
-		for _, pair := range krakenPairs {
-			commonBaseName, err := m.kraken.GetCommonAssetName(ctx, pair.Base)
-			if err != nil {
-				continue
-			}
-			if strings.EqualFold(commonBaseName, krakenAltname) && strings.EqualFold(pair.Quote, quote) {
-				p := pair
-				targetKrakenPair = &p
-				krakenAssetName = pair.Base // Use base asset code, e.g., "SOL"
-				return true
-			}
+	var targetKrakenPair *kraken.AssetPairInfo
+	var krakenAssetName string = internalBase // Use the internal base asset
+
+	// Helper to query specific pair and check existence
+	querySpecificPair := func(quoteInternal string) (bool, error) {
+		primaryPair := internalBase + quoteInternal
+		pairMap, err := m.kraken.GetAssetPairsAPI(ctx, primaryPair)
+		if err != nil {
+			return false, err
 		}
-		return false
+		if pairInfo, ok := pairMap[primaryPair]; ok {
+			targetKrakenPair = &pairInfo
+			return true, nil
+		}
+		return false, nil
 	}
 
 	// First: Try preferred quote
-	if !findPairWithQuote(preferredQuote) {
+	found, err := querySpecificPair(preferredQuote)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query pair for preferred quote %s: %w", preferredQuote, err)
+	}
+	if found {
+		m.logger.LogInfo("mapper: Preferred quote match found for %s: %s", commonSymbol, krakenAssetName)
+	} else {
 		// Second: Try fallbacks
-		found := false
+		found = false
 		for _, fallbackQuote := range fallbackQuotes {
-			if fallbackQuote != preferredQuote && findPairWithQuote(fallbackQuote) {
+			if fallbackQuote == preferredQuote {
+				continue
+			}
+			fbFound, fbErr := querySpecificPair(fallbackQuote)
+			if fbErr != nil {
+				m.logger.LogWarn("mapper: Error querying fallback quote %s for %s: %v", fallbackQuote, commonSymbol, fbErr)
+				continue
+			}
+			if fbFound {
 				found = true
 				m.logger.LogWarn("mapper: Preferred quote not found for %s; falling back to %s (%s)", commonSymbol, fallbackQuote, krakenAssetName)
 				break
@@ -128,8 +139,6 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 		if !found {
 			return nil, fmt.Errorf("mapper: could not find a matching USD/USDT asset pair for '%s' on Kraken", commonSymbol)
 		}
-	} else {
-		m.logger.LogInfo("mapper: Preferred quote match found for %s: %s", commonSymbol, krakenAssetName)
 	}
 
 	// Step 2-4: CoinGecko discovery (optional)
@@ -214,7 +223,7 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 	// Step 7: Assemble the complete identity object
 	newIdentity := &dataprovider.AssetIdentity{
 		CommonSymbol:    commonSymbol,
-		KrakenAsset:     krakenAssetName,         // Now uses base asset, e.g., "SOL"
+		KrakenAsset:     krakenAssetName,
 		KrakenWsName:    targetKrakenPair.WSName, // Pair name, e.g., "SOL/USD"
 		CoinGeckoID:     coinGeckoID,
 		CoinMarketCapID: cmcID,
