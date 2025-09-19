@@ -81,6 +81,11 @@ func (c *Client) getAltNameForCommon(ctx context.Context, common string) (string
 		return "", fmt.Errorf("getAltNameForCommon %s: API call failed: %w", common, err)
 	}
 	if len(resp.Error) > 0 {
+		// Specifically ignore "Unknown asset" for fiat, as they might not be in the Assets list
+		if strings.Contains(strings.Join(resp.Error, ", "), "EQuery:Unknown asset") && (strings.EqualFold(common, "USD") || strings.EqualFold(common, "EUR")) {
+			c.logger.LogDebug("Known fiat '%s' not found in Assets endpoint, assuming altname is the same.", common)
+			return common, nil
+		}
 		return "", fmt.Errorf("getAltNameForCommon %s: API error: %s", common, strings.Join(resp.Error, ", "))
 	}
 	if len(resp.Result) == 0 {
@@ -90,39 +95,14 @@ func (c *Client) getAltNameForCommon(ctx context.Context, common string) (string
 	for _, info := range resp.Result {
 		return info.Altname, nil
 	}
-	return "", errors.New("getAltNameForCommon: no altname found")
-}
-
-// getAltNamesForAssets queries the Assets endpoint for a comma-separated list of assets.
-func (c *Client) getAltNamesForAssets(ctx context.Context, assetsStr string) (map[string]string, error) {
-	var resp struct {
-		Error  []string             `json:"error"`
-		Result map[string]AssetInfo `json:"result"`
-	}
-
-	// Manually construct the path to send raw commas, bypassing the default URL encoding.
-	// This provides maximum compatibility.
-	path := fmt.Sprintf("/0/public/Assets?asset=%s", assetsStr)
-	if err := c.callPublic(ctx, path, nil, &resp); err != nil {
-		return nil, fmt.Errorf("API call to Assets failed: %w", err)
-	}
-
-	if len(resp.Error) > 0 {
-		return nil, fmt.Errorf("API error from Assets: %s", strings.Join(resp.Error, ", "))
-	}
-
-	altMap := make(map[string]string)
-	for commonName, info := range resp.Result {
-		altMap[commonName] = info.Altname
-	}
-	return altMap, nil
+	return "", errors.New("getAltNameForCommon: no altname found in result")
 }
 
 // RefreshAssetPairs fetches all necessary asset and pair data from Kraken for the configured pairs.
 // It uses an efficient batching method to minimize API calls:
 // 1. Normalizes configured pair strings (e.g., "BTC" -> "BTC/USD").
 // 2. Gathers all unique base and quote assets from the pairs.
-// 3. Makes a single API call to the "Assets" endpoint to get altnames for all unique assets.
+// 3. Makes an individual API call to the "Assets" endpoint for each unique asset to reliably get its altname.
 // 4. Constructs the Kraken pair names (e.g., "XBT" + "USD" -> "XBTUSD").
 // 5. Makes a single API call to the "AssetPairs" endpoint to get details for all constructed pairs.
 // 6. Caches all mappings (common-to-tradeable, common-to-primary, asset-altnames, and pair details).
@@ -138,7 +118,6 @@ func (c *Client) RefreshAssetPairs(ctx context.Context, configuredPairs []string
 	// Clear existing maps to ensure fresh data
 	c.commonToTradeablePair = make(map[string]string)
 	c.commonToPrimaryPair = make(map[string]string)
-	// **FIX 1: Ensure the cache is defined to hold the simple PairDetail struct.**
 	c.pairDetailsCache = make(map[string]AssetPairInfo)
 	c.commonToKrakenAsset = make(map[string]string)
 
@@ -166,24 +145,21 @@ func (c *Client) RefreshAssetPairs(ctx context.Context, configuredPairs []string
 		return errors.New("no valid assets extracted from configured pairs")
 	}
 
-	// Step 2 & 3: Get altnames for all unique assets in a single API call
-	assetKeys := make([]string, 0, len(uniqueAssets))
+	// Step 2 & 3: Get altnames for all unique assets by calling the API for each one.
+	// This is more robust than a single bulk call, as the response keys can be unpredictable.
 	for asset := range uniqueAssets {
-		assetKeys = append(assetKeys, asset)
-	}
-	assetsStr := strings.Join(assetKeys, ",")
-	c.logger.LogDebug("Querying altnames for assets: %s", assetsStr)
-	altNames, err := c.getAltNamesForAssets(ctx, assetsStr)
-	if err != nil {
-		return fmt.Errorf("failed to get asset altnames: %w", err)
-	}
-
-	// Cache the retrieved asset altnames
-	for common, alt := range altNames {
-		c.commonToKrakenAsset[common] = alt
-	}
-	if _, ok := c.commonToKrakenAsset["USD"]; !ok {
-		c.commonToKrakenAsset["USD"] = "USD"
+		alt, err := c.getAltNameForCommon(ctx, asset)
+		if err != nil {
+			// A special case for USD, which may not be in the Assets list but is a valid quote.
+			if strings.EqualFold(asset, "USD") {
+				c.logger.LogWarn("Could not resolve 'USD' from API, falling back to default 'USD'. This is usually safe.")
+				c.commonToKrakenAsset[asset] = "USD"
+				continue
+			}
+			return fmt.Errorf("failed to get asset altname for %s: %w", asset, err)
+		}
+		c.logger.LogDebug("Resolved asset %s -> %s", asset, alt)
+		c.commonToKrakenAsset[asset] = alt
 	}
 
 	// Step 4: Construct Kraken pair altnames
@@ -191,12 +167,16 @@ func (c *Client) RefreshAssetPairs(ctx context.Context, configuredPairs []string
 	var pairAltsList []string
 	for commonPair := range normalizedPairs {
 		parts := strings.Split(commonPair, "/")
-		baseAlt, ok1 := c.commonToKrakenAsset[parts[0]]
-		quoteAlt, ok2 := c.commonToKrakenAsset[parts[1]]
+		base, quote := parts[0], parts[1]
+
+		baseAlt, ok1 := c.commonToKrakenAsset[base]
+		quoteAlt, ok2 := c.commonToKrakenAsset[quote]
+
 		if !ok1 || !ok2 {
-			c.logger.LogWarn("Could not find altname for '%s', skipping", commonPair)
+			c.logger.LogWarn("Could not find required altname for pair '%s' (Base: %s, Quote: %s), skipping", commonPair, base, quote)
 			continue
 		}
+
 		krakenPairAlt := baseAlt + quoteAlt
 		pairAltsList = append(pairAltsList, krakenPairAlt)
 		pairAltsToCommon[krakenPairAlt] = commonPair
@@ -225,7 +205,6 @@ func (c *Client) RefreshAssetPairs(ctx context.Context, configuredPairs []string
 		c.commonToTradeablePair[commonPair] = info.Altname
 		c.commonToPrimaryPair[commonPair] = krakenPrimary
 
-		// Parse the raw fee data from the 'info' (AssetPairInfo) struct
 		var makerFee, takerFee float64
 		if len(info.FeesMaker) > 0 && len(info.FeesMaker[0]) > 1 {
 			if f, err := info.FeesMaker[0][1].Float64(); err == nil {
@@ -238,13 +217,12 @@ func (c *Client) RefreshAssetPairs(ctx context.Context, configuredPairs []string
 			}
 		}
 
-		// **FIX 2: Populate the cache with the simple PairDetail struct, not the raw AssetPairInfo.**
 		c.pairDetailsCache[commonPair] = AssetPairInfo{
 			PairDecimals: info.PairDecimals,
 			LotDecimals:  info.LotDecimals,
 			OrderMin:     info.OrderMin,
-			MakerFee:     makerFee, // This now correctly assigns a float64 to a float64 field
-			TakerFee:     takerFee, // This now correctly assigns a float64 to a float64 field
+			MakerFee:     makerFee,
+			TakerFee:     takerFee,
 		}
 		c.logger.LogDebug("Mapped %s -> tradeable: %s, primary: %s, fees(M/T): %.4f/%.4f", commonPair, info.Altname, krakenPrimary, makerFee, takerFee)
 	}
