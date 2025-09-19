@@ -160,20 +160,57 @@ func (c *Client) RefreshAssetPairs(ctx context.Context, configuredPairs []string
 	}
 	c.logger.LogInfo("Kraken Client: Refreshing asset pairs using %v...", configuredPairs)
 
-	// Construct altname pair strings from configured pairs (e.g., "BTC/USD" -> "BTCUSD")
-	altPairs := make([]string, len(configuredPairs))
+	// Parse configured pairs into base/quote
+	type PairComponents struct {
+		CommonPair string
+		BaseAlt    string
+		QuoteAlt   string
+		PairAlt    string
+	}
+	var pairComponents []PairComponents
 	configuredSet := make(map[string]bool)
-	for i, commonPair := range configuredPairs {
-		altPair := strings.ReplaceAll(commonPair, "/", "")
-		altPairs[i] = altPair
+	for _, commonPair := range configuredPairs {
 		configuredSet[commonPair] = true
+		parts := strings.Split(commonPair, "/")
+		if len(parts) != 2 {
+			c.logger.LogWarn("Invalid pair format %s, skipping", commonPair)
+			continue
+		}
+		baseCommon := strings.ToUpper(parts[0])
+		quoteCommon := strings.ToUpper(parts[1])
+
+		baseAlt, err := c.GetKrakenAltName(ctx, baseCommon)
+		if err != nil {
+			c.logger.LogWarn("Could not get base altname for %s in %s: %v", baseCommon, commonPair, err)
+			continue
+		}
+		quoteAlt, err := c.GetKrakenAltName(ctx, quoteCommon)
+		if err != nil {
+			c.logger.LogWarn("Could not get quote altname for %s in %s: %v", quoteCommon, commonPair, err)
+			continue
+		}
+		pairAlt := baseAlt + quoteAlt
+
+		pairComponents = append(pairComponents, PairComponents{
+			CommonPair: commonPair,
+			BaseAlt:    baseAlt,
+			QuoteAlt:   quoteAlt,
+			PairAlt:    pairAlt,
+		})
 	}
 
-	// Query only the specific pairs using comma-separated alt names
-	joinedAltPairs := strings.Join(altPairs, ",")
-	pairMap, err := c.GetAssetPairsAPI(ctx, joinedAltPairs)
+	if len(pairComponents) == 0 {
+		return errors.New("no valid pair components could be resolved")
+	}
+
+	// Query only the specific pair altnames
+	joinedPairAlts := make([]string, len(pairComponents))
+	for i, pc := range pairComponents {
+		joinedPairAlts[i] = pc.PairAlt
+	}
+	pairMap, err := c.GetAssetPairsAPI(ctx, strings.Join(joinedPairAlts, ","))
 	if err != nil {
-		return fmt.Errorf("failed to fetch specific asset pairs %s: %w", joinedAltPairs, err)
+		return fmt.Errorf("failed to fetch specific asset pairs %s: %w", strings.Join(joinedPairAlts, ","), err)
 	}
 
 	if len(pairMap) == 0 {
@@ -191,16 +228,16 @@ func (c *Client) RefreshAssetPairs(ctx context.Context, configuredPairs []string
 	c.pairDetailsCache = make(map[string]PairDetail)
 
 	var matchedCount int
-	for pairName, pair := range pairMap {
-		// Compute common pair from base and quote asset altnames
+	for internalName, pair := range pairMap {
+		// Compute common pair from base and quote altnames
 		commonBase, err := c.GetCommonAssetName(ctx, pair.Base)
 		if err != nil {
-			c.logger.LogWarn("Could not get common base name for %s in pair %s: %v", pair.Base, pairName, err)
+			c.logger.LogWarn("Could not get common base name for %s in pair %s: %v", pair.Base, internalName, err)
 			continue
 		}
 		commonQuote, err := c.GetCommonAssetName(ctx, pair.Quote)
 		if err != nil {
-			c.logger.LogWarn("Could not get common quote name for %s in pair %s: %v", pair.Quote, pairName, err)
+			c.logger.LogWarn("Could not get common quote name for %s in pair %s: %v", pair.Quote, internalName, err)
 			continue
 		}
 		commonPair := fmt.Sprintf("%s/%s", strings.ToUpper(commonBase), strings.ToUpper(commonQuote))
@@ -212,15 +249,15 @@ func (c *Client) RefreshAssetPairs(ctx context.Context, configuredPairs []string
 
 		matchedCount++
 
-		c.pairInfoMap[pairName] = pair
-		c.commonToPrimaryPair[commonPair] = pairName
+		c.pairInfoMap[internalName] = pair
 		tradeableName := pair.Altname
 		if tradeableName == "" {
-			tradeableName = pairName
+			tradeableName = internalName
 		}
+		c.commonToPrimaryPair[commonPair] = internalName
 		c.commonToTradeablePair[commonPair] = tradeableName
-		c.krakenToCommonPair[pairName] = commonPair
-		if tradeableName != pairName {
+		c.krakenToCommonPair[internalName] = commonPair
+		if tradeableName != internalName {
 			c.krakenToCommonPair[tradeableName] = commonPair
 		}
 
@@ -231,8 +268,8 @@ func (c *Client) RefreshAssetPairs(ctx context.Context, configuredPairs []string
 			LotDecimals:  pair.LotDecimals,
 			OrderMin:     fmt.Sprintf("%f", ordermin),
 		}
-		c.pairDetailsCache[pairName] = detail
-		if tradeableName != pairName {
+		c.pairDetailsCache[internalName] = detail
+		if tradeableName != internalName {
 			c.pairDetailsCache[tradeableName] = detail
 		}
 	}
@@ -395,22 +432,57 @@ func (c *Client) GetKrakenAssetName(ctx context.Context, commonAssetName string)
 	return "", fmt.Errorf("kraken asset name for '%s' not found in map; ensure it is part of the initial configured pairs", commonAssetName)
 }
 
-// GetKrakenAltname retrieves the Kraken altname for a given common symbol by querying the Assets API.
-func (c *Client) GetKrakenAltname(ctx context.Context, symbol string) (string, error) {
+// GetKrakenAltName retrieves the Kraken altname (e.g., "XBT" for "BTC") for a given common symbol.
+func (c *Client) GetKrakenAltName(ctx context.Context, commonSymbol string) (string, error) {
+	upperSym := strings.ToUpper(commonSymbol)
+
+	// Check cache first (we can cache altname -> common, but reverse it here)
 	c.dataMu.RLock()
-	krakenName, ok := c.commonToKrakenAsset[strings.ToUpper(symbol)]
-	if !ok {
-		c.dataMu.RUnlock()
-		return "", fmt.Errorf("could not find Kraken altname for symbol %s in cache", symbol)
+	for _, info := range c.assetInfoMap {
+		if getCommonAssetName(info) == upperSym {
+			c.dataMu.RUnlock()
+			return info.Altname, nil
+		}
 	}
-
-	assetInfo, ok := c.assetInfoMap[krakenName]
 	c.dataMu.RUnlock()
-	if !ok {
-		return "", fmt.Errorf("could not find asset info for Kraken name %s", krakenName)
+
+	// Fallback: query Assets API for the symbol
+	var resp struct {
+		Error  []string             `json:"error"`
+		Result map[string]AssetInfo `json:"result"`
+	}
+	params := url.Values{}
+	params.Set("asset", upperSym)
+	if err := c.callPublic(ctx, "/0/public/Assets", params, &resp); err != nil {
+		return "", fmt.Errorf("failed to query Assets API for symbol %s: %w", commonSymbol, err)
+	}
+	if len(resp.Error) > 0 {
+		return "", fmt.Errorf("Assets API error for %s: %s", commonSymbol, strings.Join(resp.Error, ", "))
+	}
+	if len(resp.Result) == 0 {
+		return "", fmt.Errorf("no asset info found for symbol %s", commonSymbol)
 	}
 
-	return assetInfo.Altname, nil
+	// Take the first (and only) entry's altname
+	var altname string
+	for _, info := range resp.Result {
+		altname = info.Altname
+		break
+	}
+
+	// Cache the info for future use
+	c.dataMu.Lock()
+	defer c.dataMu.Unlock()
+	internalKey := ""
+	for k := range resp.Result {
+		internalKey = k
+		c.assetInfoMap[k] = resp.Result[k]
+		break
+	}
+	commonName := getCommonAssetName(resp.Result[internalKey])
+	c.commonToKrakenAsset[commonName] = internalKey
+
+	return altname, nil
 }
 
 // GetPrimaryKrakenPairName translates a common pair name ("BTC/USD") to Kraken's primary, non-aliased pair name ("XBTUSD").

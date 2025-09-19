@@ -71,7 +71,7 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 	}
 	// --- END CHECK ---
 
-	krakenAltname, err := m.kraken.GetKrakenAltname(ctx, commonSymbol)
+	krakenAltname, err := m.kraken.GetKrakenAltName(ctx, commonSymbol)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get Kraken altname for %s: %w", commonSymbol, err)
 	}
