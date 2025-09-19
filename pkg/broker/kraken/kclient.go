@@ -160,69 +160,88 @@ func (c *Client) RefreshAssetPairs(ctx context.Context, configuredPairs []string
 	}
 	c.logger.LogInfo("Kraken Client: Refreshing asset pairs using %v...", configuredPairs)
 
-	// STAGE 1: Fetch all pairs to get the full Kraken market.
-	var allPairsResp AssetPairsResponse
-	if err := c.callPublic(ctx, "/0/public/AssetPairs", nil, &allPairsResp); err != nil {
-		return fmt.Errorf("failed to call AssetPairs for discovery: %w", err)
+	// Construct altname pair strings from configured pairs (e.g., "BTC/USD" -> "BTCUSD")
+	altPairs := make([]string, len(configuredPairs))
+	configuredSet := make(map[string]bool)
+	for i, commonPair := range configuredPairs {
+		altPair := strings.ReplaceAll(commonPair, "/", "")
+		altPairs[i] = altPair
+		configuredSet[commonPair] = true
 	}
-	if len(allPairsResp.Error) > 0 {
-		return fmt.Errorf("AssetPairs discovery API error: %s", strings.Join(allPairsResp.Error, ", "))
+
+	// Query only the specific pairs using comma-separated alt names
+	joinedAltPairs := strings.Join(altPairs, ",")
+	pairMap, err := c.GetAssetPairsAPI(ctx, joinedAltPairs)
+	if err != nil {
+		return fmt.Errorf("failed to fetch specific asset pairs %s: %w", joinedAltPairs, err)
+	}
+
+	if len(pairMap) == 0 {
+		return errors.New("no pair information returned for configured pairs")
 	}
 
 	c.dataMu.Lock()
 	defer c.dataMu.Unlock()
-	c.pairInfoMap = allPairsResp.Result
-
-	if len(c.assetInfoMap) == 0 {
-		return errors.New("asset map not initialized, call RefreshAssets first")
-	}
 
 	// Reset maps before rebuilding
+	c.pairInfoMap = make(map[string]AssetPairInfo)
 	c.commonToTradeablePair = make(map[string]string)
 	c.commonToPrimaryPair = make(map[string]string)
 	c.krakenToCommonPair = make(map[string]string)
 	c.pairDetailsCache = make(map[string]PairDetail)
 
-	// Build maps based on configured pairs
-	for _, commonPairKey := range configuredPairs {
-		// Use the existing logic to find the Kraken pair names.
-		// The heavy lifting of resolving altnames and primary names is now handled by GetPrimaryKrakenPairName.
-		primaryName, err := c.GetPrimaryKrakenPairName(ctx, commonPairKey)
+	var matchedCount int
+	for pairName, pair := range pairMap {
+		// Compute common pair from base and quote asset altnames
+		commonBase, err := c.GetCommonAssetName(ctx, pair.Base)
 		if err != nil {
-			c.logger.LogWarn("Could not resolve primary Kraken pair name for %s during RefreshAssetPairs: %v", commonPairKey, err)
+			c.logger.LogWarn("Could not get common base name for %s in pair %s: %v", pair.Base, pairName, err)
 			continue
 		}
-		tradeableName, err := c.GetTradeableKrakenPairName(ctx, commonPairKey)
+		commonQuote, err := c.GetCommonAssetName(ctx, pair.Quote)
 		if err != nil {
-			c.logger.LogWarn("Could not resolve tradeable Kraken pair name for %s during RefreshAssetPairs: %v", commonPairKey, err)
-			tradeableName = primaryName
+			c.logger.LogWarn("Could not get common quote name for %s in pair %s: %v", pair.Quote, pairName, err)
+			continue
 		}
+		commonPair := fmt.Sprintf("%s/%s", strings.ToUpper(commonBase), strings.ToUpper(commonQuote))
 
-		c.commonToPrimaryPair[commonPairKey] = primaryName
-		c.commonToTradeablePair[commonPairKey] = tradeableName
-		c.krakenToCommonPair[primaryName] = commonPairKey
-		if tradeableName != primaryName {
-			c.krakenToCommonPair[tradeableName] = commonPairKey
-		}
-
-		pairInfo, ok := c.pairInfoMap[primaryName]
-		if !ok {
-			c.logger.LogWarn("Primary pair info for %s not found in full pair list. Skipping details cache.", primaryName)
+		// Only map if this common pair is configured
+		if !configuredSet[commonPair] {
 			continue
 		}
 
-		ordermin, _ := strconv.ParseFloat(pairInfo.OrderMin, 64)
-		c.pairDetailsCache[primaryName] = PairDetail{
-			PairDecimals: pairInfo.PairDecimals,
-			LotDecimals:  pairInfo.LotDecimals,
+		matchedCount++
+
+		c.pairInfoMap[pairName] = pair
+		c.commonToPrimaryPair[commonPair] = pairName
+		tradeableName := pair.Altname
+		if tradeableName == "" {
+			tradeableName = pairName
+		}
+		c.commonToTradeablePair[commonPair] = tradeableName
+		c.krakenToCommonPair[pairName] = commonPair
+		if tradeableName != pairName {
+			c.krakenToCommonPair[tradeableName] = commonPair
+		}
+
+		// Cache pair details using the primary name and tradeable name
+		ordermin, _ := strconv.ParseFloat(pair.OrderMin, 64)
+		detail := PairDetail{
+			PairDecimals: pair.PairDecimals,
+			LotDecimals:  pair.LotDecimals,
 			OrderMin:     fmt.Sprintf("%f", ordermin),
 		}
-		if tradeableName != primaryName {
-			c.pairDetailsCache[tradeableName] = c.pairDetailsCache[primaryName]
+		c.pairDetailsCache[pairName] = detail
+		if tradeableName != pairName {
+			c.pairDetailsCache[tradeableName] = detail
 		}
 	}
 
-	c.logger.LogInfo("Kraken Client: Refreshed and built canonical maps for %d configured pairs.", len(c.commonToPrimaryPair))
+	if matchedCount != len(configuredPairs) {
+		c.logger.LogWarn("Only matched %d out of %d configured pairs. Some pairs may not exist or mappings failed.", matchedCount, len(configuredPairs))
+	}
+
+	c.logger.LogInfo("Kraken Client: Refreshed and built canonical maps for %d configured pairs.", matchedCount)
 	return nil
 }
 
