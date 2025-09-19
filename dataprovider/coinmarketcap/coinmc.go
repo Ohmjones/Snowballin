@@ -1,4 +1,3 @@
-// File: dataprovider/coinmarketcap/coinmc.go
 package coinmarketcap
 
 import (

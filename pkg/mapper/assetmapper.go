@@ -198,16 +198,17 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 
 // findPreciseCmcID gets the CMC ID by cross-referencing market cap data to avoid ambiguity.
 func (m *AssetMapper) findPreciseCmcID(ctx context.Context, symbol string, cgMarketCap float64) (string, string, error) {
-	// Step 1: Fetch all matching IDs for the symbol from CoinMarketCap.
-	cmcIDs, err := m.coinmarketcap.GetCoinIDsBySymbol(ctx, symbol)
+	// Step 1: Fetch all matching IDs for the symbol using CMC's map endpoint (returns array for multiple matches)
+	// Assume CMC package has GetAllCoinIDsBySymbol or similar; if not, implement via HTTP
+	cmcIDs, err := m.coinmarketcap.GetAllCoinIDsBySymbol(ctx, symbol) // New method needed; see below
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get CMC IDs for symbol %s: %w", symbol, err)
+		return "", "", fmt.Errorf("failed to get all CMC IDs for symbol %s: %w", symbol, err)
 	}
 	if len(cmcIDs) == 0 {
 		return "", "", fmt.Errorf("no CMC IDs found for symbol %s", symbol)
 	}
 
-	// Step 2: Get market data for ALL matching IDs.
+	// Step 2: Get market data for ALL matching IDs
 	cmcMarketData, err := m.coinmarketcap.GetMarketData(ctx, cmcIDs, "USD")
 	if err != nil {
 		return "", "", fmt.Errorf("failed to get CMC market data for IDs [%s]: %w", strings.Join(cmcIDs, ","), err)
@@ -216,53 +217,14 @@ func (m *AssetMapper) findPreciseCmcID(ctx context.Context, symbol string, cgMar
 		return "", "", fmt.Errorf("no market data returned from CMC for IDs [%s]", strings.Join(cmcIDs, ","))
 	}
 
-	// Step 3: If there is only one result, assume it's correct. This is the most common case.
-	if len(cmcMarketData) == 1 {
-		bestMatch := cmcMarketData[0]
-		m.logger.LogInfo("Precise match found for %s on CMC: ID %s (Single Result)", symbol, bestMatch.ID)
-
-		// Optionally log a warning if market caps differ significantly, but still accept the match.
-		if cgMarketCap > 0 && bestMatch.MarketCap > 0 {
-			difference := math.Abs(bestMatch.MarketCap - cgMarketCap)
-			relativeDiff := difference / cgMarketCap
-			if relativeDiff > 0.15 { // 15% tolerance for warning
-				m.logger.LogWarn("Market cap for %s differs between CoinGecko (%.0f) and CoinMarketCap (%.0f) by %.2f%%, but accepting single match.",
-					symbol, cgMarketCap, bestMatch.MarketCap, relativeDiff*100)
-			}
-		}
-		return bestMatch.ID, bestMatch.Image, nil
-	}
-
-	// Step 4: If multiple results, use market cap comparison as a tie-breaker.
 	m.logger.LogWarn("Multiple CMC results for symbol '%s' (%d candidates). Comparing market caps for precision.", symbol, len(cmcMarketData))
-
-	if cgMarketCap == 0 {
-		// No CG data to compare against; select the candidate with the highest market cap.
-		var maxCap float64 = 0
-		var bestMatch *dataprovider.MarketData
-		for i := range cmcMarketData {
-			data := cmcMarketData[i]
-			if data.MarketCap > maxCap {
-				maxCap = data.MarketCap
-				bestMatch = &data
-			}
-		}
-		if bestMatch == nil {
-			return "", "", fmt.Errorf("no market data with positive market cap available for %s", symbol)
-		}
-		m.logger.LogInfo("Precise match found for %s on CMC: ID %s (Highest Market Cap, no CG reference)", symbol, bestMatch.ID)
-		return bestMatch.ID, bestMatch.Image, nil
-	}
-
-	// With CG reference: find the candidate with the closest market cap within the tolerance.
 	const marketCapTolerance = 0.15 // 15% difference
+
 	var bestMatch *dataprovider.MarketData
 	minDifference := math.MaxFloat64
-
-	for i := range cmcMarketData {
-		data := cmcMarketData[i]
-		if data.MarketCap == 0 {
-			continue // Can't compare with a zero market cap
+	for _, data := range cmcMarketData {
+		if cgMarketCap == 0 || data.MarketCap == 0 {
+			continue // Avoid division by zero
 		}
 		difference := math.Abs(data.MarketCap - cgMarketCap)
 		relativeDiff := difference / cgMarketCap
