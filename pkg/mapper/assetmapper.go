@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -64,6 +65,7 @@ func (m *AssetMapper) GetIdentity(ctx context.Context, commonSymbol string) (*da
 
 // discoverAndMapAsset orchestrates the multi-provider identification process.
 func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol string) (*dataprovider.AssetIdentity, error) {
+	// --- RESILIENCY CHECK: Ensure essential providers are configured ---
 	if m.kraken == nil {
 		return nil, errors.New("cannot discover new asset identity: Kraken client is not configured")
 	}
@@ -114,19 +116,78 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 		return nil, fmt.Errorf("kraken did not return data for the expected pair %s", krakenPairToQuery)
 	}
 
-	// --- The rest of the asset mapping logic will go here ---
-	// For now, we'll create a partial identity to pass the pre-flight check.
-
+	// Step 5: Initialize the identity with Kraken data and prepare for enrichment.
 	identity := &dataprovider.AssetIdentity{
-		CommonSymbol: commonSymbol,
-		KrakenAsset:  baseAltname,
-		KrakenWsName: targetKrakenPair.WSName,
-		LastUpdated:  time.Now(),
+		CommonSymbol:    commonSymbol,
+		KrakenAsset:     baseAltname,
+		KrakenWsName:    targetKrakenPair.WSName,
+		LastUpdated:     time.Now(),
+		CoinGeckoID:     "N/A", // Default value
+		CoinMarketCapID: "N/A", // Default value
+		IconPath:        "",    // Default value
 	}
 
-	m.logger.LogInfo("Successfully discovered partial identity for '%s' via Kraken.", commonSymbol)
+	// Step 6: Enrich with CoinGecko data.
+	if m.coingecko == nil {
+		m.logger.LogInfo("CoinGecko provider not configured. Skipping discovery for '%s'.", commonSymbol)
+	} else {
+		cgIDs, err := m.coingecko.GetCoinIDsBySymbol(ctx, commonSymbol)
+		if err != nil {
+			m.logger.LogWarn("mapper: failed to get CoinGecko IDs for '%s', proceeding with partial identity: %v", commonSymbol, err)
+		} else {
+			cgMarketData, err := m.coingecko.GetMarketData(ctx, cgIDs, "USD")
+			if err != nil {
+				m.logger.LogWarn("mapper: failed to get market data for CoinGecko IDs [%s], proceeding with partial identity: %v", strings.Join(cgIDs, ","), err)
+			} else {
+				var candidates []dataprovider.MarketData
+				for _, cgCoin := range cgMarketData {
+					if strings.EqualFold(cgCoin.Symbol, commonSymbol) && cgCoin.MarketCapRank > 0 && cgCoin.MarketCapRank <= m.cfg.Trading.DynamicAssetScanTopN {
+						candidates = append(candidates, cgCoin)
+					}
+				}
 
-	// Store in DB and cache
+				if len(candidates) == 0 {
+					m.logger.LogWarn("mapper: could not find a confident match for '%s' on CoinGecko after cross-referencing.", commonSymbol)
+				} else {
+					sort.Slice(candidates, func(i, j int) bool {
+						return candidates[i].MarketCapRank < candidates[j].MarketCapRank
+					})
+					matchedCgCoin := candidates[0]
+					identity.CoinGeckoID = matchedCgCoin.ID
+
+					// Step 7: Enrich with CoinMarketCap data (dependent on successful CG match).
+					var cmcLogoURL string
+					if m.coinmarketcap != nil {
+						cmcID, logoURL, cmcErr := m.findPreciseCmcID(ctx, commonSymbol, matchedCgCoin.MarketCap)
+						if cmcErr != nil {
+							m.logger.LogWarn("mapper: could not resolve CoinMarketCap ID for '%s': %v", commonSymbol, cmcErr)
+						} else {
+							identity.CoinMarketCapID = cmcID
+							cmcLogoURL = logoURL
+						}
+					} else {
+						m.logger.LogInfo("mapper: CoinMarketCap provider not configured, skipping ID resolution for '%s'.", commonSymbol)
+					}
+
+					// Step 8: Download the icon.
+					iconURL := matchedCgCoin.Image
+					if iconURL == "" {
+						iconURL = cmcLogoURL // Fallback to CMC logo if CG doesn't provide one.
+					}
+					iconPath, err := m.downloadIcon(ctx, matchedCgCoin.ID, iconURL)
+					if err != nil {
+						m.logger.LogWarn("mapper: failed to download icon for '%s': %v", commonSymbol, err)
+					} else {
+						identity.IconPath = iconPath
+					}
+				}
+			}
+		}
+	}
+
+	// Step 9: Log and save the final, enriched identity.
+	m.logger.LogInfo("Successfully discovered identity for '%s' (CG: %s, CMC: %s)", commonSymbol, identity.CoinGeckoID, identity.CoinMarketCapID)
+
 	if err := m.db.SaveAssetIdentity(identity); err != nil {
 		m.logger.LogWarn("Could not save newly discovered asset identity for %s to DB: %v", commonSymbol, err)
 	}
