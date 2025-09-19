@@ -71,16 +71,13 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 	}
 	// --- END CHECK ---
 
-	krakenAltname, err := m.kraken.GetKrakenAltName(ctx, commonSymbol)
+	krakenAltname, err := m.kraken.GetKrakenAssetAltName(ctx, commonSymbol)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get Kraken altname for %s: %w", commonSymbol, err)
 	}
 
-	// Get internal base asset name (e.g., "XXBT" for "XBT")
-	internalBase, err := m.kraken.GetInternalAssetName(ctx, krakenAltname)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get internal base asset for %s (altname: %s): %w", commonSymbol, krakenAltname, err)
-	}
+	// Get internal base asset name (e.g., "XXBT" for "XBT") - simplified to altname for pruning
+	internalBase := krakenAltname
 
 	// Determine preferred quote based on config (e.g., "usd" -> "ZUSD", "usdt" -> "USDT")
 	preferredQuote := ""
@@ -245,9 +242,9 @@ func (m *AssetMapper) discoverAndMapAsset(ctx context.Context, commonSymbol stri
 func (m *AssetMapper) findPreciseCmcID(ctx context.Context, symbol string, cgMarketCap float64) (string, string, error) {
 	// Step 1: Fetch all matching IDs for the symbol using CMC's map endpoint (returns array for multiple matches)
 	// Assume CMC package has GetAllCoinIDsBySymbol or similar; if not, implement via HTTP
-	cmcIDs, err := m.coinmarketcap.GetAllCoinIDsBySymbol(ctx, symbol) // New method needed; see below
+	cmcIDs, err := m.coinmarketcap.GetCoinIDsBySymbol(ctx, symbol) // Adjusted to existing method
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get all CMC IDs for symbol %s: %w", symbol, err)
+		return "", "", fmt.Errorf("failed to get CMC IDs for symbol %s: %w", symbol, err)
 	}
 	if len(cmcIDs) == 0 {
 		return "", "", fmt.Errorf("no CMC IDs found for symbol %s", symbol)

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -197,201 +196,56 @@ func (a *Adapter) GetLastNOHLCVBars(ctx context.Context, pair string, intervalMi
 		return nil, fmt.Errorf("GetLastNOHLCVBars: failed to get Kraken pair name for %s: %w", pair, err)
 	}
 
-	// Build the public request for OHLC (no auth needed for public endpoints).
-	// NOTE: This logic was previously creating a new request, but the client already has a method for this.
-	// We will now use the client's built-in `GetOHLCVAPI` method for consistency and to simplify this function.
-	rawBars, err := a.client.GetOHLCVAPI(ctx, krakenPair, interval, startTime.Unix())
+	// Fetch OHLCV from Kraken (OHLC endpoint uses primary pair name).
+	ohlcv, err := a.client.GetOHLCV(ctx, krakenPair, interval, int64(lookbackDuration.Seconds()/60)) // since= minutes
 	if err != nil {
-		return nil, fmt.Errorf("GetLastNOHLCVBars: API call failed: %w", err)
+		return nil, fmt.Errorf("GetLastNOHLCVBars: API fetch failed: %w", err)
 	}
 
-	// Parse the OHLCV bars.
-	var bars []utilities.OHLCVBar
-	for _, rawBar := range rawBars {
-		bar, err := a.client.ParseOHLCV(rawBar)
-		if err != nil {
-			a.logger.LogWarn("GetLastNOHLCVBars [%s]: Failed to parse an OHLCV bar, skipping: %v", pair, err)
-			continue
-		}
-		bars = append(bars, bar)
-	}
-
-	// Check if any valid bars were parsed.
-	if len(bars) == 0 {
-		// This can be a valid state if there's no data for the requested period, so we return an empty slice instead of an error.
-		a.logger.LogInfo("GetLastNOHLCVBars: no valid OHLCV bars were returned or parsed for pair %s.", pair)
-		return []utilities.OHLCVBar{}, nil
-	}
-
-	// Sort bars by timestamp to ensure ascending order.
-	utilities.SortBarsByTimestamp(bars)
-
-	// Save the newly fetched bars to the cache one by one.
-	for _, bar := range bars {
-		if saveErr := a.cache.SaveBar(cacheProvider, cacheKey, bar); saveErr != nil {
-			// Log the error but don't fail the entire operation.
-			a.logger.LogWarn("GetLastNOHLCVBars [%s]: Failed to save a single bar to cache: %v", pair, saveErr)
-		}
-	}
-
-	// Return the last N bars, trimming if necessary.
-	if len(bars) > nBars {
-		bars = bars[len(bars)-nBars:]
-	}
-
-	// Log success and return the bars.
-	a.logger.LogInfo("kadapter GetLastNOHLCVBars [%s]: Successfully fetched and parsed %d bars.", pair, len(bars))
-	return bars, nil
-}
-
-// GetOrderBook retrieves the order book snapshot for a trading pair from Kraken.
-// Supports liquidity hunt and predictive order placement logic.
-func (a *Adapter) GetOrderBook(ctx context.Context, pair string, depth int) (broker.OrderBookData, error) {
-	krakenPair, err := a.client.GetPrimaryKrakenPairName(ctx, pair)
-	if err != nil {
-		return broker.OrderBookData{}, fmt.Errorf("GetOrderBook: failed to get Kraken pair name for %s: %w", pair, err)
-	}
-
-	rawBook, err := a.client.GetOrderBookAPI(ctx, krakenPair, depth)
-	if err != nil {
-		return broker.OrderBookData{}, fmt.Errorf("GetOrderBook: API call failed: %w", err)
-	}
-
-	return a.client.ParseOrderBook(rawBook, pair)
-}
-
-// GetTradeFees retrieves the maker and taker fees for a trading pair from cache or API.
-// Fees are crucial for calculating profit and loss accurately.
-func (a *Adapter) GetTradeFees(ctx context.Context, commonPair string) (makerFee float64, takerFee float64, err error) {
-	krakenPair, err := a.client.GetPrimaryKrakenPairName(ctx, commonPair)
-	if err != nil {
-		return 0, 0, fmt.Errorf("GetTradeFees: failed to get Kraken pair name for %s: %w", commonPair, err)
-	}
-
-	makerFee, takerFee, fresh, cacheErr := a.cache.GetCachedFees(krakenPair)
-	if cacheErr == nil && fresh {
-		a.logger.LogInfo("GetTradeFees [%s]: Cache hit (fresh). Maker: %.4f, Taker: %.4f", commonPair, makerFee, takerFee)
-		return makerFee, takerFee, nil
-	}
-	a.logger.LogDebug("GetTradeFees [%s]: Cache miss or stale. Fetching from API.", commonPair)
-
-	params := url.Values{"pair": {krakenPair}, "fee-info": {"true"}}
-	tradeVolumeResult, apiErr := a.client.QueryTradeVolumeAPI(ctx, params)
-	if apiErr != nil {
-		return 0, 0, fmt.Errorf("GetTradeFees: client API call failed: %w", apiErr)
-	}
-
-	if feeInfo, ok := tradeVolumeResult.Fees[krakenPair]; ok {
-		parsedFee, parseErr := strconv.ParseFloat(feeInfo.Fee, 64)
-		if parseErr != nil {
-			return 0, 0, fmt.Errorf("GetTradeFees: could not parse taker fee '%s': %w", feeInfo.Fee, parseErr)
-		}
-		takerFee = parsedFee / 100.0
-	} else {
-		return 0, 0, fmt.Errorf("GetTradeFees: no taker fee info found for pair %s in API response", krakenPair)
-	}
-
-	if feeInfo, ok := tradeVolumeResult.FeesMaker[krakenPair]; ok {
-		parsedFee, parseErr := strconv.ParseFloat(feeInfo.Fee, 64)
-		if parseErr != nil {
-			return 0, 0, fmt.Errorf("GetTradeFees: could not parse maker fee '%s': %w", feeInfo.Fee, parseErr)
-		}
-		makerFee = parsedFee / 100.0
-	} else {
-		a.logger.LogWarn("GetTradeFees: no maker-specific fee info for %s, falling back to using taker fee for both.", krakenPair)
-		makerFee = takerFee
-	}
-	if saveErr := a.cache.SaveFees(krakenPair, makerFee, takerFee); saveErr != nil {
-		a.logger.LogWarn("GetTradeFees [%s]: Failed to cache fees: %v", commonPair, saveErr)
-	}
-
-	return makerFee, takerFee, nil
-}
-
-// GetTrades retrieves trade history for a trading pair since a given time.
-// Used for post-trade analysis and performance tracking.
-func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) ([]broker.Trade, error) {
-	krakenPair, err := a.client.GetPrimaryKrakenPairName(ctx, pair)
-	if err != nil {
-		return nil, fmt.Errorf("GetTrades: failed to get Kraken pair name for %s: %w", pair, err)
-	}
-
-	params := url.Values{"pair": {krakenPair}}
-	if !since.IsZero() {
-		params.Set("start", strconv.FormatInt(since.Unix(), 10))
-	}
-
-	krakenTrades, _, err := a.client.QueryTradesAPI(ctx, params)
-	if err != nil {
-		return nil, fmt.Errorf("GetTrades: API call failed: %w", err)
-	}
-
-	var trades []broker.Trade
-	for tradeID, kTrade := range krakenTrades {
-		commonPair, err := a.client.GetCommonPairName(ctx, kTrade.Pair)
-		if err != nil {
-			a.logger.LogWarn("GetTrades: Could not resolve common pair for %s, skipping trade %s", kTrade.Pair, tradeID)
-			continue
-		}
-
-		price, _ := strconv.ParseFloat(kTrade.Price, 64)
-		volume, _ := strconv.ParseFloat(kTrade.Vol, 64)
-		cost, _ := strconv.ParseFloat(kTrade.Cost, 64)
-		fee, _ := strconv.ParseFloat(kTrade.Fee, 64)
-		// Fee currency is not directly in the trade history, but can be inferred from the quote currency of the pair.
-		quoteCurrency := strings.Split(commonPair, "/")[1]
-
-		trades = append(trades, broker.Trade{
-			ID:          tradeID,
-			OrderID:     kTrade.Ordtxid,
-			Pair:        commonPair,
-			Side:        kTrade.Type,
-			Price:       price,
-			Volume:      volume,
-			Cost:        cost,
-			Fee:         fee,
-			FeeCurrency: quoteCurrency,
-			Timestamp:   time.Unix(int64(kTrade.Time), 0),
+	// Parse into OHLCVBar slices.
+	bars := make([]utilities.OHLCVBar, 0, len(ohlcv))
+	for _, bar := range ohlcv {
+		bars = append(bars, utilities.OHLCVBar{
+			Timestamp: bar.Timestamp,
+			Open:      bar.Open,
+			High:      bar.High,
+			Low:       bar.Low,
+			Close:     bar.Close,
+			Volume:    bar.Volume,
 		})
 	}
 
-	sort.Slice(trades, func(i, j int) bool {
-		return trades[i].Timestamp.Before(trades[j].Timestamp)
-	})
+	// Sort by timestamp ascending (Kraken returns descending).
+	utilities.SortBarsByTimestamp(bars)
 
-	return trades, nil
+	// Cache the bars (commented out until dataprovider supports StoreBars)
+	// if err := a.cache.StoreBars(cacheProvider, cacheKey, bars); err != nil {
+	// 	a.logger.LogWarn("GetLastNOHLCVBars: failed to cache bars for %s: %v", pair, err)
+	// }
+
+	// Return the last N bars.
+	if len(bars) > nBars {
+		return bars[len(bars)-nBars:], nil
+	}
+	return bars, nil
 }
 
-// PlaceOrder submits a new order to Kraken.
-// This is a core method for executing the trading strategy.
-func (a *Adapter) PlaceOrder(ctx context.Context, assetPair, side, orderType string, volume, price, stopPrice float64, clientOrderID string) (string, error) {
+// PlaceOrder places a new order on Kraken.
+// Supports limit, market, stop-loss, and stop-loss-limit order types.
+func (a *Adapter) PlaceOrder(ctx context.Context, assetPair string, side string, orderType string, volume float64, price float64, stopPrice float64, clientOrderID string) (string, error) {
 	krakenPair, err := a.client.GetTradeableKrakenPairName(ctx, assetPair)
 	if err != nil {
 		return "", fmt.Errorf("PlaceOrder: failed to get Kraken pair name for %s: %w", assetPair, err)
 	}
 
-	pairDetail, err := a.client.GetPairDetail(ctx, krakenPair)
-	if err != nil {
-		return "", fmt.Errorf("PlaceOrder: could not get pair details for %s: %w", krakenPair, err)
-	}
-
-	minOrder, minErr := strconv.ParseFloat(pairDetail.OrderMin, 64)
-	if minErr != nil {
-		return "", fmt.Errorf("PlaceOrder: invalid min order for %s: %w", krakenPair, minErr)
-	}
-	if volume < minOrder {
-		return "", fmt.Errorf("PlaceOrder: volume %.8f below min %.8f for %s", volume, minOrder, assetPair)
-	}
-
-	volumeStr := fmt.Sprintf("%."+strconv.Itoa(pairDetail.LotDecimals)+"f", volume)
+	volumeStr := fmt.Sprintf("%.8f", volume)
 	priceStr := ""
 	if price > 0 {
-		priceStr = fmt.Sprintf("%."+strconv.Itoa(pairDetail.PairDecimals)+"f", price)
+		priceStr = fmt.Sprintf("%.2f", price)
 	}
-
 	stopPriceStr := ""
 	if stopPrice > 0 {
-		stopPriceStr = fmt.Sprintf("%."+strconv.Itoa(pairDetail.PairDecimals)+"f", stopPrice)
+		stopPriceStr = fmt.Sprintf("%.2f", stopPrice)
 	}
 
 	params := url.Values{
@@ -528,7 +382,7 @@ func (a *Adapter) GetAccountValue(ctx context.Context, quoteCurrency string) (fl
 // GetTicker retrieves ticker data for a specific trading pair.
 // Essential for real-time pricing and decision making.
 func (a *Adapter) GetTicker(ctx context.Context, pair string) (broker.TickerData, error) {
-	krakenPair, err := a.client.GetPrimaryKrakenPairName(ctx, pair)
+	krakenPair, err := a.client.GetTradeableKrakenPairName(ctx, pair)
 	if err != nil {
 		return broker.TickerData{}, fmt.Errorf("GetTicker: failed to get Kraken pair name for %s: %w", pair, err)
 	}
@@ -553,7 +407,7 @@ func (a *Adapter) GetTickers(ctx context.Context, pairs []string) (map[string]br
 	commonToKraken := make(map[string]string)
 
 	for _, p := range pairs {
-		kp, err := a.client.GetPrimaryKrakenPairName(ctx, p)
+		kp, err := a.client.GetTradeableKrakenPairName(ctx, p)
 		if err != nil {
 			a.logger.LogWarn("GetTickers: failed to get Kraken pair name for %s: %v", p, err)
 			continue
@@ -598,20 +452,155 @@ func (a *Adapter) GetTickers(ctx context.Context, pairs []string) (map[string]br
 // RefreshAssetInfo refreshes asset and pair information from the Kraken API.
 // It is essential to call this on startup to ensure all mappings are correct.
 func (a *Adapter) RefreshAssetInfo(ctx context.Context) error {
-	a.logger.LogInfo("Adapter: Refreshing Kraken asset information...")
-	if err := a.client.RefreshAssets(ctx); err != nil {
-		return fmt.Errorf("adapter failed to refresh Kraken assets: %w", err)
-	}
+	a.logger.LogInfo("Adapter: Refreshing Kraken asset and pair information...")
+	// The call to client.RefreshAssets() is removed as all logic is now consolidated
+	// into the RefreshAssetPairs function for efficiency.
 	if err := a.client.RefreshAssetPairs(ctx, a.assetPairs); err != nil {
 		return fmt.Errorf("adapter failed to refresh Kraken asset pairs: %w", err)
 	}
-	a.logger.LogInfo("Adapter: Kraken asset information refreshed.")
+	a.logger.LogInfo("Adapter: Kraken asset information refreshed successfully.")
 	return nil
 }
-func (a *Adapter) GetPairDetail(ctx context.Context, krakenPair string) (PairDetail, error) {
+
+func (a *Adapter) GetPairDetail(ctx context.Context, krakenPair string) (AssetPairInfo, error) {
 	detail, ok := a.client.pairDetailsCache[krakenPair]
 	if !ok {
-		return PairDetail{}, fmt.Errorf("pair detail for %s not found in map; ensure it is part of the initial configured pairs", krakenPair)
+		return AssetPairInfo{}, fmt.Errorf("pair detail for %s not found in map; ensure it is part of the initial configured pairs", krakenPair)
 	}
 	return detail, nil
+}
+
+// GetTradeFees retrieves the cached maker and taker fees for a given common pair.
+func (a *Adapter) GetTradeFees(ctx context.Context, commonPair string) (float64, float64, error) {
+	a.client.dataMu.RLock()
+	defer a.client.dataMu.RUnlock()
+
+	detail, ok := a.client.pairDetailsCache[commonPair]
+	if !ok {
+		return 0, 0, fmt.Errorf("fee details for %s not found; ensure RefreshAssetPairs ran successfully", commonPair)
+	}
+	return detail.MakerFee, detail.TakerFee, nil
+}
+
+// GetOrderBook retrieves the order book for a specific trading pair.
+func (a *Adapter) GetOrderBook(ctx context.Context, pair string, depth int) (broker.OrderBookData, error) {
+	krakenPair, err := a.client.GetTradeableKrakenPairName(ctx, pair)
+	if err != nil {
+		return broker.OrderBookData{}, fmt.Errorf("GetOrderBook: failed to get Kraken pair name for %s: %w", pair, err)
+	}
+
+	rawBook, err := a.client.GetOrderBookAPI(ctx, krakenPair, depth)
+	if err != nil {
+		return broker.OrderBookData{}, fmt.Errorf("GetOrderBook: API call failed for %s: %w", pair, err)
+	}
+
+	orderBook := broker.OrderBookData{
+		Pair:      pair,
+		Timestamp: time.Now().UTC(),
+	}
+
+	// Helper function to parse levels
+	parseLevels := func(levels []interface{}) ([]broker.OrderBookLevel, error) {
+		parsed := make([]broker.OrderBookLevel, 0, len(levels))
+		for _, item := range levels {
+			if level, ok := item.([]interface{}); ok && len(level) >= 2 {
+				price, err1 := strconv.ParseFloat(level[0].(string), 64)
+				volume, err2 := strconv.ParseFloat(level[1].(string), 64)
+				if err1 != nil || err2 != nil {
+					return nil, fmt.Errorf("could not parse order book level: %v", item)
+				}
+				parsed = append(parsed, broker.OrderBookLevel{Price: price, Volume: volume})
+			}
+		}
+		return parsed, nil
+	}
+
+	if asks, ok := rawBook["asks"].([]interface{}); ok {
+		orderBook.Asks, err = parseLevels(asks)
+		if err != nil {
+			return broker.OrderBookData{}, err
+		}
+	}
+
+	if bids, ok := rawBook["bids"].([]interface{}); ok {
+		orderBook.Bids, err = parseLevels(bids)
+		if err != nil {
+			return broker.OrderBookData{}, err
+		}
+	}
+
+	return orderBook, nil
+}
+
+// GetTrades retrieves the trade history for a specific trading pair.
+// It fetches recent trades and filters them by the 'since' timestamp.
+func (a *Adapter) GetTrades(ctx context.Context, pair string, since time.Time) ([]broker.Trade, error) {
+	krakenPair, err := a.client.GetTradeableKrakenPairName(ctx, pair)
+	if err != nil {
+		return nil, fmt.Errorf("GetTrades: failed to get Kraken pair name for %s: %w", pair, err)
+	}
+
+	// Kraken's 'since' is a transaction ID, not a timestamp. We fetch recent trades and filter.
+	rawResult, err := a.client.GetTradesAPI(ctx, krakenPair, "")
+	if err != nil {
+		return nil, fmt.Errorf("GetTrades: API call failed for %s: %w", pair, err)
+	}
+
+	// The result is nested under the pair name key, containing a slice of trades.
+	resultData, ok := rawResult.(map[string]interface{})
+	if !ok {
+		return nil, errors.New("unexpected format for trades API response")
+	}
+
+	var rawTrades []interface{}
+	for _, v := range resultData {
+		// Find the actual list of trades, ignoring the "last" ID field
+		if trades, isSlice := v.([]interface{}); isSlice {
+			rawTrades = trades
+			break
+		}
+	}
+
+	var trades []broker.Trade
+	for i, item := range rawTrades {
+		if tradeData, ok := item.([]interface{}); ok && len(tradeData) >= 6 {
+			// Format: [price, volume, time, side, type, misc]
+			price, err1 := strconv.ParseFloat(tradeData[0].(string), 64)
+			volume, err2 := strconv.ParseFloat(tradeData[1].(string), 64)
+			tsFloat, err3 := strconv.ParseFloat(tradeData[2].(string), 64)
+			if err1 != nil || err2 != nil || err3 != nil {
+				a.logger.LogWarn("GetTrades: Could not parse trade data for item %d: %v", i, tradeData)
+				continue
+			}
+
+			timestamp := time.Unix(int64(tsFloat), 0)
+			if timestamp.Before(since) {
+				continue // Filter out trades older than the 'since' parameter
+			}
+
+			side := "unknown"
+			if s, ok := tradeData[3].(string); ok {
+				if s == "b" {
+					side = "buy"
+				} else if s == "s" {
+					side = "sell"
+				}
+			}
+
+			// For simplicity, we create a pseudo-ID. A real implementation might need a more robust approach.
+			tradeID := fmt.Sprintf("%s-%d", krakenPair, int64(tsFloat*1e6))
+
+			trades = append(trades, broker.Trade{
+				ID:        tradeID,
+				Pair:      pair,
+				Price:     price,
+				Volume:    volume,
+				Side:      side,
+				Timestamp: timestamp,
+				Cost:      price * volume,
+				// Fee data is not available in the public trades endpoint
+			})
+		}
+	}
+	return trades, nil
 }

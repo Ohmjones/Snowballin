@@ -1,47 +1,21 @@
 package kraken
 
 type AssetPairInfo struct {
-	Altname           string          `json:"altname"`
-	WSName            string          `json:"wsname"`
-	ACLASSBase        string          `json:"aclass_base"`
-	Base              string          `json:"base"`
-	ACLASSQuote       string          `json:"aclass_quote"`
-	Quote             string          `json:"quote"`
-	Lot               string          `json:"lot"`
-	PairDecimals      int             `json:"pair_decimals"`
-	LotDecimals       int             `json:"lot_decimals"`
-	LotMultiplier     int             `json:"lot_multiplier"`
-	LeverageBuy       []int           `json:"leverage_buy"`
-	LeverageSell      []int           `json:"leverage_sell"`
-	Fees              [][]interface{} `json:"fees"`
-	FeesMaker         [][]interface{} `json:"fees_maker"`
-	FeeVolumeCurrency string          `json:"fee_volume_currency"`
-	MarginCall        int             `json:"margin_call"`
-	MarginStop        int             `json:"margin_stop"`
-	OrderMin          string          `json:"ordermin"`
-}
-type AssetPairAPIInfo struct {
-	Altname       string `json:"altname"`
-	Base          string `json:"base"`
-	Quote         string `json:"quote"`
-	LotDecimals   int    `json:"lot_decimals"`
-	PairDecimals  int    `json:"pair_decimals"`
-	OrderMin      string `json:"ordermin"`
-	OrderMax      string `json:"ordermax"`
-	PriceDecimals int    `json:"price_decimals"`
-	PriceLot      string `json:"price_lot"`
+	PairName     string  `json:"-"` // Augmented: the response key (primary)
+	Altname      string  `json:"altname"`
+	Base         string  `json:"base"`
+	Quote        string  `json:"quote"`
+	PairDecimals int     `json:"pair_decimals"`
+	LotDecimals  int     `json:"lot_decimals"`
+	OrderMin     string  `json:"ordermin"`
+	WSName       string  `json:"wsname"`
+	MakerFee     float64 // Base maker fee rate
+	TakerFee     float64 // Base taker fee rate
 }
 
-// KrakenAPIRawOrderBook directly maps the structure from Kraken's /0/public/Depth endpoint result.
-type KrakenAPIRawOrderBook struct {
-	Asks [][]interface{} `json:"asks"` // Each inner slice is typically [price_string, volume_string, timestamp_int]
-	Bids [][]interface{} `json:"bids"` // Each inner slice is typically [price_string, volume_string, timestamp_int]
-}
 type AssetInfo struct {
-	Altname         string `json:"altname"`          // Alternate name (common symbol, e.g., ETH, USD)
-	ACLASS          string `json:"aclass"`           // Asset class (e.g., "currency")
-	Decimals        int    `json:"decimals"`         // Standard number of decimal places for calculations
-	DisplayDecimals int    `json:"display_decimals"` // Number of decimal places for display
+	Altname string `json:"altname"`
+	// Other fields pruned
 }
 
 type TickerInfo struct {
@@ -56,24 +30,16 @@ type TickerInfo struct {
 	OpenPrice         string   `json:"o"`
 }
 
-// TickerData is a simplified/processed version of TickerInfo, used internally by the client
-// before being mapped to broker.TickerData by the adapter.
-type TickerData struct {
-	Pair         string // Kraken pair name, e.g., XBTUSD
-	AskPrice     float64
-	BidPrice     float64
-	LastPrice    float64
-	VolumeToday  float64
-	Volume24h    float64
-	VWAPToday    float64
-	VWAP24h      float64
-	TradesToday  int
-	Trades24h    int
-	LowToday     float64
-	Low24h       float64
-	HighToday    float64
-	High24h      float64
-	OpeningPrice float64
+// TickerResponse is the top-level response for the Ticker endpoint.
+type TickerResponse struct {
+	Error  []string              `json:"error"`
+	Result map[string]TickerInfo `json:"result"`
+}
+
+// AssetPairsResponse is the top-level response for the AssetPairs endpoint.
+type AssetPairsResponse struct {
+	Error  []string                 `json:"error"`
+	Result map[string]AssetPairInfo `json:"result"`
 }
 
 // KrakenOrderDescription is part of Kraken's order info response.
@@ -110,63 +76,4 @@ type KrakenOrderInfo struct {
 	Misc       string                 `json:"misc"`
 	Oflags     string                 `json:"oflags"`
 	Trades     []string               `json:"trades,omitempty"`
-}
-
-// KrakenFeeTierInfo represents fee information for a trading pair.
-type KrakenFeeTierInfo struct {
-	Fee        string `json:"fee"`        // Current fee percentage for the tier
-	MinFee     string `json:"minfee"`     // Minimum fee for the pair (if not fixed per-order)
-	MaxFee     string `json:"maxfee"`     // Maximum fee for the pair
-	NextFee    string `json:"nextfee"`    // Fee for next volume tier (if available)
-	NextVolume string `json:"nextvolume"` // Volume for the next tier (if available)
-	TierVolume string `json:"tiervolume"` // Volume in current tier (if applicable)
-}
-
-// KrakenTradeInfo represents a single trade detail from Kraken's TradesHistory.
-type KrakenTradeInfo struct {
-	Ordtxid        string  `json:"ordertxid"`
-	Pair           string  `json:"pair"`
-	Time           float64 `json:"time"`
-	Type           string  `json:"type"`
-	Ordertype      string  `json:"ordertype"`
-	Price          string  `json:"price"`
-	Cost           string  `json:"cost"`
-	Fee            string  `json:"fee"`
-	Vol            string  `json:"vol"`
-	Margin         string  `json:"margin"`
-	Misc           string  `json:"misc"`
-	PosStatus      string  `json:"posstatus,omitempty"`
-	ClosedAvgPrice string  `json:"cprice,omitempty"`
-	ClosedCost     string  `json:"ccost,omitempty"`
-	ClosedFee      string  `json:"cfee,omitempty"`
-	ClosedVol      string  `json:"cvol,omitempty"`
-	ClosedMargin   string  `json:"cmargin,omitempty"`
-	Net            string  `json:"net,omitempty"`
-	TradeID        string  // Map key from TradesHistory result
-}
-
-// TradeVolumeResponse parses the top-level response from the TradeVolume endpoint.
-type TradeVolumeResponse struct {
-	Error  []string          `json:"error"`
-	Result TradeVolumeResult `json:"result"`
-}
-
-// TradeVolumeResult contains the core data, including the separate fee structures for maker and taker.
-type TradeVolumeResult struct {
-	Currency  string                       `json:"currency"`
-	Volume    string                       `json:"volume"`
-	Fees      map[string]KrakenFeeTierInfo `json:"fees"`
-	FeesMaker map[string]KrakenFeeTierInfo `json:"fees_maker"`
-}
-
-// TickerResponse is the top-level response for the Ticker endpoint.
-type TickerResponse struct {
-	Error  []string              `json:"error"`
-	Result map[string]TickerInfo `json:"result"`
-}
-
-// AssetPairsResponse is the top-level response for the AssetPairs endpoint.
-type AssetPairsResponse struct {
-	Error  []string                 `json:"error"`
-	Result map[string]AssetPairInfo `json:"result"`
 }
