@@ -284,18 +284,53 @@ func (c *Client) RefreshAssetPairs(ctx context.Context, configuredPairs []string
 
 // GetAssetPairsAPI fetches asset pair information for one or all pairs.
 func (c *Client) GetAssetPairsAPI(ctx context.Context, pairStr string) (map[string]AssetPairInfo, error) {
-	params := url.Values{}
-	if pairStr != "" {
-		// Do not encode the pairStr to preserve commas
-		params.Set("pair", pairStr)
-	}
 	var resp AssetPairsResponse
-	if err := c.callPublic(ctx, "/0/public/AssetPairs", params, &resp); err != nil {
-		return nil, fmt.Errorf("GetAssetPairsAPI: callPublic failed: %w", err)
+	var endpoint string
+
+	if pairStr != "" {
+		// Manually append the pair parameter without encoding to preserve commas
+		endpoint = fmt.Sprintf("%s/0/public/AssetPairs?pair=%s", c.BaseURL, pairStr)
+	} else {
+		endpoint = c.BaseURL + "/0/public/AssetPairs"
 	}
+
+	c.logger.LogDebug("Kraken GetAssetPairsAPI: URL=%s", endpoint)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request for AssetPairs: %w", err)
+	}
+	req.Header.Set("User-Agent", "SnowballinBot/1.0")
+
+	var lastErr error
+	maxRetries := c.cfg.MaxRetries
+	backoff := time.Duration(c.cfg.RetryDelaySec) * time.Second
+
+	for i := 0; i < maxRetries; i++ {
+		lastErr = utilities.DoJSONRequest(c.HTTPClient, req, 0, 0, &resp)
+
+		if lastErr != nil {
+			if strings.Contains(lastErr.Error(), "EAPI:Rate limit exceeded") {
+				c.logger.LogWarn("Rate limit exceeded on AssetPairs. Waiting %v before retrying... (Attempt %d/%d)", backoff, i+1, maxRetries)
+				select {
+				case <-time.After(backoff):
+					backoff *= 2 // Exponential backoff
+					continue
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			return nil, fmt.Errorf("AssetPairs API call failed: %w", lastErr)
+		}
+
+		// Success
+		break
+	}
+
 	if len(resp.Error) > 0 {
-		return nil, fmt.Errorf("GetAssetPairsAPI: API error: %s", strings.Join(resp.Error, ", "))
+		return nil, fmt.Errorf("AssetPairs API error: %s", strings.Join(resp.Error, ", "))
 	}
+
 	return resp.Result, nil
 }
 
