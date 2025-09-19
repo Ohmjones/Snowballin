@@ -89,9 +89,8 @@ func (a *Adapter) GetAllBalances(ctx context.Context) ([]broker.Balance, error) 
 		// Attempt to map the Kraken asset name back to a common symbol (e.g., ZUSD -> USD)
 		commonName, err := a.client.GetCommonAssetName(ctx, krakenName)
 		if err != nil {
-			// If mapping fails, log it but use the original Kraken name.
-			// This ensures assets not explicitly configured are still visible, even if they can't be valued.
-			a.logger.LogDebug("GetAllBalances: could not get common name for Kraken asset '%s', using raw name. Error: %v", krakenName, err)
+			// **IMPROVED LOG:** This message is now more informative and less alarming.
+			a.logger.LogDebug("GetAllBalances: Found unmapped asset '%s' in account. It will be listed but not valued.", krakenName)
 			commonName = krakenName
 		}
 
