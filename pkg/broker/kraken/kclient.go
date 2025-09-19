@@ -93,6 +93,31 @@ func (c *Client) getAltNameForCommon(ctx context.Context, common string) (string
 	return "", errors.New("getAltNameForCommon: no altname found")
 }
 
+// getAltNamesForAssets queries the Assets endpoint for a comma-separated list of assets.
+func (c *Client) getAltNamesForAssets(ctx context.Context, assetsStr string) (map[string]string, error) {
+	var resp struct {
+		Error  []string             `json:"error"`
+		Result map[string]AssetInfo `json:"result"`
+	}
+
+	// Manually construct the path to send raw commas, bypassing the default URL encoding.
+	// This provides maximum compatibility.
+	path := fmt.Sprintf("/0/public/Assets?asset=%s", assetsStr)
+	if err := c.callPublic(ctx, path, nil, &resp); err != nil {
+		return nil, fmt.Errorf("API call to Assets failed: %w", err)
+	}
+
+	if len(resp.Error) > 0 {
+		return nil, fmt.Errorf("API error from Assets: %s", strings.Join(resp.Error, ", "))
+	}
+
+	altMap := make(map[string]string)
+	for commonName, info := range resp.Result {
+		altMap[commonName] = info.Altname
+	}
+	return altMap, nil
+}
+
 // RefreshAssetPairs fetches all necessary asset and pair data from Kraken for the configured pairs.
 // It uses an efficient batching method to minimize API calls:
 // 1. Normalizes configured pair strings (e.g., "BTC" -> "BTC/USD").
@@ -214,27 +239,6 @@ func (c *Client) RefreshAssetPairs(ctx context.Context, configuredPairs []string
 
 	c.logger.LogInfo("Kraken Client: Successfully refreshed mappings for %d pairs.", len(c.commonToTradeablePair))
 	return nil
-}
-
-// getAltNamesForAssets queries the Assets endpoint for a comma-separated list of assets.
-func (c *Client) getAltNamesForAssets(ctx context.Context, assetsStr string) (map[string]string, error) {
-	var resp struct {
-		Error  []string             `json:"error"`
-		Result map[string]AssetInfo `json:"result"`
-	}
-	params := url.Values{"asset": {assetsStr}}
-	if err := c.callPublic(ctx, "/0/public/Assets", params, &resp); err != nil {
-		return nil, fmt.Errorf("API call to Assets failed: %w", err)
-	}
-	if len(resp.Error) > 0 {
-		return nil, fmt.Errorf("API error from Assets: %s", strings.Join(resp.Error, ", "))
-	}
-
-	altMap := make(map[string]string)
-	for commonName, info := range resp.Result {
-		altMap[commonName] = info.Altname
-	}
-	return altMap, nil
 }
 
 // getAssetPairsForAlts queries the AssetPairs endpoint for a comma-separated list of pair altnames.
