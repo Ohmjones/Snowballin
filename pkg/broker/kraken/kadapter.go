@@ -76,8 +76,8 @@ func (a *Adapter) CancelOrder(ctx context.Context, orderID string) error {
 }
 
 // GetAllBalances retrieves all non-zero account balances from Kraken.
-// Balances are converted to common asset names (e.g., XBT -> BTC).
-// This method is essential for portfolio-level tracking and drawdown calculations.
+// It correctly handles futures assets (e.g., 'ETH.F') by mapping them to their
+// base asset ('ETH') for consistent handling and valuation throughout the application.
 func (a *Adapter) GetAllBalances(ctx context.Context) ([]broker.Balance, error) {
 	balances, err := a.client.GetBalancesAPI(ctx)
 	if err != nil {
@@ -86,12 +86,20 @@ func (a *Adapter) GetAllBalances(ctx context.Context) ([]broker.Balance, error) 
 
 	var allBalances []broker.Balance
 	for krakenName, balanceStr := range balances {
-		// Attempt to map the Kraken asset name back to a common symbol (e.g., ZUSD -> USD)
-		commonName, err := a.client.GetCommonAssetName(ctx, krakenName)
-		if err != nil {
-			// **IMPROVED LOG:** This message is now more informative and less alarming.
-			a.logger.LogDebug("GetAllBalances: Found unmapped asset '%s' in account. It will be listed but not valued.", krakenName)
+		// Determine the asset symbol to use for mapping. For futures like 'ETH.F',
+		// we strip the suffix and use the base 'ETH' to find its common name and value.
+		assetToMap := krakenName
+		if strings.HasSuffix(krakenName, ".F") {
+			assetToMap = strings.TrimSuffix(krakenName, ".F")
+		}
+
+		// Attempt to map the Kraken asset name (e.g., XXBT) back to a common symbol (e.g., BTC).
+		commonName, mapErr := a.client.GetCommonAssetName(ctx, assetToMap)
+		if mapErr != nil {
+			// If mapping fails, use the original Kraken asset name. This ensures the asset is
+			// still listed in the portfolio, even if it cannot be valued later.
 			commonName = krakenName
+			a.logger.LogDebug("GetAllBalances: Found unmapped asset '%s' in account. It will be listed but may not be valued.", krakenName)
 		}
 
 		bal, parseErr := strconv.ParseFloat(balanceStr, 64)
@@ -100,9 +108,10 @@ func (a *Adapter) GetAllBalances(ctx context.Context) ([]broker.Balance, error) 
 			continue
 		}
 
+		// Only include assets with a balance greater than zero.
 		if bal > 0 {
 			allBalances = append(allBalances, broker.Balance{
-				Currency:  commonName,
+				Currency:  commonName, // Use the mapped common name
 				Total:     bal,
 				Available: bal, // Assuming total is available for simplicity
 			})
