@@ -381,38 +381,56 @@ func (c *Client) GetOHLCV(ctx context.Context, pair, interval string, sinceMinut
 	}
 
 	var rawBarsData [][]interface{}
+	var found bool
 
-	// To robustly find the data, we must get the primary pair name (e.g., "XXBTZUSD")
-	// as that is the key used in the API response, even when querying with an altname (e.g., "XBTUSD").
-	commonPair, err := c.GetCommonPairName(ctx, pair)
-	if err != nil {
-		c.logger.LogWarn("GetOHLCV: Could not reverse map %s to common pair, will attempt fallback search. Err: %v", pair, err)
-	} else {
-		primaryPair, err := c.GetPrimaryKrakenPairName(ctx, commonPair)
-		if err == nil {
-			// Primary lookup method: direct access using the correct primary pair key.
+	// --- Strategy 1: Look for the official "primary" pair name (e.g., XXBTZUSD) ---
+	commonPair, commonErr := c.GetCommonPairName(ctx, pair)
+	if commonErr == nil {
+		primaryPair, primaryErr := c.GetPrimaryKrakenPairName(ctx, commonPair)
+		if primaryErr == nil {
 			if data, ok := resp.Result[primaryPair]; ok {
 				if bars, isSlice := data.([][]interface{}); isSlice {
 					rawBarsData = bars
+					found = true
+					c.logger.LogDebug("GetOHLCV [%s]: Found data using primary pair key '%s'", pair, primaryPair)
 				}
 			}
 		}
 	}
 
-	// Fallback method: if the primary lookup fails, iterate through the response map.
-	// This handles edge cases or API inconsistencies.
-	if rawBarsData == nil {
+	// --- Strategy 2: If not found, look for the "altname" we queried with (e.g., XBTUSD) ---
+	if !found {
+		if data, ok := resp.Result[pair]; ok {
+			if bars, isSlice := data.([][]interface{}); isSlice {
+				rawBarsData = bars
+				found = true
+				c.logger.LogDebug("GetOHLCV [%s]: Found data using altname key '%s'", pair, pair)
+			}
+		}
+	}
+
+	// --- Strategy 3 (Fallback): If still not found, iterate all keys ---
+	if !found {
+		c.logger.LogDebug("GetOHLCV [%s]: Could not find data with primary or altname key, iterating all keys in response.", pair)
 		for key, value := range resp.Result {
 			if key != "last" {
 				if bars, ok := value.([][]interface{}); ok {
 					rawBarsData = bars
-					break // Data found, exit the loop.
+					found = true
+					c.logger.LogDebug("GetOHLCV [%s]: Found data under unexpected key '%s'", pair, key)
+					break
 				}
 			}
 		}
 	}
 
 	if rawBarsData == nil {
+		// --- CRITICAL DIAGNOSTIC LOGGING ---
+		keysInResponse := make([]string, 0, len(resp.Result))
+		for k := range resp.Result {
+			keysInResponse = append(keysInResponse, k)
+		}
+		c.logger.LogError("GetOHLCV: Failed to find candle data for '%s'. Keys in API response: %v", pair, keysInResponse)
 		return nil, fmt.Errorf("GetOHLCV: could not find OHLCV data for pair %s in API response", pair)
 	}
 
