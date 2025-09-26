@@ -381,57 +381,44 @@ func (c *Client) GetOHLCV(ctx context.Context, pair, interval string, sinceMinut
 	}
 
 	var rawBarsData [][]interface{}
-	var found bool
+	// Iterate over the result map to find the candle data. The key is the primary
+	// pair name (e.g., XXBTZUSD) and may not match the requested 'pair' string.
+	for key, value := range resp.Result {
+		if key == "last" {
+			continue
+		}
 
-	// --- Strategy 1: Look for the official "primary" pair name (e.g., XXBTZUSD) ---
-	commonPair, commonErr := c.GetCommonPairName(ctx, pair)
-	if commonErr == nil {
-		primaryPair, primaryErr := c.GetPrimaryKrakenPairName(ctx, commonPair)
-		if primaryErr == nil {
-			if data, ok := resp.Result[primaryPair]; ok {
-				if bars, isSlice := data.([][]interface{}); isSlice {
-					rawBarsData = bars
-					found = true
-					c.logger.LogDebug("GetOHLCV [%s]: Found data using primary pair key '%s'", pair, primaryPair)
-				}
+		// The JSON decoder unmarshals an array of arrays into a slice of interfaces,
+		// where each element is another interface holding a slice.
+		// We must first assert the top-level slice.
+		topLevelSlice, ok := value.([]interface{})
+		if !ok {
+			continue // This key does not contain an array, so skip it.
+		}
+
+		// Now, build the [][]interface{} structure that the parsing logic expects.
+		reconstructedBars := make([][]interface{}, 0, len(topLevelSlice))
+		isDataValid := true
+		for _, item := range topLevelSlice {
+			// Assert that each item in the top-level slice is also a slice.
+			if innerSlice, ok := item.([]interface{}); ok {
+				reconstructedBars = append(reconstructedBars, innerSlice)
+			} else {
+				// If any item is not a slice, this is not the candle data we are looking for.
+				isDataValid = false
+				break
 			}
 		}
-	}
 
-	// --- Strategy 2: If not found, look for the "altname" we queried with (e.g., XBTUSD) ---
-	if !found {
-		if data, ok := resp.Result[pair]; ok {
-			if bars, isSlice := data.([][]interface{}); isSlice {
-				rawBarsData = bars
-				found = true
-				c.logger.LogDebug("GetOHLCV [%s]: Found data using altname key '%s'", pair, pair)
-			}
-		}
-	}
-
-	// --- Strategy 3 (Fallback): If still not found, iterate all keys ---
-	if !found {
-		c.logger.LogDebug("GetOHLCV [%s]: Could not find data with primary or altname key, iterating all keys in response.", pair)
-		for key, value := range resp.Result {
-			if key != "last" {
-				if bars, ok := value.([][]interface{}); ok {
-					rawBarsData = bars
-					found = true
-					c.logger.LogDebug("GetOHLCV [%s]: Found data under unexpected key '%s'", pair, key)
-					break
-				}
-			}
+		if isDataValid {
+			rawBarsData = reconstructedBars
+			c.logger.LogDebug("GetOHLCV [%s]: Successfully parsed candle data found under API response key '%s'", pair, key)
+			break // Data found and parsed, exit the loop.
 		}
 	}
 
 	if rawBarsData == nil {
-		// --- CRITICAL DIAGNOSTIC LOGGING ---
-		keysInResponse := make([]string, 0, len(resp.Result))
-		for k := range resp.Result {
-			keysInResponse = append(keysInResponse, k)
-		}
-		c.logger.LogError("GetOHLCV: Failed to find candle data for '%s'. Keys in API response: %v", pair, keysInResponse)
-		return nil, fmt.Errorf("GetOHLCV: could not find OHLCV data for pair %s in API response", pair)
+		return nil, fmt.Errorf("GetOHLCV: could not find and parse OHLCV data for pair %s in API response", pair)
 	}
 
 	bars := make([]utilities.OHLCVBar, 0, len(rawBarsData))
@@ -683,13 +670,4 @@ func (c *Client) callPublic(ctx context.Context, path string, params url.Values,
 	req.Header.Set("User-Agent", "SnowballinBot/1.0")
 
 	return utilities.DoJSONRequest(c.HTTPClient, req, c.cfg.MaxRetries, time.Duration(c.cfg.RetryDelaySec)*time.Second, target)
-}
-
-// keys returns slice of map keys (helper).
-func keys(m map[string]bool) []string {
-	ks := make([]string, 0, len(m))
-	for k := range m {
-		ks = append(ks, k)
-	}
-	return ks
 }

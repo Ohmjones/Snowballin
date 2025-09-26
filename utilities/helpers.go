@@ -231,6 +231,15 @@ func ParseFloatFromInterface(val interface{}) (float64, error) {
 	}
 }
 
+// keys returns slice of map keys (helper).
+func Keys(m map[string]bool) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	return ks
+}
+
 // ParseLogLevel converts a string log level to the LogLevel type.
 func ParseLogLevel(levelStr string) (LogLevel, error) {
 	switch strings.ToLower(levelStr) {
