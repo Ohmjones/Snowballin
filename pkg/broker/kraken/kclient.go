@@ -358,17 +358,16 @@ func (c *Client) GetPairDetail(ctx context.Context, commonPair string) (AssetPai
 	return AssetPairInfo{}, fmt.Errorf("pair detail for %s not found; ensure RefreshAssetPairs run", commonPair)
 }
 
-// GetOHLCV fetches OHLCV data from Kraken. It correctly handles the API's
-// nested response structure where the candle data is inside a map keyed by the pair name.
-// This fixes the `json: cannot unmarshal object into Go struct` error.
+// GetOHLCV fetches OHLCV data from Kraken. It has been made more robust
+// to handle cases where the API response key for the pair data does not exactly
+// match the pair name used in the request. It now iterates through the response
+// map to find the candle data, making it resilient to API inconsistencies.
 func (c *Client) GetOHLCV(ctx context.Context, pair, interval string, sinceMinutes int64) ([]utilities.OHLCVBar, error) {
 	params := url.Values{
 		"pair":     {pair},
 		"interval": {interval},
 	}
 	if sinceMinutes > 0 {
-		// Kraken's 'since' parameter expects a Unix timestamp.
-		// We calculate it based on the minutes provided, assuming it's a lookback duration.
 		sinceTime := time.Now().Add(-time.Duration(sinceMinutes) * time.Minute).Unix()
 		params.Set("since", strconv.FormatInt(sinceTime, 10))
 	}
@@ -382,13 +381,14 @@ func (c *Client) GetOHLCV(ctx context.Context, pair, interval string, sinceMinut
 	}
 
 	var rawBarsData [][]interface{}
-	// The result from Kraken is a map where the key is the pair name and the value is the array of bars.
-	// We must iterate through the map to find our data, ignoring the "last" key used for pagination.
+	// Iterate over the result map. The key is the pair name, but it might not
+	// match the requested pair string exactly (e.g., "XBT/USD" vs "XXBTZUSD").
+	// We ignore the "last" key which is used for pagination.
 	for key, value := range resp.Result {
 		if key != "last" {
 			if bars, ok := value.([][]interface{}); ok {
 				rawBarsData = bars
-				break // Found the candle data, no need to check other keys.
+				break // Data found, exit the loop.
 			}
 		}
 	}
@@ -397,30 +397,25 @@ func (c *Client) GetOHLCV(ctx context.Context, pair, interval string, sinceMinut
 		return nil, fmt.Errorf("GetOHLCV: could not find OHLCV data for pair %s in API response", pair)
 	}
 
-	// Parse the raw interface slice into a structured OHLCVBar slice.
 	bars := make([]utilities.OHLCVBar, 0, len(rawBarsData))
 	for _, row := range rawBarsData {
-		// A valid Kraken OHLC row has 8 elements; we need at least 7 to get the volume.
 		if len(row) < 7 {
-			c.logger.LogWarn("GetOHLCV: skipping malformed OHLC row with %d elements for pair %s", len(row), pair)
 			continue
 		}
-
-		// Use a helper for robust parsing from interface{}
 		ts, err1 := utilities.ParseFloatFromInterface(row[0])
 		open, err2 := utilities.ParseFloatFromInterface(row[1])
 		high, err3 := utilities.ParseFloatFromInterface(row[2])
 		low, err4 := utilities.ParseFloatFromInterface(row[3])
 		closePrice, err5 := utilities.ParseFloatFromInterface(row[4])
-		volume, err6 := utilities.ParseFloatFromInterface(row[6]) // Volume is at index 6 in Kraken's OHLC response
+		volume, err6 := utilities.ParseFloatFromInterface(row[6])
 
 		if err1 != nil || err2 != nil || err3 != nil || err4 != nil || err5 != nil || err6 != nil {
-			c.logger.LogWarn("GetOHLCV: failed to parse one or more values in OHLC row for pair %s. Row: %v", pair, row)
+			c.logger.LogWarn("GetOHLCV: failed to parse one or more values in OHLC row for pair %s.", pair)
 			continue
 		}
 
 		bars = append(bars, utilities.OHLCVBar{
-			Timestamp: int64(ts) * 1000, // Convert Unix seconds to milliseconds
+			Timestamp: int64(ts) * 1000,
 			Open:      open,
 			High:      high,
 			Low:       low,

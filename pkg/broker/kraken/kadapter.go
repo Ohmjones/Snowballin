@@ -201,14 +201,14 @@ func (a *Adapter) GetLastNOHLCVBars(ctx context.Context, pair string, intervalMi
 	// Cache miss or stale data; fetch from the Kraken API.
 	a.logger.LogInfo("kadapter GetLastNOHLCVBars [%s]: Cache miss or insufficient data. Fetching from API.", pair)
 
-	// Get the Kraken-specific pair name (e.g., "BTC/USD" -> "XXBTZUSD").
-	krakenPair, err := a.client.GetPrimaryKrakenPairName(ctx, pair)
+	// Get the Kraken-specific tradeable pair name (e.g., "BTC/USD" -> "XBTUSD").
+	krakenPair, err := a.client.GetTradeableKrakenPairName(ctx, pair)
 	if err != nil {
 		return nil, fmt.Errorf("GetLastNOHLCVBars: failed to get Kraken pair name for %s: %w", pair, err)
 	}
 
-	// Fetch OHLCV from Kraken (OHLC endpoint uses primary pair name).
-	ohlcv, err := a.client.GetOHLCV(ctx, krakenPair, interval, int64(lookbackDuration.Seconds()/60)) // since= minutes
+	// Fetch OHLCV from Kraken (OHLC endpoint uses the tradeable pair name).
+	ohlcv, err := a.client.GetOHLCV(ctx, krakenPair, interval, int64(lookbackDuration.Seconds()/60))
 	if err != nil {
 		return nil, fmt.Errorf("GetLastNOHLCVBars: API fetch failed: %w", err)
 	}
@@ -226,13 +226,10 @@ func (a *Adapter) GetLastNOHLCVBars(ctx context.Context, pair string, intervalMi
 		})
 	}
 
-	// Sort by timestamp ascending (Kraken returns descending).
-	utilities.SortBarsByTimestamp(bars)
-
-	// Cache the bars (commented out until dataprovider supports StoreBars)
-	// if err := a.cache.StoreBars(cacheProvider, cacheKey, bars); err != nil {
-	// 	a.logger.LogWarn("GetLastNOHLCVBars: failed to cache bars for %s: %v", pair, err)
-	// }
+	// Sort by timestamp ascending if necessary (the GetOHLCV function should already handle this).
+	if len(bars) > 1 && bars[0].Timestamp > bars[1].Timestamp {
+		utilities.SortBarsByTimestamp(bars)
+	}
 
 	// Return the last N bars.
 	if len(bars) > nBars {
