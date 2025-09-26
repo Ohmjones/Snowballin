@@ -381,14 +381,33 @@ func (c *Client) GetOHLCV(ctx context.Context, pair, interval string, sinceMinut
 	}
 
 	var rawBarsData [][]interface{}
-	// Iterate over the result map. The key is the pair name, but it might not
-	// match the requested pair string exactly (e.g., "XBT/USD" vs "XXBTZUSD").
-	// We ignore the "last" key which is used for pagination.
-	for key, value := range resp.Result {
-		if key != "last" {
-			if bars, ok := value.([][]interface{}); ok {
-				rawBarsData = bars
-				break // Data found, exit the loop.
+
+	// To robustly find the data, we must get the primary pair name (e.g., "XXBTZUSD")
+	// as that is the key used in the API response, even when querying with an altname (e.g., "XBTUSD").
+	commonPair, err := c.GetCommonPairName(ctx, pair)
+	if err != nil {
+		c.logger.LogWarn("GetOHLCV: Could not reverse map %s to common pair, will attempt fallback search. Err: %v", pair, err)
+	} else {
+		primaryPair, err := c.GetPrimaryKrakenPairName(ctx, commonPair)
+		if err == nil {
+			// Primary lookup method: direct access using the correct primary pair key.
+			if data, ok := resp.Result[primaryPair]; ok {
+				if bars, isSlice := data.([][]interface{}); isSlice {
+					rawBarsData = bars
+				}
+			}
+		}
+	}
+
+	// Fallback method: if the primary lookup fails, iterate through the response map.
+	// This handles edge cases or API inconsistencies.
+	if rawBarsData == nil {
+		for key, value := range resp.Result {
+			if key != "last" {
+				if bars, ok := value.([][]interface{}); ok {
+					rawBarsData = bars
+					break // Data found, exit the loop.
+				}
 			}
 		}
 	}
